@@ -1,0 +1,878 @@
+---
+title: DevOps-инженер — от Git до Kubernetes
+description: Полный путь DevOps-инженера по порядку роадмапа «Просто DevOps» — Git, Linux, сети, Docker, CI/CD, Ansible, Kubernetes, затем базы, мониторинг, логи, облака, очереди, Terraform, GitOps и Vault. В каждом блоке теория, практика на своём проекте и вопросы с собеседований.
+mode: sequential
+passScore: 80
+order: 0
+---
+
+# DevOps-инженер — от Git до Kubernetes
+
+## Git
+Конфиги, пайплайны и манифесты — это код. Git — фундамент, учится параллельно со всем остальным.
+
+- [[Git — основы]]
+	- Репозиторий
+	- Коммит
+	- git init
+	- git add
+	- git commit
+	- git status
+	- git log
+	- .gitignore
+- [[Git — удалённые репозитории]]
+	- GitHub и GitLab
+	- git clone
+	- git push
+	- git pull
+	- git fetch
+	- SSH-ключи
+- [[Git — ветки и слияние]]
+	- Ветки
+	- git switch и checkout
+	- git merge
+	- merge conflict
+	- git rebase
+	- git cherry-pick
+- [[Git — история, теги и отмена изменений]]
+	- git diff
+	- git log
+	- Теги v1.0
+	- git revert
+	- git reset
+	- git restore
+	- git stash
+- [[Стратегии ветвления]]
+	- GitFlow
+	- GitHub Flow
+	- GitLab Flow
+	- Trunk-Based
+	- Pull и merge request
+- [[Markdown и репозиторий-конспект]]
+	- Синтаксис Markdown
+	- README
+	- Ежедневный коммит конспекта
+
+## Linux — основы
+Самый важный и один из самых больших блоков: серверы, виртуалки и Kubernetes — везде Linux.
+
+- [[Linux второй системой]]
+	- Дистрибутивы
+	- Установка рядом с Windows
+	- Жить в Linux каждый день
+- [[Терминал и базовые команды]]
+	- cd
+	- ls
+	- pwd
+	- mkdir
+	- touch
+	- rm
+	- cp
+	- mv
+	- cat
+	- less
+	- man
+- [[Редакторы nano и vim]]
+	- nano
+	- vim
+	- vimtutor
+- [[Файловая система и поиск файлов]]
+	- Структура каталогов
+	- find
+	- locate
+	- tree
+	- ln
+	- stat
+	- file
+- [[Пользователи, группы и права]]
+	- chmod
+	- chown
+	- Права 755 и 644
+	- sudo
+	- umask
+- [[Потоки, перенаправление и пайпы]]
+	- stdin
+	- stdout
+	- stderr
+	- >
+	- >>
+	- 2>&1
+	- Пайпы |
+- [[Работа с текстом]]
+	- grep
+	- awk
+	- sed
+	- cut
+	- sort
+	- uniq
+	- wc
+	- xargs
+- [[Переменные окружения]]
+	- env
+	- export
+	- PATH
+	- .bashrc
+	- .bash_profile
+	- .profile
+- [[Bash-скрипты]]
+	- Запуск скриптов
+	- Переменные
+	- Условия
+	- Циклы
+	- Функции
+	- Exit-коды
+- [[Установка программ и пакетов]]
+	- apt
+	- dnf
+	- Репозитории
+	- pip и venv
+	- npm
+	- Maven
+- [[SSH]]
+	- ssh-keygen
+	- ssh-copy-id
+	- ~/.ssh/config
+	- Проброс портов
+	- scp
+	- rsync
+
+## Linux — процессы и службы
+Топ-1 тема по Linux на собеседованиях.
+
+- [[Процессы — ps и kill]]
+	- ps aux
+	- PID и PPID
+	- kill
+	- kill -15 и kill -9
+- [[Состояния процессов]]
+	- R
+	- S
+	- D
+	- Z
+	- T
+	- Зомби и сироты
+	- fork
+	- exec
+	- wait
+- [[Сигналы]]
+	- SIGTERM
+	- SIGKILL
+	- SIGHUP
+	- SIGINT
+	- SIGUSR1 и SIGUSR2
+	- trap
+- [[Директория proc]]
+	- Псевдофайловая система
+	- /proc/PID
+	- /proc/meminfo
+	- Откуда берут данные ps и htop
+- [[systemd и unit-файлы]]
+	- PID 1
+	- Отличие от SysV init
+	- systemctl
+	- Unit-файл
+	- Автозапуск и рестарт
+- [[Логи и journalctl]]
+	- journalctl
+	- syslog
+	- /var/log
+	- logrotate
+- [[Фоновые процессы и приоритеты]]
+	- &
+	- nohup
+	- disown
+	- screen
+	- tmux
+	- nice
+	- renice
+- [[OOM Killer, cgroups и namespaces]]
+	- OOM Killer
+	- oom_score_adj
+	- cgroups
+	- namespaces
+	- Мостик к Docker и Kubernetes
+- [[strace и lsof]] #optional
+	- Системные вызовы
+	- strace
+	- ltrace
+	- lsof
+
+## Linux — ресурсы и диски
+Понимать, что происходит с сервером, и находить, кто съел ресурсы.
+
+- [[top и htop]]
+	- Load Average
+	- us
+	- sy
+	- wa
+	- si
+	- id
+	- RES
+	- Сортировка процессов
+- [[Память в Linux]]
+	- free -h
+	- available и free
+	- RSS и VSZ
+	- Page cache
+	- Swap
+- [[Утилиты диагностики]]
+	- vmstat
+	- iostat
+	- sar
+	- pidstat
+	- ss
+	- iftop
+	- perf
+- [[Место на диске — df и du]]
+	- df -h
+	- du -sh
+	- No space left on device
+- [[inode]]
+	- Что хранит inode
+	- df -i
+	- Место есть
+	- А файлы не создаются
+- [[mount и fstab]]
+	- mount
+	- umount
+	- UUID
+	- /etc/fstab
+- [[Файловые системы]]
+	- ext4
+	- xfs
+	- tmpfs
+	- overlay
+- [[RAID и LVM]]
+	- RAID 0
+	- RAID 1
+	- RAID 10
+	- PV
+	- VG
+	- LV
+- [[Загрузка Linux]]
+	- BIOS и UEFI
+	- GRUB
+	- Ядро и initramfs
+	- systemd
+	- Приглашение входа
+
+## Linux — практика и собеседование
+Главная практика блока: своё приложение без Docker, которое дальше пойдёт в Docker, CI/CD и Kubernetes.
+
+- [[Первичная настройка сервера]]
+	- Пользователь и sudo
+	- SSH по ключам
+	- Запрет входа по паролю и root
+	- ufw или iptables
+- [[Свой systemd-сервис]]
+	- Unit-файл для HTTP-сервера
+	- Автозапуск
+	- Restart
+	- Лимит памяти
+	- Проверка kill -9
+- [[Проект — приложение без Docker]]
+	- Frontend
+	- Backend
+	- База данных
+	- Запуск руками
+	- pip
+	- npm
+	- Maven
+- [[PostgreSQL для своего приложения]]
+	- Установка
+	- Пользователь и права
+	- Открыть порт
+	- Создать базу
+	- Подключить бэкенд
+- [[Linux на собеседовании]]
+	- Load Average
+	- inodes
+	- Зомби
+	- No space left on device
+	- Загрузка системы
+	- Сигналы
+	- Права 755
+	- LVM
+
+## Сети
+Уметь диагностировать сетевые проблемы и настраивать базовую инфраструктуру.
+
+- [[Модель OSI и TCP-IP]]
+	- 7 уровней
+	- Уровни 3
+	- 4 и 7
+	- Инкапсуляция
+- [[IP-адреса, маски и подсети]]
+	- IPv4
+	- CIDR
+	- Маска подсети
+	- Шлюз
+	- Частные адреса
+- [[TCP и UDP]]
+	- Порты
+	- Трёхстороннее рукопожатие
+	- Отличия TCP и UDP
+- [[ARP и ICMP]]
+	- ARP
+	- ping
+	- traceroute
+	- mtr
+- [[DNS]]
+	- Записи A
+	- CNAME
+	- MX
+	- TXT
+	- Рекурсивный резолв
+	- dig
+	- /etc/hosts
+	- resolv.conf
+- [[HTTP и HTTPS]]
+	- Методы
+	- Коды ответов
+	- Заголовки
+	- curl
+- [[TLS и сертификаты]]
+	- TLS handshake
+	- Сертификаты и цепочка доверия
+	- Let's Encrypt
+- [[Сетевая диагностика в Linux]]
+	- ip a
+	- ss -tulpn
+	- netstat
+	- curl
+	- telnet
+	- nc
+	- nmap
+- [[tcpdump и Wireshark]]
+	- Захват трафика
+	- Фильтры
+	- Разбор пакетов
+- [[Файрвол и fail2ban]]
+	- iptables
+	- nftables
+	- ufw
+	- fail2ban
+- [[Nginx]]
+	- Конфиг
+	- Reverse proxy
+	- Статика
+	- nginx -t
+	- nginx -s reload
+- [[Балансировка нагрузки]]
+	- upstream в Nginx
+	- HAProxy
+	- Алгоритмы балансировки
+- [[Практика — сеть для своего приложения]]
+	- Backend не видит базу
+	- Порты
+	- Nginx как reverse proxy
+	- SSH-защита
+	- fail2ban
+- [[Сети на собеседовании]]
+	- Что происходит при вводе адреса
+	- TLS handshake
+	- Маска подсети
+	- OSI
+	- TCP и UDP
+	- DNS
+
+## Docker
+Упаковывать приложение в контейнер и работать с образами. Не только Docker: Podman, Buildah, containerd.
+
+- [[Контейнеры и виртуализация]]
+	- Отличие от ВМ
+	- namespaces и cgroups
+	- OCI
+	- Podman
+	- containerd
+- [[Архитектура Docker]]
+	- Docker Daemon
+	- Docker CLI
+	- Docker API
+	- Образ и контейнер
+- [[Команды Docker]]
+	- run
+	- ps
+	- logs
+	- exec
+	- stop
+	- images
+	- pull
+	- push
+	- tag
+	- history
+- [[Dockerfile]]
+	- FROM
+	- RUN
+	- COPY
+	- ADD
+	- WORKDIR
+	- ENV
+	- ARG
+	- EXPOSE
+	- CMD
+	- ENTRYPOINT
+	- USER
+- [[Слои, кэш и контекст сборки]]
+	- Слои образа
+	- Кэш сборки
+	- .dockerignore
+- [[Multi-stage build]]
+	- Сборка в несколько этапов
+	- Маленький итоговый образ
+- [[Best practices Dockerfile]]
+	- Alpine и slim
+	- Не от root
+	- Чистка кэша
+	- Порядок слоёв
+- [[Теги и registry]]
+	- Тегирование
+	- Версионирование образов
+	- Docker Hub
+	- GitLab Registry
+	- docker login и push
+- [[Сети в Docker]]
+	- bridge
+	- host
+	- none
+	- overlay
+	- macvlan
+	- Проброс портов
+- [[Тома и хранение данных]]
+	- volumes
+	- bind mount
+	- tmpfs
+- [[Docker Compose]]
+	- compose.yaml
+	- Сервисы
+	- Сети и тома
+	- depends_on
+	- docker compose up
+- [[Практика — приложение в контейнерах]]
+	- Dockerfile для своего приложения
+	- Compose
+	- nginx со своим конфигом
+- [[Практика — мониторинг-стек в Compose]]
+	- Prometheus
+	- Grafana
+	- Node Exporter
+	- cAdvisor
+- [[Docker на собеседовании]]
+	- Контейнеризация и виртуализация
+	- Изоляция в ядре
+	- Multi-stage
+	- CMD и ENTRYPOINT
+	- COPY и ADD
+
+## CI-CD
+Автоматизировать сборку, тестирование и деплой своего проекта.
+
+- [[YAML]]
+	- Синтаксис
+	- Списки и словари
+	- Многострочные строки
+	- Якоря
+- [[CI и CD]]
+	- Continuous Integration
+	- Continuous Delivery
+	- Continuous Deployment
+- [[Как строить пайплайн]]
+	- Стадии
+	- Артефакты
+	- Окружения
+	- Идеальный пайплайн
+	- GitOps
+- [[GitLab CI — основы]]
+	- .gitlab-ci.yml
+	- pipeline
+	- stage
+	- job
+	- rules
+- [[GitLab CI — переменные, артефакты и кэш]]
+	- variables
+	- CI-CD Variables
+	- artifacts
+	- cache
+	- before_script
+	- environments
+	- when manual
+- [[GitLab CI — продвинутое]]
+	- needs
+	- extends
+	- YAML-якоря
+	- include
+	- trigger
+- [[GitLab Runner]]
+	- Установка
+	- Регистрация
+	- Executors shell
+	- docker
+	- kubernetes
+- [[Jenkins]]
+	- Master и Agent
+	- Jenkinsfile
+	- Декларативный пайплайн
+	- Credentials
+	- Groovy
+- [[Практика — пайплайн build, test, deploy]]
+	- Сборка образа
+	- Линтер
+	- Деплой по SSH
+- [[Практика — окружения и шаблоны]]
+	- dev
+	- staging
+	- prod
+	- Секреты
+	- Кэш
+	- Общие шаблоны через include
+- [[CI-CD на собеседовании]]
+	- Идеальный пайплайн
+	- CI и CD
+	- extends и include
+
+## Ansible
+Управление конфигурацией: один плейбук настраивает десятки серверов одинаково.
+
+- [[Ansible — как устроен]]
+	- Agentless
+	- SSH и Python
+	- Декларативность
+	- Идемпотентность
+- [[Inventory и ad-hoc команды]]
+	- INI и YAML
+	- Группы хостов
+	- ansible -m
+- [[Модули Ansible]]
+	- apt
+	- yum
+	- copy
+	- template
+	- file
+	- service
+	- user
+	- docker_container
+	- git
+- [[Playbook]]
+	- Структура
+	- Tasks
+	- Handlers
+	- Facts
+	- when
+	- loop
+- [[Переменные и шаблоны Jinja2]]
+	- Приоритеты переменных
+	- group_vars и host_vars
+	- Шаблоны .j2
+- [[Роли]]
+	- Структура роли
+	- defaults и vars
+	- Ansible Galaxy
+- [[Ansible Vault]]
+	- Шифрование секретов
+	- ansible-vault
+- [[Практика — плейбук для нового сервера]]
+	- Обновление
+	- Docker
+	- Пользователь
+	- SSH
+	- Пакеты
+	- Роли
+	- Группа серверов
+- [[Ansible на собеседовании]]
+	- Плейбуки
+	- Роли
+	- Приоритеты переменных
+	- Handler
+	- Идемпотентность
+
+## Kubernetes
+Самый важный инструмент DevOps-инженера и самая большая тема на собеседованиях.
+
+- [[Зачем нужен Kubernetes]]
+	- Оркестрация
+	- Декларативный подход
+	- Желаемое состояние
+- [[Архитектура Kubernetes]]
+	- API Server
+	- etcd
+	- Scheduler
+	- Controller Manager
+	- kubelet
+	- kube-proxy
+	- Container runtime
+- [[kubectl и локальный кластер]]
+	- Minikube
+	- Kind
+	- k3d
+	- kubectl get
+	- describe
+	- logs
+	- apply
+- [[Pod]]
+	- Манифест
+	- Несколько контейнеров
+	- Почему под
+	- А не контейнер
+- [[Deployment и ReplicaSet]]
+	- Rolling update
+	- Откат
+	- Масштабирование
+- [[StatefulSet и DaemonSet]]
+	- Стабильные имена
+	- Свои тома
+	- Под на каждой ноде
+- [[Job и CronJob]]
+	- Разовые задачи
+	- Задачи по расписанию
+- [[ConfigMap и Secret]]
+	- Конфигурация
+	- Секреты
+	- Переменные и файлы
+- [[Service]]
+	- ClusterIP
+	- NodePort
+	- LoadBalancer
+	- Headless
+- [[Ingress]]
+	- Ingress и Ingress Controller
+	- Правила маршрутизации
+	- TLS
+- [[Сеть в Kubernetes]]
+	- CNI
+	- kube-proxy
+	- CoreDNS
+	- NetworkPolicy
+- [[Хранилище в Kubernetes]]
+	- PV
+	- PVC
+	- StorageClass
+	- Access Modes
+- [[Ресурсы и пробы]]
+	- requests
+	- limits
+	- liveness
+	- readiness
+	- startup
+- [[Helm]]
+	- Chart
+	- values
+	- templates
+	- helm install и upgrade
+- [[Автомасштабирование HPA]]
+	- Horizontal Pod Autoscaler
+	- metrics-server
+- [[RBAC]]
+	- Role
+	- ClusterRole
+	- RoleBinding
+	- ServiceAccount
+- [[Affinity, taints и tolerations]]
+	- nodeSelector
+	- Affinity
+	- Anti-Affinity
+	- Taints
+	- Tolerations
+- [[Способы развёртывания кластера]]
+	- kubeadm
+	- kubespray
+	- Managed Kubernetes
+- [[Практика — приложение в кластере]]
+	- Deployment
+	- Service
+	- ConfigMap
+	- Пробы
+	- Полный стек приложения
+- [[Практика — Helm chart для приложения]]
+	- values-dev и values-prod
+	- Два namespace
+- [[Продвинутый Kubernetes]] #optional
+	- Операторы
+	- Service Mesh
+	- Бэкап etcd
+	- Multi-cluster
+	- Траблшутинг кластера
+- [[Kubernetes на собеседовании]]
+	- Deployment
+	- StatefulSet и DaemonSet
+	- Типы Service
+	- Ingress
+	- HPA
+	- Affinity
+
+## Базы данных
+DevOps не пишет сложный SQL, но поднимает базу, делает бэкапы, репликацию и мониторинг.
+
+- [[PostgreSQL — установка и настройка]]
+	- postgresql.conf
+	- pg_hba.conf
+	- Роли
+	- GRANT
+- [[SQL для DevOps]]
+	- SELECT
+	- INSERT
+	- CREATE TABLE
+	- GRANT
+- [[Бэкап и восстановление PostgreSQL]]
+	- pg_dump
+	- pg_restore
+	- pg_basebackup
+	- PITR
+- [[Репликация PostgreSQL]]
+	- Streaming replication
+	- Primary и replica
+- [[Redis]]
+	- Кэш
+	- Типы данных
+	- TTL
+- [[MongoDB и ClickHouse]] #optional
+	- Документная база
+	- Колоночная база для логов и аналитики
+
+## Мониторинг
+Понимать, что происходит с системой, и вовремя реагировать.
+
+- [[Основы мониторинга]]
+	- Метрики
+	- Pull и push
+	- 4 золотых сигнала
+	- USE
+	- RED
+- [[Prometheus]]
+	- Архитектура
+	- Pull-модель
+	- Типы метрик
+	- scrape_configs
+- [[PromQL]]
+	- Селекторы
+	- rate
+	- sum by
+	- Агрегации
+- [[Экспортеры]]
+	- node_exporter
+	- postgres_exporter
+	- cAdvisor
+- [[Grafana]]
+	- Источники данных
+	- Дашборды
+	- Переменные
+	- Библиотека дашбордов
+- [[Alertmanager и алерты]]
+	- Правила алертов
+	- Маршрутизация
+	- Уведомления
+- [[Практика — мониторинг своего проекта]]
+	- Метрики сервера
+	- Базы и приложения
+	- Дашборд
+	- Алерты
+
+## Логирование
+Научиться читать логи и понимать, куда копать.
+
+- [[Централизованное логирование]]
+	- Источники логов
+	- stdout подов
+	- Файлы серверов
+- [[ELK и OpenSearch]]
+	- Elasticsearch
+	- Logstash
+	- Kibana
+	- OpenSearch
+- [[Loki и Grafana]]
+	- Loki
+	- Promtail и Alloy
+	- LogQL
+- [[Сборщики логов]]
+	- Fluentd
+	- Fluent Bit
+	- Filebeat
+
+## Облака
+Большинство новых проектов стартуют в облаке. В России — свои облака: Yandex Cloud, Selectel, Cloud.ru и другие.
+
+- [[Облачные модели]]
+	- IaaS
+	- PaaS
+	- SaaS
+	- Российские облака
+- [[Виртуальные машины и сети в облаке]]
+	- ВМ
+	- SSH
+	- VPC
+	- Подсети
+	- Группы безопасности
+- [[Объектное хранилище S3]]
+	- Бакеты
+	- Объекты
+	- Доступ
+	- Применение
+- [[Managed-сервисы]]
+	- Managed PostgreSQL
+	- Managed Kubernetes
+
+## Очереди сообщений
+Нужны в микросервисах: сервисы общаются асинхронно — положил сообщение, его когда-нибудь обработают.
+
+- [[Зачем нужны очереди]]
+	- Асинхронность
+	- Развязка сервисов
+	- Буфер нагрузки
+- [[Kafka]]
+	- Брокер
+	- Топик
+	- Партиции
+	- Оффсеты
+	- Продюсеры
+	- Консьюмеры
+	- Consumer group
+	- Репликация
+- [[RabbitMQ]]
+	- Exchange
+	- Очередь
+	- Подтверждение доставки
+	- Отличие от Kafka
+
+## Terraform
+Описывать инфраструктуру как код.
+
+- [[Terraform — основы]]
+	- HCL
+	- Провайдер
+	- Ресурс
+	- init
+	- plan
+	- apply
+- [[Terraform state и backend]]
+	- tfstate
+	- Backend в S3
+	- Блокировка
+- [[Модули Terraform]]
+	- Переиспользование
+	- Входы и выходы
+- [[Окружения в Terraform]]
+	- dev
+	- staging
+	- prod
+	- tfvars
+	- Изоляция окружений
+- [[Практика — инфраструктура в облаке]]
+	- ВМ
+	- Сеть и S3 через Terraform
+
+## GitOps и секреты
+Git как единственный источник правды для инфраструктуры и безопасное хранение секретов.
+
+- [[GitOps]]
+	- Принципы
+	- Pull-модель деплоя
+	- Argo CD и Flux
+- [[Argo CD]]
+	- Установка
+	- Application
+	- App of Apps
+	- Helm через Argo
+- [[HashiCorp Vault]]
+	- Зачем нужен
+	- KV secrets engine
+	- Базовые команды
+	- Auth methods
