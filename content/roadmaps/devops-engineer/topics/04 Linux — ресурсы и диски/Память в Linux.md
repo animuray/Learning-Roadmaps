@@ -9,7 +9,7 @@ materials:
   - title: Linux ate my RAM! — почему «свободной» памяти мало
     url: https://www.linuxatemyram.com/
     type: статья
-  - title: man7 — proc_pid_status(5): VmRSS, VmSize и другие поля памяти
+  - title: "man7 — proc_pid_status(5): VmRSS, VmSize и другие поля памяти"
     url: https://man7.org/linux/man-pages/man5/proc_pid_status.5.html
     type: документация
   - title: Brendan Gregg — Linux Performance

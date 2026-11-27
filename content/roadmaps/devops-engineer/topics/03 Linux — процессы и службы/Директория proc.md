@@ -9,7 +9,7 @@ materials:
   - title: man7 — proc_pid_status(5)
     url: https://man7.org/linux/man-pages/man5/proc_pid_status.5.html
     type: документация
-  - title: man7 — proc_pid_stat(5): файл, который читает ps
+  - title: "man7 — proc_pid_stat(5): файл, который читает ps"
     url: https://www.man7.org/linux/man-pages/man5/proc_pid_stat.5.html
     type: документация
   - title: Filesystem Hierarchy Standard — /proc

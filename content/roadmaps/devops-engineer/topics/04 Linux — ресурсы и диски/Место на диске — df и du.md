@@ -1,12 +1,12 @@
 ---
 title: Место на диске — df и du
-slug: mesto-na-diske-df-du
+slug: mesto-na-diske-df-i-du
 description: Как найти, что съело диск, — связка df и du, типичные виновники и разбор ошибки No space left on device.
 duration: 60
 level: Основы
 quizSize: 10
 materials:
-  - title: ArchWiki — fstab (на русском): разделы и точки монтирования
+  - title: "ArchWiki — fstab (на русском): разделы и точки монтирования"
     url: https://wiki.archlinux.org/title/Fstab_(%D0%A0%D1%83%D1%81%D1%81%D0%BA%D0%B8%D0%B9)
     type: документация
   - title: Cloudways — How to fix «No space left on device»

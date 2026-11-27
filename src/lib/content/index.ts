@@ -56,25 +56,34 @@ function indexNotes(roadmapDir: string): NoteIndex {
     const rel = path.relative(CONTENT_DIR, file);
     const base = path.basename(file, ".md");
     index.set(base.toLowerCase(), rel);
-    try {
-      const { data } = matter(fs.readFileSync(file, "utf8"));
-      const aliases: unknown[] = Array.isArray(data.aliases) ? data.aliases : [];
-      for (const a of [data.title, ...aliases]) {
-        if (typeof a === "string" && !index.has(a.toLowerCase())) index.set(a.toLowerCase(), rel);
-      }
-    } catch {
-      /* битый frontmatter покажет content:check */
+    const { data } = parseNote(fs.readFileSync(file, "utf8"));
+    const aliases: unknown[] = Array.isArray(data.aliases) ? data.aliases : [];
+    for (const a of [data.title, ...aliases]) {
+      if (typeof a === "string" && !index.has(a.toLowerCase())) index.set(a.toLowerCase(), rel);
     }
   }
   return index;
 }
 
-function readFrontmatter(rel: string): Record<string, unknown> {
+/**
+ * Разбирает заметку. Если YAML во frontmatter битый (частая причина — «: » в значении
+ * без кавычек), возвращает пустые данные, текст без frontmatter и описание ошибки.
+ * Пустой объект опций отключает кэш gray-matter: с кэшем повторный вызов после ошибки
+ * молча вернул бы пустые данные и необрезанный frontmatter в тексте.
+ */
+function parseNote(src: string): { data: Record<string, unknown>; content: string; error?: string } {
   try {
-    return matter(fs.readFileSync(path.join(CONTENT_DIR, rel), "utf8")).data;
-  } catch {
-    return {};
+    const { data, content } = matter(src, {});
+    return { data, content };
+  } catch (e) {
+    const content = src.replace(/^---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/, "");
+    const error = (e instanceof Error ? e.message : String(e)).split("\n")[0];
+    return { data: {}, content, error };
   }
+}
+
+function readFrontmatter(rel: string): Record<string, unknown> {
+  return parseNote(fs.readFileSync(path.join(CONTENT_DIR, rel), "utf8")).data;
 }
 
 /* ------------------------------------------------------------------ */
@@ -113,7 +122,7 @@ function loadRoadmap(slug: string): Roadmap | null {
   const file = path.join(dir, ROADMAP_FILE);
   if (!fs.existsSync(file)) return null;
 
-  const { data, content } = matter(fs.readFileSync(file, "utf8"));
+  const { data, content } = parseNote(fs.readFileSync(file, "utf8"));
   const notes = indexNotes(dir);
   const sections: Section[] = [];
   const topics: TopicRef[] = [];
@@ -281,7 +290,9 @@ function loadTopic(roadmap: Roadmap, ref: TopicRef, warn: (m: string) => void): 
   };
   if (!ref.notePath) return base;
 
-  const { data, content } = matter(fs.readFileSync(path.join(CONTENT_DIR, ref.notePath), "utf8"));
+  const note = parseNote(fs.readFileSync(path.join(CONTENT_DIR, ref.notePath), "utf8"));
+  if (note.error) warn(`frontmatter не разобран (${note.error}) — значения с «: » возьмите в кавычки`);
+  const { data, content } = note;
   const parts = splitNote(content);
   // Заголовок H1 в начале заметки дублирует название темы — убираем.
   const body = parts.body.replace(/^#\s+.+\n?/, "").trim();

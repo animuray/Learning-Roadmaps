@@ -1,18 +1,18 @@
 ---
 title: Процессы — ps и kill
-slug: processy-ps-i-kill
+slug: protsessy-ps-i-kill
 description: Что такое процесс, PID и PPID, как найти процесс через ps aux, pgrep и pstree и как его остановить — kill, kill -15 и kill -9.
 duration: 60
 level: Основы
 quizSize: 10
 materials:
-  - title: man7 — proc_pid_status(5): что ядро знает о процессе
+  - title: "man7 — proc_pid_status(5): что ядро знает о процессе"
     url: https://man7.org/linux/man-pages/man5/proc_pid_status.5.html
     type: документация
-  - title: man7 — signal(7): обзор сигналов
+  - title: "man7 — signal(7): обзор сигналов"
     url: https://www.man7.org/linux/man-pages/man7/signal.7.html
     type: документация
-  - title: Хабр — Процессы в Linux: fork, exec, wait
+  - title: "Хабр — Процессы в Linux: fork, exec, wait"
     url: https://habr.com/ru/articles/423049/
     type: статья
 ---

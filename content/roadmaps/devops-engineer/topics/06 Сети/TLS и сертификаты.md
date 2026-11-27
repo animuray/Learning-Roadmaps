@@ -15,7 +15,7 @@ materials:
   - title: Cloudflare Blog — A detailed look at RFC 8446 (TLS 1.3)
     url: https://blog.cloudflare.com/rfc-8446-aka-tls-1-3/
     type: статья
-  - title: Хабр — TLS вручную: разбор рукопожатия по байтам
+  - title: "Хабр — TLS вручную: разбор рукопожатия по байтам"
     url: https://habr.com/ru/articles/764260/
     type: статья
 ---
