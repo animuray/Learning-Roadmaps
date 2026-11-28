@@ -1,8 +1,10 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 import { redirect } from "next/navigation";
 import { Route } from "lucide-react";
 import { signInDev, signInWithGoogle } from "@/app/actions/auth";
 import { devLoginEnabled } from "@/auth";
+import { LoginForm } from "@/components/auth/password-forms";
 import { getCurrentUser } from "@/lib/session";
 
 export const metadata: Metadata = { title: "Вход" };
@@ -26,6 +28,23 @@ export default async function LoginPage({ searchParams }: PageProps<"/login">) {
         {error && (
           <p className="mt-4 rounded-lg bg-surface-2 p-3 text-sm text-danger">Не удалось войти ({error}). Попробуйте ещё раз.</p>
         )}
+
+        <div className="mt-6">
+          <LoginForm callbackUrl={callbackUrl} />
+        </div>
+        <p className="mt-4 text-sm text-muted">
+          Нет аккаунта?{" "}
+          <Link
+            href={callbackUrl === "/" ? "/register" : `/register?callbackUrl=${encodeURIComponent(callbackUrl)}`}
+            className="font-medium text-accent hover:underline"
+          >
+            Зарегистрироваться
+          </Link>
+        </p>
+
+        <div className="mt-6 flex items-center gap-3 text-xs text-muted">
+          <span className="h-px flex-1 bg-line" /> или <span className="h-px flex-1 bg-line" />
+        </div>
 
         <form action={signInWithGoogle} className="mt-6">
           <input type="hidden" name="callbackUrl" value={callbackUrl} />

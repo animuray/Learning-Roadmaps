@@ -30,6 +30,8 @@ export const users = pgTable("user", {
   github: text("github"),
   website: text("website"),
   isPublic: boolean("is_public").notNull().default(true),
+  /** Хеш пароля для входа по логину (логин — handle). У тех, кто входит через Google, пусто. */
+  passwordHash: text("password_hash"),
   createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
 });
 

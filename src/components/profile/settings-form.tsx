@@ -31,6 +31,7 @@ export function SettingsForm({ initial }: { initial: Initial }) {
           <span className="pl-3 text-muted">/u/</span>
           <input name="handle" defaultValue={initial.handle} required className="w-full bg-transparent px-1 py-2 outline-none" />
         </div>
+        <span className="mt-1 block text-xs text-muted">Это же логин для входа по паролю.</span>
       </label>
       <label className="block">
         <span className="text-sm font-medium">О себе</span>

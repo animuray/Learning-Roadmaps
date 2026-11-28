@@ -7,10 +7,59 @@ import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { accounts, sessions, users, verificationTokens } from "@/db/schema";
 import { ensureHandle } from "@/lib/handle";
+import { verifyPassword } from "@/lib/password";
 
 export const devLoginEnabled = process.env.DEV_LOGIN === "true";
 
-const providers: Provider[] = [Google];
+/* Защита от подбора пароля: не больше MAX_FAILS неудачных попыток на логин за окно. Память процесса —
+   для одного сервера этого достаточно; после перезапуска счётчики обнуляются. */
+const MAX_FAILS = 10;
+const FAIL_WINDOW_MS = 15 * 60 * 1000;
+const fails = new Map<string, { count: number; since: number }>();
+
+function tooManyFails(login: string): boolean {
+  const f = fails.get(login);
+  if (!f) return false;
+  if (Date.now() - f.since > FAIL_WINDOW_MS) {
+    fails.delete(login);
+    return false;
+  }
+  return f.count >= MAX_FAILS;
+}
+
+function noteFail(login: string) {
+  const f = fails.get(login);
+  if (!f || Date.now() - f.since > FAIL_WINDOW_MS) fails.set(login, { count: 1, since: Date.now() });
+  else f.count++;
+}
+
+/** Хеш случайного пароля: проверка по нему всегда ложна, но занимает столько же времени, сколько настоящая. */
+const DUMMY_HASH =
+  "scrypt$32768$8$1$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+const providers: Provider[] = [
+  Google,
+  // Вход по логину (handle) и паролю. Учётная запись создаётся на /register.
+  Credentials({
+    id: "password",
+    name: "Логин и пароль",
+    credentials: { login: { label: "Логин" }, password: { label: "Пароль", type: "password" } },
+    async authorize(credentials) {
+      const login = String(credentials?.login ?? "").trim().toLowerCase();
+      const password = String(credentials?.password ?? "");
+      if (!login || !password || tooManyFails(login)) return null;
+      const [user] = await db.select().from(users).where(eq(users.handle, login));
+      // Для несуществующего логина тоже считаем хеш — чтобы по времени ответа нельзя было узнать, есть ли такой пользователь.
+      const ok = await verifyPassword(password, user?.passwordHash ?? DUMMY_HASH);
+      if (!user?.passwordHash || !ok) {
+        noteFail(login);
+        return null;
+      }
+      fails.delete(login);
+      return { id: user.id, email: user.email, name: user.name, image: user.image };
+    },
+  }),
+];
 
 if (devLoginEnabled) {
   // Вход без Google — только для локальной разработки (DEV_LOGIN=true).

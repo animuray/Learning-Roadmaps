@@ -6,6 +6,7 @@ import { redirect } from "next/navigation";
 import { z } from "zod";
 import { db } from "@/db";
 import { userAvatars, users } from "@/db/schema";
+import { readAvatar, saveAvatar } from "@/lib/avatar";
 import { HANDLE_RE } from "@/lib/handle";
 import { getCurrentUser } from "@/lib/session";
 import type { FormState } from "./learning";
@@ -57,34 +58,14 @@ export async function updateProfile(_prev: FormState, formData: FormData): Promi
 
 /* ------------------------------- аватарка ------------------------------- */
 
-/** Браузер присылает уже обрезанную и уменьшенную картинку (256×256), так что 512 КБ — с запасом. */
-const AVATAR_MAX_BYTES = 512 * 1024;
-
-/** Тип картинки по первым байтам: заголовку Content-Type от браузера не доверяем, SVG не принимаем вовсе. */
-function imageMime(b: Buffer): string | null {
-  if (b.length > 8 && b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
-  if (b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
-  if (b.length > 12 && b.toString("ascii", 0, 4) === "RIFF" && b.toString("ascii", 8, 12) === "WEBP") return "image/webp";
-  return null;
-}
-
 export async function uploadAvatar(_prev: FormState, formData: FormData): Promise<FormState> {
   const user = await getCurrentUser();
   if (!user) redirect("/login");
   const file = formData.get("avatar");
   if (!(file instanceof File) || file.size === 0) return { error: "Выберите картинку" };
-  if (file.size > AVATAR_MAX_BYTES) return { error: "Картинка слишком большая" };
-  const data = Buffer.from(await file.arrayBuffer());
-  const mime = imageMime(data);
-  if (!mime) return { error: "Нужна картинка PNG, JPEG или WebP" };
-
-  const now = new Date();
-  await db
-    .insert(userAvatars)
-    .values({ userId: user.id, mime, data, updatedAt: now })
-    .onConflictDoUpdate({ target: userAvatars.userId, set: { mime, data, updatedAt: now } });
-  // ?v= — чтобы браузер не показывал старую картинку из кеша
-  await db.update(users).set({ image: `/api/avatar/${user.id}?v=${now.getTime()}` }).where(eq(users.id, user.id));
+  const avatar = await readAvatar(file);
+  if ("error" in avatar) return avatar;
+  await saveAvatar(user.id, avatar);
   refresh();
   return { ok: true };
 }
