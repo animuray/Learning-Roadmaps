@@ -105,6 +105,96 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 - [ ] Посмотреть swap: `swapon --show`; создать swap-файл на тестовой ВМ и подключить его
 - [ ] Запустить `vmstat 1` и создать нагрузку на память; понаблюдать за колонками free, cache, si, so
 
+## Лаборатория
+
+### Сколько памяти на самом деле доступно
+
+Новичок посмотрел в `free` колонку `free` и решил, что памяти почти не осталось. Запишите в `~/avail.txt` (только число, в **мегабайтах**), сколько памяти **реально доступно** новым программам — с учётом кэша, который ядро отдаст по первому требованию.
+
+```bash setup
+rm -f /home/student/avail.txt
+cat /var/log/*.log /usr/bin/* > /dev/null 2>&1; true
+```
+
+```bash check
+[ -f /home/student/avail.txt ] || fail "Нет ~/avail.txt"
+got=$(tr -d '[:space:]' < /home/student/avail.txt)
+[[ "$got" =~ ^[0-9]+$ ]] || fail "В ~/avail.txt должно быть только число мегабайт, а там «$got»"
+avail=$(awk '/^MemAvailable/ {print int($2/1024)}' /proc/meminfo)
+free=$(awk '/^MemFree/ {print int($2/1024)}' /proc/meminfo)
+d=$(( got > avail ? got - avail : avail - got ))
+[ $d -le $(( avail / 5 )) ] || fail "В ~/avail.txt $got МБ, а доступно сейчас около $avail МБ (это не та колонка или не те единицы)"
+ok "доступно ≈ $avail МБ (а «free» — всего $free МБ)"
+```
+
+```text hint
+1. Вывести сводку памяти в мегабайтах.
+2. Колонка «свободно» — память, которая не используется вообще ничем. Нужна другая колонка — оценка ядра, сколько можно отдать программам, не трогая своп.
+3. То же значение есть в /proc/meminfo в килобайтах.
+```
+
+```bash solution
+free -m
+free -m | awk '/^Mem:/ {print $7}' > ~/avail.txt
+```
+
+```text review
+Эталон: колонка `available` в `free -m` (или `MemAvailable` в `/proc/meminfo`).
+
+- `free` — память, которая не занята ничем. В Linux она обычно маленькая, и это **нормально**: свободная память уходит под кэш файлов (`buff/cache`), чтобы ускорить диск.
+- `available` — сколько можно выделить программам, освободив кэш. Тревожно, когда **она** маленькая и растёт `si`/`so` в `vmstat` (активный своп).
+- «Linux съел всю память» — классический вопрос на собеседовании. Ответ: смотрите `available`, а не `free`; подробнее — linuxatemyram.com.
+```
+
+### Подключить swap-файл
+
+На маленьком сервере нет свопа, и при всплесках нагрузки приходит OOM killer. Создайте swap-файл `/swapfile` размером **256 МБ**, включите его и сделайте так, чтобы он подключался **после перезагрузки**.
+
+```bash setup
+swapoff /swapfile 2>/dev/null
+rm -f /swapfile
+sed -i '\#^/swapfile[[:space:]]#d' /etc/fstab
+true
+```
+
+```bash check
+[ -f /swapfile ] || fail "Файла /swapfile нет"
+[ "$(stat -c '%a %U' /swapfile)" = "600 root" ] || fail "Права на /swapfile — $(stat -c '%a %U' /swapfile): своп могут читать другие пользователи"
+size=$(swapon --show=NAME,SIZE --bytes --noheadings | awk '$1 == "/swapfile" {print $2}')
+[ -n "$size" ] || fail "/swapfile не подключён как своп"
+[ "$size" -ge 260000000 ] && [ "$size" -le 270000000 ] || fail "Размер свопа $((size / 1024 / 1024)) МБ, а нужен 256 МБ"
+awk '$1 == "/swapfile" && $3 == "swap"' /etc/fstab | grep -q . || fail "После перезагрузки своп не подключится: в /etc/fstab нет строки для /swapfile"
+ok "swap /swapfile: $((size / 1024 / 1024)) МБ, в fstab есть"
+```
+
+```text hint
+1. Создать файл нужного размера, заполненный нулями (или сразу выделить место), и закрыть доступ всем, кроме root.
+2. Разметить файл как область подкачки и включить её.
+3. Добавить строку в таблицу монтирования: путь, «точка монтирования» для свопа — специальное слово, тип swap, опции по умолчанию.
+```
+
+```bash solution
+sudo dd if=/dev/zero of=/swapfile bs=1M count=256 status=none
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+swapon --show
+```
+
+```text review
+Эталон: `dd`/`fallocate` → `chmod 600` → `mkswap` → `swapon` → строка `/swapfile none swap sw 0 0` в `/etc/fstab`.
+
+- Права 600 обязательны: в своп попадает содержимое памяти — пароли, ключи, данные.
+- `fallocate -l 256M /swapfile` быстрее `dd`, но на некоторых ФС (btrfs, старые xfs) своп-файл так не работает — `dd` надёжнее.
+- `vm.swappiness` (0–100) — насколько охотно ядро уходит в своп. Для серверов с базами ставят 1–10.
+- Kubernetes по умолчанию требует **выключенный** своп на узлах (`swapoff -a` и комментарий в fstab) — частый вопрос при установке kubeadm.
+```
+
+```text notes
+chmod\s+(644|666|777) => Своп-файл был доступен на чтение не только root — в него попадает содержимое памяти. Права — 600.
+```
+
 ## Тест
 
 ### В free -h колонка free показывает 300 МБ, а available — 9 ГБ. Хватает ли системе памяти?

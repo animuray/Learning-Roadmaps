@@ -114,6 +114,128 @@ tcp.analysis.retransmission      повторные передачи
 - [ ] Записать захват в файл, открыть в Wireshark и применить фильтры `http.request`, `dns`, `tcp.flags.reset == 1`
 - [ ] Использовать Follow TCP Stream для HTTP-запроса к своему приложению
 
+## Лаборатория
+
+Клиент `lab-tdc` (10.70.0.10) и сервер `lab-tds` (10.70.0.20) соединены кабелем, интерфейс у каждого — `eth0`. Слушать трафик можно изнутри любой из машин: `sudo ip netns exec lab-tds tcpdump -i eth0 ...`.
+
+```bash setup
+# «Машины» задачи — network namespace lab-*, «кабели» — пары veth. Всё лабораторное начинается с lab.
+lab_net_reset() {
+  for u in $(systemctl list-units --all --plain --no-legend 'lab-net-*' | awk '{print $1}'); do
+    systemctl stop "$u" 2>/dev/null; systemctl reset-failed "$u" 2>/dev/null
+  done
+  for ns in $(ip netns list | awk '$1 ~ /^lab-/ {print $1}'); do
+    ip netns pids "$ns" | xargs -r kill -9 2>/dev/null; ip netns del "$ns"
+  done
+  for l in $(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1 | grep '^lab'); do ip link del "$l" 2>/dev/null; done
+  rm -rf /etc/netns/lab-*
+  true
+}
+# lab_ns имя — пустая «машина» lab-имя с поднятым loopback
+lab_ns() { ip netns add "lab-$1"; ip -n "lab-$1" link set lo up; }
+# lab_link ns1 if1 addr1 ns2 if2 addr2 — кабель между двумя машинами; ns «-» — сам стенд, addr «-» — без адреса
+lab_link() {
+  local t1=labt$RANDOM t2=labu$RANDOM
+  ip link add "$t1" type veth peer name "$t2"
+  _lab_end "$1" "$t1" "$2" "$3"; _lab_end "$4" "$t2" "$5" "$6"
+}
+_lab_end() {
+  if [ "$1" = - ]; then
+    ip link set "$2" name "$3"; ip link set "$3" up; [ "$4" = - ] || ip addr add "$4" dev "$3"
+  else
+    ip link set "$2" netns "lab-$1"; ip -n "lab-$1" link set "$2" name "$3"; ip -n "lab-$1" link set "$3" up
+    [ "$4" = - ] || ip -n "lab-$1" addr add "$4" dev "$3"
+  fi
+}
+# lab_bg имя ns команда... — фоновый процесс внутри машины (служба lab-net-имя)
+lab_bg() { local u=$1 ns=$2; shift 2; systemd-run -q --unit="lab-net-$u" ip netns exec "lab-$ns" "$@"; }
+# lab_wait_port ns адрес порт — дождаться, пока сервис начнёт слушать
+lab_wait_port() { for i in $(seq 40); do ip netns exec "lab-$1" ss -ltnH "src $2 and sport = :$3" | grep -q . && return 0; sleep 0.25; done; return 1; }
+lab_net_reset
+lab_ns tdc; lab_ns tds
+lab_link tdc eth0 10.70.0.10/24 tds eth0 10.70.0.20/24
+```
+
+### Пароль в открытом виде
+
+Клиент раз в пару секунд входит в веб-приложение на сервере по **HTTP без TLS**. Перехватите трафик и найдите **пароль**, который он отправляет. Запишите его в `~/sniffed.txt`.
+
+```bash setup
+rm -f /home/student/sniffed.txt
+pw="P@ss-$(tr -dc a-z0-9 </dev/urandom | head -c 8)"
+echo "$pw" > /var/lib/lab/sniff-pw
+lab_bg tds-web tds python3 -m http.server 80 --bind 10.70.0.20 --directory /tmp
+lab_wait_port tds 10.70.0.20 80
+lab_bg tdc-login tdc bash -c "while true; do curl -s -o /dev/null --data-urlencode 'user=admin' --data-urlencode 'password=$pw' http://10.70.0.20/login; sleep 2; done"
+```
+
+```bash check
+want=$(cat /var/lib/lab/sniff-pw)
+[ -f /home/student/sniffed.txt ] || fail "Нет ~/sniffed.txt"
+got=$(tr -d '[:space:]' < /home/student/sniffed.txt)
+[ "$got" = "$want" ] || fail "В ~/sniffed.txt «$got» — это не пароль из перехваченного запроса"
+ok "пароль перехвачен — вот почему HTTP без TLS нельзя"
+```
+
+```text hint
+1. Запустить захват на интерфейсе сервера (или клиента), отфильтровав по порту веб-сервера, без разрешения имён, с выводом содержимого пакетов в текстовом виде и ограничением числа пакетов.
+2. Пароль идёт в теле POST-запроса в формате «поле=значение&...», спецсимволы в нём закодированы процентами (%40 — это @).
+```
+
+```bash solution
+sudo ip netns exec lab-tds timeout 5 tcpdump -i eth0 -n -A -c 20 'tcp port 80' 2>/dev/null | grep -o 'password=[^& ]*' | head -1
+pw=$(sudo ip netns exec lab-tds timeout 5 tcpdump -i eth0 -n -A -c 20 'tcp port 80' 2>/dev/null | grep -o 'password=[^& ]*' | head -1 | cut -d= -f2)
+python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "$pw" > ~/sniffed.txt
+```
+
+```text review
+Эталон: `tcpdump -i eth0 -n -A 'tcp port 80'` → найти `password=...` в теле POST.
+
+- Любой, кто видит трафик (сосед в Wi-Fi, провайдер, взломанный маршрутизатор, сосед по облачной сети), читает HTTP целиком. Поэтому всё с паролями, токенами и cookie — только через HTTPS, а внутри инфраструктуры — mTLS или хотя бы TLS между сервисами.
+- Фильтры tcpdump (BPF): `host 10.70.0.10`, `port 80`, `tcp[tcpflags] & tcp-syn != 0`, `and`/`or`/`not`. `-w file.pcap` — сохранить для Wireshark, `-r file.pcap` — прочитать.
+- `-A` — содержимое в ASCII, `-X` — hex + ASCII, `-s 0` — пакет целиком, `-c N` — остановиться после N пакетов.
+- На проде tcpdump видит чужие данные — снимают дамп только с разрешения и коротко.
+```
+
+### Кто получает отказ
+
+Клиент без конца пытается подключиться к какому-то TCP-порту сервера `10.70.0.20` и получает отказ — сервер отвечает сбросом соединения (RST). По захвату трафика определите **номер порта**, к которому ломится клиент, и запишите его в `~/rst-port.txt`.
+
+```bash setup
+rm -f /home/student/rst-port.txt
+port=$(( RANDOM % 20000 + 20000 ))
+echo $port > /var/lib/lab/rst-port
+lab_bg tdc-knock tdc bash -c "while true; do timeout 1 bash -c '</dev/tcp/10.70.0.20/$port' 2>/dev/null; timeout 1 bash -c '</dev/tcp/10.70.0.20/80' 2>/dev/null; sleep 1; done"
+```
+
+```bash check
+want=$(cat /var/lib/lab/rst-port)
+[ -f /home/student/rst-port.txt ] || fail "Нет ~/rst-port.txt"
+got=$(tr -d '[:space:]' < /home/student/rst-port.txt)
+[ "$got" = "$want" ] || fail "В ~/rst-port.txt «$got» — клиент получает отказ на другом порту"
+ok "клиент стучится в закрытый порт $want"
+```
+
+```text hint
+1. Захватить трафик между машинами без разрешения имён и портов в названия.
+2. Оставить только пакеты с флагом сброса соединения — у фильтра tcpdump есть доступ к флагам TCP. В выводе флаг сброса помечен буквой R.
+3. Порт сервера — в адресе отправителя пакета сброса (после последней точки).
+```
+
+```bash solution
+sudo ip netns exec lab-tds timeout 4 tcpdump -i eth0 -n -c 3 'tcp[tcpflags] & tcp-rst != 0' 2>/dev/null
+sudo ip netns exec lab-tds timeout 4 tcpdump -i eth0 -n -c 1 'tcp[tcpflags] & tcp-rst != 0' 2>/dev/null | awk '{print $3}' | awk -F. '{print $NF}' > ~/rst-port.txt
+```
+
+```text review
+Эталон: `tcpdump -n 'tcp[tcpflags] & tcp-rst != 0'` → порт в адресе отправителя RST.
+
+- Флаги в выводе tcpdump: `[S]` — SYN, `[S.]` — SYN-ACK, `[.]` — ACK, `[P.]` — данные, `[F.]` — FIN, `[R]`/`[R.]` — сброс.
+- RST в ответ на SYN = порт закрыт («Connection refused»). RST посреди соединения — сервер или файрвол рвёт соединение (перезапуск бэкенда, тайм-аут балансировщика).
+- Рукопожатие целиком: `tcpdump -n 'tcp[tcpflags] & (tcp-syn|tcp-fin|tcp-rst) != 0'`.
+- В Wireshark то же фильтром `tcp.flags.reset == 1`, а Statistics → Conversations покажет, кто с кем говорит.
+```
+
 ## Тест
 
 ### Для чего нужен tcpdump?

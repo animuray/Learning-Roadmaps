@@ -118,6 +118,190 @@ Docker по умолчанию использует `172.17.0.0/16`, а Kubernet
 - [ ] Посмотреть сеть Docker (`docker network inspect bridge`), если Docker установлен, и найти её подсеть
 - [ ] Выполнить `ip route get 1.1.1.1` и `ip route get 127.0.0.1` и сравнить результат
 
+## Лаборатория
+
+«Машины» в задачах — сетевые пространства имён (network namespaces) `lab-*` на стенде: у каждой свои интерфейсы, адреса и маршруты. Команда внутри машины: `sudo ip netns exec lab-<имя> <команда>`, коротко для ip — `sudo ip -n lab-<имя> ...`. Список машин — `ip netns list`.
+
+```bash setup
+# «Машины» задачи — network namespace lab-*, «кабели» — пары veth. Всё лабораторное начинается с lab.
+lab_net_reset() {
+  for u in $(systemctl list-units --all --plain --no-legend 'lab-net-*' | awk '{print $1}'); do
+    systemctl stop "$u" 2>/dev/null; systemctl reset-failed "$u" 2>/dev/null
+  done
+  for ns in $(ip netns list | awk '$1 ~ /^lab-/ {print $1}'); do
+    ip netns pids "$ns" | xargs -r kill -9 2>/dev/null; ip netns del "$ns"
+  done
+  for l in $(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1 | grep '^lab'); do ip link del "$l" 2>/dev/null; done
+  rm -rf /etc/netns/lab-*
+  true
+}
+# lab_ns имя — пустая «машина» lab-имя с поднятым loopback
+lab_ns() { ip netns add "lab-$1"; ip -n "lab-$1" link set lo up; }
+# lab_link ns1 if1 addr1 ns2 if2 addr2 — кабель между двумя машинами; ns «-» — сам стенд, addr «-» — без адреса
+lab_link() {
+  local t1=labt$RANDOM t2=labu$RANDOM
+  ip link add "$t1" type veth peer name "$t2"
+  _lab_end "$1" "$t1" "$2" "$3"; _lab_end "$4" "$t2" "$5" "$6"
+}
+_lab_end() {
+  if [ "$1" = - ]; then
+    ip link set "$2" name "$3"; ip link set "$3" up; [ "$4" = - ] || ip addr add "$4" dev "$3"
+  else
+    ip link set "$2" netns "lab-$1"; ip -n "lab-$1" link set "$2" name "$3"; ip -n "lab-$1" link set "$3" up
+    [ "$4" = - ] || ip -n "lab-$1" addr add "$4" dev "$3"
+  fi
+}
+# lab_bg имя ns команда... — фоновый процесс внутри машины (служба lab-net-имя)
+lab_bg() { local u=$1 ns=$2; shift 2; systemd-run -q --unit="lab-net-$u" ip netns exec "lab-$ns" "$@"; }
+# lab_wait_port ns адрес порт — дождаться, пока сервис начнёт слушать
+lab_wait_port() { for i in $(seq 40); do ip netns exec "lab-$1" ss -ltnH "src $2 and sport = :$3" | grep -q . && return 0; sleep 0.25; done; return 1; }
+```
+
+### Посчитать подсеть
+
+В `~/task.txt` записан адрес узла с префиксом (например, `172.16.37.143/21`). Посчитайте для его подсети и запишите в `~/subnet.txt` три строки:
+
+1. адрес сети;
+2. широковещательный адрес (broadcast);
+3. число адресов, которые можно выдать узлам.
+
+```bash setup
+rm -f /home/student/subnet.txt
+python3 - <<'EOF' > /home/student/task.txt
+import random
+first = random.choice(["10", "172.16", "192.168"])
+if first == "10": ip = f"10.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+elif first == "172.16": ip = f"172.{random.randint(16,31)}.{random.randint(0,255)}.{random.randint(1,254)}"
+else: ip = f"192.168.{random.randint(0,255)}.{random.randint(1,254)}"
+print(f"{ip}/{random.randint(19,29)}")
+EOF
+chown student:student /home/student/task.txt
+```
+
+```bash check
+[ -f /home/student/subnet.txt ] || fail "Нет ~/subnet.txt"
+task=$(tr -d '[:space:]' < /home/student/task.txt)
+python3 - "$task" /home/student/subnet.txt <<'EOF' || exit 1
+import ipaddress, sys
+net = ipaddress.ip_interface(sys.argv[1]).network
+lines = [l.strip() for l in open(sys.argv[2]) if l.strip()]
+def fail(m): print("✗ " + m); sys.exit(1)
+if len(lines) < 3: fail(f"В ~/subnet.txt строк: {len(lines)}, нужно 3")
+if lines[0].split("/")[0] != str(net.network_address): fail(f"Адрес сети «{lines[0]}» неверен")
+if lines[1] != str(net.broadcast_address): fail(f"Broadcast «{lines[1]}» неверен")
+if lines[2] != str(net.num_addresses - 2): fail(f"Число адресов для узлов «{lines[2]}» неверно")
+print(f"✓ {sys.argv[1]}: сеть {net}, broadcast {net.broadcast_address}, узлов {net.num_addresses - 2}")
+EOF
+```
+
+```text hint
+1. Префикс /N — первые N бит адреса относятся к сети. Переведите в двоичный вид тот октет, где проходит граница.
+2. Адрес сети — все биты узла нули; broadcast — все биты узла единицы.
+3. Адресов в подсети — 2 в степени (32 − N); два из них (сеть и broadcast) узлам не выдают.
+4. Себя проверить можно калькулятором подсетей в терминале.
+```
+
+```bash solution
+t=$(cat ~/task.txt)
+ipcalc -nb "$t"
+python3 -c "import ipaddress,sys; n=ipaddress.ip_interface(sys.argv[1]).network; print(n.network_address); print(n.broadcast_address); print(n.num_addresses-2)" "$t" > ~/subnet.txt
+```
+
+```text review
+Эталон: вручную через двоичную запись октета с границей, проверка — `ipcalc 172.16.37.143/21`.
+
+- Пример: `/21` → граница в третьем октете (21 − 16 = 5 бит сети в нём), шаг подсетей там `2^(8−5) = 8`: 37 попадает в блок 32–39. Сеть `172.16.32.0`, broadcast `172.16.39.255`, узлов `2^11 − 2 = 2046`.
+- Быстрые соответствия: /24 — 254 узла, /25 — 126, /26 — 62, /27 — 30, /28 — 14, /29 — 6, /30 — 2 (линк между маршрутизаторами), /32 — один адрес.
+- Частные диапазоны (RFC 1918): `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`. В облаке VPC режут на подсети так же: публичные и приватные /24 под зоны.
+- Ловушка: подсети Docker (`172.17.0.0/16`) и Kubernetes (`10.42.0.0/16`, `10.43.0.0/16` у k3s) не должны пересекаться с корпоративной сетью — иначе часть сети станет недоступна.
+```
+
+### Соединить две машины
+
+Машины `lab-a` и `lab-b` соединены кабелем: у каждой интерфейс `eth0`, но без адресов. Назначьте `lab-a` адрес **10.10.1.1/24**, `lab-b` — **10.10.1.2/24**, чтобы они пинговали друг друга.
+
+```bash setup
+lab_net_reset
+lab_ns a; lab_ns b
+lab_link a eth0 - b eth0 -
+```
+
+```bash check
+ip -n lab-a -4 -o addr show dev eth0 | grep -q ' 10.10.1.1/24 ' || fail "У lab-a на eth0 нет адреса 10.10.1.1/24 (сейчас: $(ip -n lab-a -4 -o addr show dev eth0 | awk '{print $4}' | tr '\n' ' '))"
+ip -n lab-b -4 -o addr show dev eth0 | grep -q ' 10.10.1.2/24 ' || fail "У lab-b на eth0 нет адреса 10.10.1.2/24"
+ip netns exec lab-a ping -c1 -W1 10.10.1.2 >/dev/null 2>&1 || fail "lab-a не пингует 10.10.1.2 (интерфейсы подняты? $(ip -n lab-a -br link show eth0))"
+ip netns exec lab-b ping -c1 -W1 10.10.1.1 >/dev/null 2>&1 || fail "lab-b не пингует 10.10.1.1"
+ok "lab-a ⇄ lab-b, маршрут: $(ip -n lab-a route | head -1)"
+```
+
+```text hint
+1. Посмотреть интерфейсы и адреса машины — утилита ip, раздел адресов, с ключом «пространство имён».
+2. Добавить адрес с префиксом на интерфейс каждой машины.
+3. Проверить связь ping изнутри машины. Маршрут до соседей по подсети появляется сам, когда на интерфейсе есть адрес.
+```
+
+```bash solution
+sudo ip -n lab-a addr add 10.10.1.1/24 dev eth0
+sudo ip -n lab-b addr add 10.10.1.2/24 dev eth0
+sudo ip -n lab-a link set eth0 up
+sudo ip -n lab-b link set eth0 up
+sudo ip netns exec lab-a ping -c 2 10.10.1.2
+```
+
+```text review
+Эталон: `ip addr add 10.10.1.1/24 dev eth0` на каждой машине (+ `ip link set eth0 up`).
+
+- Вместе с адресом `/24` ядро добавляет маршрут «подсеть `10.10.1.0/24` — напрямую через eth0» (`proto kernel scope link` в `ip route`). Без префикса (`/32`) соседа не будет видно.
+- `ip a`, `ip r`, `ip link` — замена устаревших `ifconfig` и `route`. `-br` — короткий вид: `ip -br a`.
+- Адрес через `ip addr add` живёт до перезагрузки. Постоянно — в netplan (`/etc/netplan/*.yaml`, Ubuntu), NetworkManager (`nmcli`) или systemd-networkd.
+```
+
+### Нет связи через маршрутизатор
+
+Клиент `lab-client` (10.11.1.10/24) должен ходить к серверу `lab-server` (10.11.2.20/24) через маршрутизатор `lab-router` (10.11.1.1 и 10.11.2.1). Сейчас связи нет. Восстановите её, **ничего не меняя на сервере**: `lab-client` должен пинговать `10.11.2.20`. Неисправностей может быть больше одной.
+
+```bash setup
+lab_net_reset
+lab_ns client; lab_ns router; lab_ns server
+lab_link client eth0 10.11.1.10/24 router eth0 10.11.1.1/24
+lab_link router eth1 10.11.2.1/24 server eth0 10.11.2.20/24
+ip -n lab-server route add default via 10.11.2.1
+ip netns exec lab-router sysctl -qw net.ipv4.ip_forward=0
+```
+
+```bash check
+ip netns exec lab-client ping -c1 -W1 10.11.2.20 >/dev/null 2>&1 || fail "lab-client не пингует 10.11.2.20"
+[ "$(ip -n lab-server route | grep -c default)" = 1 ] && ip -n lab-server -4 -o addr show eth0 | grep -q 10.11.2.20/24 || fail "На сервере изменена сетевая настройка"
+ok "client → router → server: $(ip netns exec lab-client ip route get 10.11.2.20 | head -1)"
+```
+
+```text hint
+1. Пройти путь пакета по шагам: какой маршрут у клиента к сети сервера? Таблица маршрутов есть у каждой машины.
+2. Пингуется ли сам маршрутизатор с клиента? А сервер — с маршрутизатора?
+3. Машина с двумя интерфейсами не пересылает чужие пакеты между ними, пока это явно не разрешено параметром ядра. В namespace у маршрутизатора свои параметры ядра.
+```
+
+```bash solution
+sudo ip netns exec lab-client ip route
+sudo ip -n lab-client route add default via 10.11.1.1
+sudo ip netns exec lab-router sysctl net.ipv4.ip_forward
+sudo ip netns exec lab-router sysctl -w net.ipv4.ip_forward=1
+sudo ip netns exec lab-client ping -c 2 10.11.2.20
+```
+
+```text review
+Эталон: маршрут по умолчанию у клиента (`ip route add default via 10.11.1.1`) + `net.ipv4.ip_forward=1` на маршрутизаторе.
+
+- Пакет до другой подсети уходит на **шлюз** — первый совпавший маршрут в `ip route` (самый длинный префикс). Проверить, куда пойдёт пакет: `ip route get 10.11.2.20`.
+- Linux-машина маршрутизирует, только если `ip_forward=1`. Его включают Docker, Kubernetes, VPN — и выключенный forward после «закручивания гаек» ломает контейнерам интернет.
+- Помните про **обратный** путь: серверу тоже нужен маршрут до клиента (здесь — его default через маршрутизатор). Асимметричная маршрутизация — частая причина «пинг в одну сторону».
+- Диагностика по шагам: пинг шлюза → пинг дальнего интерфейса шлюза → пинг цели → `traceroute`, а на маршрутизаторе — `tcpdump`: доходят ли пакеты и уходят ли дальше.
+```
+
+```text notes
+ip\s+(-n\s+lab-server|netns\s+exec\s+lab-server\s+ip)\s+[^\n]*(route|addr)\s+(add|del|change|replace) => Менялась настройка сервера — по условию его трогать было нельзя.
+```
+
 ## Тест
 
 ### Сколько адресов в подсети /24?

@@ -96,6 +96,153 @@ sudo sysctl --system                     # применить все файлы 
 - [ ] Открыть файл в `less` в одном терминале, удалить его в другом и восстановить через `/proc/PID/fd`
 - [ ] Включить `net.ipv4.ip_forward` через `sysctl -w`, затем сделать настройку постоянной через `/etc/sysctl.d/`
 
+## Лаборатория
+
+```bash setup
+lab_unit() { systemctl stop "$1" 2>/dev/null; systemctl reset-failed "$1" 2>/dev/null; true; }
+mkdir -p /opt/lab
+```
+
+### Вернуть удалённый файл
+
+Кто-то удалил `~/data/orders.csv` — выгрузку заказов, копии нет. Но программа `orders-exporter` до сих пор держит этот файл открытым. Восстановите файл на прежнее место **с полным содержимым**.
+
+```bash setup
+lab_unit lab-exporter
+rm -rf /home/student/data
+mkdir -p /home/student/data
+{ echo "id,customer,total"; for i in $(seq 1 500); do echo "$i,customer$((i % 37)),$((i * 7 % 1000))"; done; } > /home/student/data/orders.csv
+chown -R student:student /home/student/data
+md5sum < /home/student/data/orders.csv > /var/lib/lab/orders.md5
+cat > /opt/lab/orders-exporter <<'EOF'
+#!/usr/bin/env python3
+import time
+f = open("/home/student/data/orders.csv")
+while True:
+    time.sleep(60)
+EOF
+chmod 755 /opt/lab/orders-exporter
+systemd-run -q --unit=lab-exporter -p User=student /opt/lab/orders-exporter
+sleep 1
+rm -f /home/student/data/orders.csv
+```
+
+```bash check
+f=/home/student/data/orders.csv
+[ -f $f ] || fail "~/data/orders.csv нет"
+[ "$(md5sum < $f)" = "$(cat /var/lib/lab/orders.md5)" ] || fail "Файл есть, но содержимое не совпадает с исходным ($(wc -l < $f) строк)"
+ok "orders.csv восстановлен: $(wc -l < $f) строк"
+```
+
+```text hint
+1. Найти PID программы.
+2. В каталоге процесса в /proc есть подкаталог с его открытыми файловыми дескрипторами — это ссылки на файлы. Удалённый файл помечен там словом «deleted».
+3. Через такую ссылку файл можно прочитать, пока процесс жив, — и скопировать куда нужно.
+```
+
+```bash solution
+pid=$(pgrep -f orders-exporter)
+ls -l /proc/$pid/fd/
+fd=$(ls -l /proc/$pid/fd/ | awk '/orders.csv \(deleted\)/ {print $9}')
+cp /proc/$pid/fd/$fd ~/data/orders.csv
+```
+
+```text review
+Эталон: `ls -l /proc/<PID>/fd` → `cp /proc/<PID>/fd/<N> ~/data/orders.csv`.
+
+- Удаление (`rm`) убирает только **имя** файла. Данные живут, пока на них ссылается хоть одно имя или открытый дескриптор.
+- `/proc/PID/fd/N` — дескрипторы процесса; через них можно читать удалённые файлы. Найти все такие файлы в системе: `lsof +L1` (или `lsof | grep deleted`).
+- Обратная сторона: удалённый, но открытый лог продолжает занимать место — `df` показывает, что диск полон, а `du` его «не видит». Лечится перезапуском программы или усечением через `: > /proc/PID/fd/N`.
+- Ещё полезное в `/proc/PID`: `cmdline`, `environ`, `cwd`, `exe`, `status`, `limits`.
+```
+
+### Где работает процесс
+
+Процесс `mystery-job` пишет какие-то файлы в свой текущий каталог. Узнайте его **текущий рабочий каталог** и запишите полный путь в `~/cwd.txt`.
+
+```bash setup
+lab_unit lab-mystery
+d=/var/tmp/job-$(tr -dc a-z0-9 </dev/urandom | head -c 6)
+rm -rf /var/tmp/job-*
+mkdir -p $d && chown student:student $d
+echo $d > /var/lib/lab/mystery-cwd
+cat > /opt/lab/mystery-job <<'EOF'
+#!/bin/bash
+while true; do date > out.txt; sleep 5; done
+EOF
+chmod 755 /opt/lab/mystery-job
+rm -f /home/student/cwd.txt
+systemd-run -q --unit=lab-mystery -p User=student -p WorkingDirectory=$d /opt/lab/mystery-job
+```
+
+```bash check
+want=$(cat /var/lib/lab/mystery-cwd)
+[ -f /home/student/cwd.txt ] || fail "Нет ~/cwd.txt"
+got=$(tr -d '[:space:]' < /home/student/cwd.txt)
+[ "$got" = "$want" ] || fail "В ~/cwd.txt «$got» — это не рабочий каталог mystery-job"
+ok "mystery-job работает в $want"
+```
+
+```text hint
+В каталоге процесса в /proc есть символическая ссылка на его текущий каталог. Прочитать, куда ведёт ссылка, можно отдельной командой.
+```
+
+```bash solution
+pid=$(pgrep -f /opt/lab/mystery-job)
+readlink /proc/$pid/cwd > ~/cwd.txt
+```
+
+```text review
+Эталон: `readlink /proc/<PID>/cwd`.
+
+- Также `pwdx <PID>` или `lsof -p <PID> | grep cwd`.
+- `/proc/PID/exe` — какой бинарник реально запущен (полезно, если файл подменили или удалили), `/proc/PID/root` — корень процесса (у процесса в контейнере — файловая система контейнера).
+- Относительные пути в программе отсчитываются от cwd. У службы systemd он задаётся `WorkingDirectory=`, иначе это `/`.
+```
+
+### Параметр ядра — сейчас и навсегда
+
+Для базы данных рекомендуют уменьшить склонность ядра к свопу: параметр `vm.swappiness` должен быть равен `10`. Примените значение **сразу** (без перезагрузки) и сделайте так, чтобы оно **сохранилось после перезагрузки** — отдельным файлом настроек.
+
+```bash setup
+sysctl -qw vm.swappiness=60
+for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do [ -f "$f" ] && sed -i '/^[[:space:]]*vm\.swappiness/d' "$f"; done
+true
+```
+
+```bash check
+[ "$(sysctl -n vm.swappiness)" = 10 ] || fail "Сейчас vm.swappiness = $(sysctl -n vm.swappiness)"
+files=$(grep -lE '^[[:space:]]*vm\.swappiness[[:space:]]*=[[:space:]]*10[[:space:]]*$' /etc/sysctl.d/*.conf 2>/dev/null)
+[ -n "$files" ] || fail "Значение не сохранено в файле настроек в /etc/sysctl.d/ — после перезагрузки вернётся 60"
+ok "vm.swappiness = 10, сохранено в $files"
+```
+
+```text hint
+1. Параметры ядра видны как файлы в /proc/sys (точки в имени — это каталоги), а для чтения и записи есть отдельная утилита с ключом «записать».
+2. Чтобы значение пережило перезагрузку, его кладут в свой файл с расширением .conf в каталоге настроек этой утилиты.
+3. Применить все файлы настроек можно той же утилитой с ключом «системные».
+```
+
+```bash solution
+sudo sysctl -w vm.swappiness=10
+echo 'vm.swappiness = 10' | sudo tee /etc/sysctl.d/90-swappiness.conf >/dev/null
+sudo sysctl --system >/dev/null
+sysctl vm.swappiness
+```
+
+```text review
+Эталон: `sysctl -w vm.swappiness=10` + файл `/etc/sysctl.d/90-swappiness.conf`.
+
+- `sysctl -w` меняет значение только до перезагрузки. Постоянное — файлы `/etc/sysctl.d/*.conf`; применяются по порядку имён, поэтому свои называют с большим номером.
+- `/proc/sys/vm/swappiness` и `sysctl vm.swappiness` — одно и то же: `echo 10 | sudo tee /proc/sys/vm/swappiness` тоже сработает (но тоже до перезагрузки).
+- Часто меняют: `net.ipv4.ip_forward` (маршрутизация, Docker, Kubernetes), `fs.inotify.max_user_watches`, `net.core.somaxconn`, `vm.max_map_count` (Elasticsearch).
+- `/etc/sysctl.conf` тоже читается, но отдельные файлы удобнее раскатывать Ansible и откатывать.
+```
+
+```text notes
+>>\s*/etc/sysctl\.conf|nano\s+/etc/sysctl\.conf|vim?\s+/etc/sysctl\.conf => Значение дописывалось в /etc/sysctl.conf. Работает, но свои настройки удобнее держать отдельным файлом в /etc/sysctl.d/.
+```
+
 ## Тест
 
 ### Что такое /proc?

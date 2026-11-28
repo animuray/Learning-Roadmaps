@@ -123,6 +123,163 @@ spec:
 - [ ] Запустить CronJob вручную через `kubectl create job --from=cronjob/...`
 - [ ] Сделать CronJob бэкапа PostgreSQL в PVC с часовым поясом `Europe/Moscow`
 
+## Лаборатория
+
+Кластер — k3s на стенде.
+
+```bash lib
+# Kubernetes на стенде — k3s (один узел). root работает с /etc/rancher/k3s/k3s.yaml, ученик — со своим ~/.kube/config
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# lab_kns имя — чистый namespace задачи (старый удаляется вместе со всем содержимым)
+lab_kns() {
+  kubectl delete ns "$1" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1
+  kubectl create ns "$1" >/dev/null
+}
+# убрать с узла метки и taint-ы, которые оставляют задачи про размещение подов
+lab_knode() {
+  kubectl taint nodes --all lab-dedicated- >/dev/null 2>&1
+  kubectl label nodes --all disktype- zone- >/dev/null 2>&1
+  true
+}
+# lab_kready ns селектор [секунд] — дождаться готовности подов
+lab_kready() { kubectl -n "$1" wait --for=condition=Ready pod -l "$2" --timeout="${3:-90}s" >/dev/null 2>&1; }
+# lab_kfiles каталог — каталог манифестов ученика (пустой)
+lab_kfiles() { rm -rf "$1"; mkdir -p "$1"; chown -R student:student "$1"; }
+lab_kj() { kubectl "$@" -o json 2>/dev/null; }
+lab_traefik() { kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'; }
+```
+
+```bash setup
+lab_knode
+```
+
+### Пакетная задача
+
+Создайте в namespace **`lab-jobs`** Job **`report`** (образ `busybox:1.36`), который выполняет команду `echo "report done"` и должен завершиться успешно **3 раза** (`completions`), запуская **не больше 2 подов одновременно**. При падении — **не больше 2 повторов**, а завершённый Job удаляется сам через **10 минут** после окончания.
+
+```bash setup
+lab_kns lab-jobs
+```
+
+```bash check
+j=$(lab_kj -n lab-jobs get job report) || fail "Job report нет"
+[ "$(echo "$j" | jq -r .spec.completions)" = 3 ] || fail "completions = $(echo "$j" | jq -r .spec.completions)"
+[ "$(echo "$j" | jq -r .spec.parallelism)" = 2 ] || fail "parallelism = $(echo "$j" | jq -r .spec.parallelism)"
+[ "$(echo "$j" | jq -r .spec.backoffLimit)" = 2 ] || fail "backoffLimit = $(echo "$j" | jq -r .spec.backoffLimit)"
+[ "$(echo "$j" | jq -r .spec.ttlSecondsAfterFinished)" = 600 ] || fail "Job не удалится через 10 минут после завершения"
+kubectl -n lab-jobs wait --for=condition=complete job/report --timeout=90s >/dev/null 2>&1 || fail "Job не завершился успешно"
+[ "$(lab_kj -n lab-jobs get job report | jq -r .status.succeeded)" = 3 ] || fail "Успешных запусков не 3"
+ok "report: 3 успешных пода, по 2 одновременно"
+```
+
+```text hint
+1. Каркас Job — kubectl create job в режиме «показать на клиенте».
+2. Число успешных завершений, параллелизм, лимит повторов и время жизни после завершения — поля спецификации Job.
+3. У пода Job политика перезапуска не может быть Always.
+```
+
+```bash solution
+mkdir -p ~/k8s
+cat > ~/k8s/report.yaml <<'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: report
+  namespace: lab-jobs
+spec:
+  completions: 3
+  parallelism: 2
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: report
+          image: busybox:1.36
+          command: ["sh", "-c", "echo report done"]
+EOF
+kubectl apply -f ~/k8s/report.yaml
+kubectl -n lab-jobs wait --for=condition=complete job/report --timeout=90s
+```
+
+```text review
+Эталон — в «Решении».
+
+- Job — для разовой работы до успешного завершения: миграции базы перед деплоем, пересчёт отчётов, импорт данных. Под перезапускается при ошибке до `backoffLimit`.
+- `restartPolicy: Never` — новая попытка в **новом** поде (логи прошлых сохраняются); `OnFailure` — перезапуск контейнера в том же поде.
+- `ttlSecondsAfterFinished` убирает завершённые Job — иначе они копятся и мешают `kubectl get pods`.
+- `activeDeadlineSeconds` — общий тайм-аут: зависшая задача не будет висеть вечно.
+```
+
+### Расписание
+
+Создайте в namespace **`lab-jobs`** CronJob **`cleanup`** (образ `busybox:1.36`, команда `echo cleanup`), который:
+
+- запускается **каждые 15 минут**;
+- **не запускает** новый экземпляр, пока не закончился предыдущий;
+- хранит историю **2 успешных** и **1 неудачного** запуска.
+
+Не дожидаясь расписания, **запустите его один раз вручную** — как Job **`cleanup-manual`**, созданный из этого CronJob.
+
+```bash setup
+lab_kns lab-jobs
+```
+
+```bash check
+c=$(lab_kj -n lab-jobs get cronjob cleanup) || fail "CronJob cleanup нет"
+[ "$(echo "$c" | jq -r .spec.schedule)" = "*/15 * * * *" ] || fail "Расписание — «$(echo "$c" | jq -r .spec.schedule)»"
+[ "$(echo "$c" | jq -r .spec.concurrencyPolicy)" = Forbid ] || fail "Новый запуск может начаться, пока идёт предыдущий (concurrencyPolicy: $(echo "$c" | jq -r .spec.concurrencyPolicy))"
+[ "$(echo "$c" | jq -r .spec.successfulJobsHistoryLimit)" = 2 ] && [ "$(echo "$c" | jq -r .spec.failedJobsHistoryLimit)" = 1 ] || fail "История запусков не 2 успешных / 1 неудачный"
+j=$(lab_kj -n lab-jobs get job cleanup-manual) || fail "Job cleanup-manual нет — CronJob не запускали вручную"
+[ "$(echo "$j" | jq -r '.metadata.ownerReferences[0].kind // .metadata.annotations["cronjob.kubernetes.io/instantiate"] // empty')" != "" ] || fail "cleanup-manual создан не из CronJob cleanup"
+kubectl -n lab-jobs wait --for=condition=complete job/cleanup-manual --timeout=60s >/dev/null 2>&1 || fail "cleanup-manual не завершился"
+ok "cleanup: */15, Forbid, ручной запуск выполнен"
+```
+
+```text hint
+1. Расписание — в формате cron: пять полей (минута, час, день, месяц, день недели); «каждые N» — через косую черту.
+2. Поведение при наложении запусков и глубина истории — поля спецификации CronJob; сам шаблон Job — внутри.
+3. У kubectl create job есть ключ «из» — создать Job из шаблона CronJob.
+```
+
+```bash solution
+mkdir -p ~/k8s
+cat > ~/k8s/cleanup.yaml <<'EOF'
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cleanup
+  namespace: lab-jobs
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: cleanup
+              image: busybox:1.36
+              command: ["sh", "-c", "echo cleanup"]
+EOF
+kubectl apply -f ~/k8s/cleanup.yaml
+kubectl -n lab-jobs create job cleanup-manual --from=cronjob/cleanup
+kubectl -n lab-jobs wait --for=condition=complete job/cleanup-manual --timeout=60s
+```
+
+```text review
+Эталон: CronJob с `schedule: "*/15 * * * *"`, `concurrencyPolicy: Forbid` + `kubectl create job --from=cronjob/cleanup`.
+
+- `concurrencyPolicy`: `Allow` (по умолчанию — можно параллельно), `Forbid` (пропустить запуск, если прошлый не закончился), `Replace` (убить прошлый). Для бэкапов и очистки — Forbid.
+- Время — по часовому поясу kube-controller-manager (обычно UTC); с 1.27 есть `timeZone: Europe/Moscow`.
+- Ручной запуск `--from=cronjob/...` — проверить задачу сразу после изменения, не дожидаясь расписания.
+- `startingDeadlineSeconds` — сколько можно опоздать с запуском (после простоя кластера), иначе запуск пропускается.
+```
+
 ## Тест
 
 ### Чем Job отличается от Deployment?

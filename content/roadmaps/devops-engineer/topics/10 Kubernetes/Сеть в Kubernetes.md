@@ -167,6 +167,147 @@ kubectl -n kube-system logs deploy/coredns
 - [ ] Пересоздать kind-кластер с Calico или Cilium (отключив стандартный CNI) и применить default-deny + разрешение frontend → api
 - [ ] Закрыть egress без правила для DNS и убедиться, что сломалось разрешение имён; починить
 
+## Лаборатория
+
+Кластер — k3s на стенде; NetworkPolicy в нём работают (встроенный контроллер).
+
+```bash lib
+# Kubernetes на стенде — k3s (один узел). root работает с /etc/rancher/k3s/k3s.yaml, ученик — со своим ~/.kube/config
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# lab_kns имя — чистый namespace задачи (старый удаляется вместе со всем содержимым)
+lab_kns() {
+  kubectl delete ns "$1" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1
+  kubectl create ns "$1" >/dev/null
+}
+# убрать с узла метки и taint-ы, которые оставляют задачи про размещение подов
+lab_knode() {
+  kubectl taint nodes --all lab-dedicated- >/dev/null 2>&1
+  kubectl label nodes --all disktype- zone- >/dev/null 2>&1
+  true
+}
+# lab_kready ns селектор [секунд] — дождаться готовности подов
+lab_kready() { kubectl -n "$1" wait --for=condition=Ready pod -l "$2" --timeout="${3:-90}s" >/dev/null 2>&1; }
+# lab_kfiles каталог — каталог манифестов ученика (пустой)
+lab_kfiles() { rm -rf "$1"; mkdir -p "$1"; chown -R student:student "$1"; }
+lab_kj() { kubectl "$@" -o json 2>/dev/null; }
+lab_traefik() { kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'; }
+```
+
+```bash setup
+lab_knode
+```
+
+### Имя сервиса из другого namespace
+
+В namespace **`lab-data`** работает сервис **`postgres`**, а приложение — в namespace **`lab-app`**. Узнайте **полное DNS-имя** (FQDN) сервиса, по которому к нему можно обратиться из любого namespace, и запишите его в `~/fqdn.txt`. Проверьте из пода `client` в `lab-app`, что имя разрешается.
+
+```bash setup
+for ns in lab-data lab-app; do lab_kns $ns; done
+kubectl -n lab-data create deployment postgres --image=busybox:1.36 -- sleep 100000 >/dev/null
+kubectl -n lab-data expose deployment postgres --port=5432 >/dev/null
+kubectl -n lab-app run client --image=busybox:1.36 --restart=Never --command -- sleep 100000 >/dev/null
+rm -f /home/student/fqdn.txt
+```
+
+```bash check
+dom=$(kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' | grep -oE 'kubernetes [a-z.]+' | awk '{print $2}' | head -1)
+want="postgres.lab-data.svc.${dom:-cluster.local}"
+[ -f /home/student/fqdn.txt ] || fail "Нет ~/fqdn.txt"
+got=$(tr -d '[:space:]' < /home/student/fqdn.txt); got=${got%.}
+[ "$got" = "$want" ] || fail "В ~/fqdn.txt «$got» — это не полное имя сервиса postgres из lab-data"
+kubectl -n lab-app wait --for=condition=Ready pod/client --timeout=60s >/dev/null 2>&1
+kubectl -n lab-app exec client -- nslookup "$want" >/dev/null 2>&1 || fail "Из lab-app имя $want не разрешается"
+ok "$want → $(kubectl -n lab-data get svc postgres -o jsonpath='{.spec.clusterIP}')"
+```
+
+```text hint
+1. DNS-имя сервиса строится из имени сервиса, имени namespace, слова svc и домена кластера.
+2. Домен кластера и поисковые домены видны в файле настроек резолвера внутри любого пода.
+3. Проверить разрешение имени утилитой поиска DNS внутри пода-клиента.
+```
+
+```bash solution
+kubectl -n lab-app exec client -- cat /etc/resolv.conf
+kubectl -n lab-app exec client -- nslookup postgres.lab-data.svc.cluster.local
+echo postgres.lab-data.svc.cluster.local > ~/fqdn.txt
+```
+
+```text review
+Эталон: `postgres.lab-data.svc.cluster.local`.
+
+- В `/etc/resolv.conf` пода — сервер CoreDNS и `search <ns>.svc.cluster.local svc.cluster.local cluster.local`: поэтому внутри своего namespace хватает `postgres`, а из соседнего — `postgres.lab-data`.
+- `options ndots:5`: имена с меньше чем 5 точками сначала пробуются с каждым search-доменом — внешние запросы (`api.github.com`) порождают лишние DNS-запросы. Для частых внешних вызовов используют FQDN с точкой в конце.
+- Headless-сервис (`clusterIP: None`) отдаёт в DNS адреса самих подов, а у подов StatefulSet есть имена `db-0.db.ns.svc.cluster.local`.
+- Отладка DNS: `kubectl run -it --rm dbg --image=busybox -- nslookup ...`, логи CoreDNS в kube-system.
+```
+
+### Закрыть базу NetworkPolicy
+
+В namespace **`lab-netpol`** работают сервис **`db`** (поды `app=db`, порт 5432), под-бэкенд **`api`** (метка `app=api`) и посторонний под **`other`**. Создайте NetworkPolicy **`db-allow-api`**, после которой к подам `db` по TCP **5432** могут подключаться **только** поды `app=api` из того же namespace. Под `other` должен получать отказ по тайм-ауту.
+
+```bash setup
+lab_kns lab-netpol
+kubectl -n lab-netpol create deployment db --image=busybox:1.36 -- sh -c 'while true; do nc -lk -p 5432 -e echo ok; done' >/dev/null
+kubectl -n lab-netpol expose deployment db --port=5432 >/dev/null
+kubectl -n lab-netpol run api --image=busybox:1.36 --labels=app=api --restart=Never --command -- sleep 100000 >/dev/null
+kubectl -n lab-netpol run other --image=busybox:1.36 --labels=app=other --restart=Never --command -- sleep 100000 >/dev/null
+kubectl -n lab-netpol rollout status deploy/db --timeout=90s >/dev/null
+lab_kready lab-netpol app=api
+lab_kready lab-netpol app=other
+```
+
+```bash check
+np=$(lab_kj -n lab-netpol get networkpolicy db-allow-api) || fail "NetworkPolicy db-allow-api нет"
+[ "$(echo "$np" | jq -r '.spec.podSelector.matchLabels.app')" = db ] || fail "Политика применяется не к подам app=db"
+sleep 2
+kubectl -n lab-netpol exec api -- nc -z -w 3 db 5432 >/dev/null 2>&1 || fail "Под api не может подключиться к db:5432"
+kubectl -n lab-netpol exec other -- nc -z -w 3 db 5432 >/dev/null 2>&1 && fail "Под other всё ещё подключается к db:5432"
+ok "к db:5432 пускает только app=api"
+```
+
+```text hint
+1. Политика выбирает поды, которые защищает, по меткам; как только под выбран политикой с типом Ingress, всё входящее, что не разрешено явно, запрещается.
+2. В правилах входящего трафика — источник (выбор подов по метке) и порт с протоколом.
+3. Проверить подключение из обоих подов с ограничением по времени.
+```
+
+```bash solution
+mkdir -p ~/k8s
+cat > ~/k8s/db-netpol.yaml <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-allow-api
+  namespace: lab-netpol
+spec:
+  podSelector:
+    matchLabels:
+      app: db
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api
+      ports:
+        - protocol: TCP
+          port: 5432
+EOF
+kubectl apply -f ~/k8s/db-netpol.yaml
+sleep 2
+kubectl -n lab-netpol exec api -- nc -zv -w 3 db 5432
+kubectl -n lab-netpol exec other -- nc -zv -w 3 db 5432 || echo "other: закрыто"
+```
+
+```text review
+Эталон — в «Решении».
+
+- По умолчанию в Kubernetes **все поды видят всех**. Первая же политика, выбравшая под, делает его «deny by default» для указанного направления.
+- Частая схема: `default-deny` на namespace (пустой `podSelector: {}` без правил) + точечные разрешения. Не забудьте разрешить DNS (UDP/TCP 53 к CoreDNS), если закрываете Egress.
+- `from` может содержать `podSelector`, `namespaceSelector` (из другого namespace — по меткам namespace) и `ipBlock`.
+- Политики работают, только если их поддерживает CNI: Calico, Cilium, kube-router (k3s). В «голом» Flannel они молча игнорируются.
+```
+
 ## Тест
 
 ### Какие требования предъявляет сетевая модель Kubernetes?

@@ -131,6 +131,116 @@ archive_command = 'test ! -f /archive/%f && cp %p /archive/%f'
 - [ ] Настроить pgBackRest или WAL-G с хранением в MinIO/S3 и ежедневный CronJob или systemd timer
 - [ ] Написать скрипт автоматической проверки восстановления
 
+## Лаборатория
+
+PostgreSQL 16 на стенде, база **`shop`**. Утилиты `pg_dump`, `pg_restore`, `psql` запускайте от системного пользователя `postgres` (`sudo -u postgres ...`) — у него права на все базы.
+
+```bash lib
+# PostgreSQL 16 на стенде: кластер 16/main, порт 5432. Администратор — системный пользователь postgres.
+lab_psql() { sudo -u postgres psql -qXtA "$@"; }
+# lab_shopdb — учебная база shop: customers, orders (крупная), audit_log (самая крупная), settings
+lab_shopdb() {
+  lab_psql -c "DROP DATABASE IF EXISTS shop WITH (FORCE)" -c "CREATE DATABASE shop" >/dev/null
+  lab_psql -d shop >/dev/null <<'EOF'
+CREATE TABLE customers (id serial PRIMARY KEY, name text, city text);
+CREATE TABLE orders (id serial PRIMARY KEY, customer_id int REFERENCES customers, total numeric, status text, created_at timestamptz DEFAULT now());
+CREATE TABLE audit_log (id bigserial PRIMARY KEY, event text, payload text, at timestamptz DEFAULT now());
+CREATE TABLE settings (key text PRIMARY KEY, value text);
+INSERT INTO customers (name, city) SELECT 'customer ' || g, (ARRAY['Москва','Казань','Пермь'])[1 + g % 3] FROM generate_series(1, 2000) g;
+INSERT INTO orders (customer_id, total, status) SELECT 1 + g % 2000, (g % 500) * 10, (ARRAY['new','paid','shipped'])[1 + g % 3] FROM generate_series(1, 30000) g;
+INSERT INTO audit_log (event, payload) SELECT 'event ' || g, repeat(md5(g::text), 8) FROM generate_series(1, 60000) g;
+INSERT INTO settings VALUES ('currency', 'RUB'), ('vat', '20');
+EOF
+}
+```
+
+### Бэкап и восстановление в новую базу
+
+Сделайте **бэкап** базы `shop` в **custom-формате** в файл `/var/backups/pg/shop.dump`, а затем **восстановите** его в новую базу **`shop_restored`**. Число строк во всех таблицах должно совпасть с исходной базой.
+
+```bash setup
+lab_shopdb
+lab_psql -c "DROP DATABASE IF EXISTS shop_restored WITH (FORCE)" >/dev/null
+rm -rf /var/backups/pg
+mkdir -p /var/backups/pg && chown postgres:postgres /var/backups/pg
+```
+
+```bash check
+f=/var/backups/pg/shop.dump
+[ -f $f ] || fail "Нет /var/backups/pg/shop.dump"
+pg_restore -l $f >/dev/null 2>&1 || fail "shop.dump — не архив custom-формата (pg_restore -l его не читает)"
+pg_restore -l $f | grep -q 'TABLE DATA public orders' || fail "В бэкапе нет данных таблицы orders"
+[ "$(lab_psql -c "select 1 from pg_database where datname = 'shop_restored'")" = 1 ] || fail "Базы shop_restored нет"
+for t in customers orders audit_log settings; do
+  a=$(lab_psql -d shop -c "select count(*) from $t"); b=$(lab_psql -d shop_restored -c "select count(*) from $t" 2>/dev/null)
+  [ "$a" = "$b" ] || fail "В $t: в shop $a строк, в shop_restored ${b:-таблицы нет}"
+done
+lab_psql -d shop_restored -c "select count(*) from pg_constraint where conname like '%_fkey'" | grep -qv '^0$' || fail "В восстановленной базе нет внешних ключей"
+ok "бэкап $(du -h $f | cut -f1), shop_restored совпадает с shop"
+```
+
+```text hint
+1. Утилита логического бэкапа: ключ формата (custom — сжатый, с оглавлением, для выборочного восстановления) и файл вывода.
+2. Создать пустую базу для восстановления.
+3. Утилита восстановления custom-архивов: в какую базу и из какого файла; полезен ключ «без владельцев», если ролей нет на целевом сервере.
+4. Сравнить количество строк.
+```
+
+```bash solution
+sudo -u postgres pg_dump -Fc -d shop -f /var/backups/pg/shop.dump
+sudo -u postgres pg_restore -l /var/backups/pg/shop.dump | head -15
+sudo -u postgres createdb shop_restored
+sudo -u postgres pg_restore -d shop_restored --no-owner /var/backups/pg/shop.dump
+sudo -u postgres psql -d shop_restored -c "select count(*) from orders"
+```
+
+```text review
+Эталон: `pg_dump -Fc` → `createdb shop_restored` → `pg_restore -d shop_restored`.
+
+- Форматы: plain SQL (`-Fp`, восстанавливается `psql`), custom (`-Fc`, сжатый, выборочное восстановление `-t таблица`, параллельность `-j`), directory (`-Fd`, параллельный дамп).
+- `pg_dump` — снимок **одной базы** на момент начала, не блокирует работу. Роли и настройки кластера в него не входят — их сохраняет `pg_dumpall --globals-only`.
+- **Бэкап, который не восстанавливали, — не бэкап.** Регулярно проверяйте восстановление в отдельную базу или на отдельный сервер, автоматически.
+- Для больших баз и восстановления на момент времени (PITR) — физические бэкапы + WAL: `pg_basebackup`, pgBackRest, WAL-G.
+```
+
+### Восстановить одну таблицу
+
+Кто-то выполнил `TRUNCATE settings` в базе `shop`. Есть ночной бэкап `/var/backups/pg/nightly.dump` (custom-формат). Восстановите из него **только данные таблицы `settings`** — остальные таблицы трогать нельзя: в них со времени бэкапа появились новые данные.
+
+```bash setup
+lab_shopdb
+rm -rf /var/backups/pg && mkdir -p /var/backups/pg && chown postgres:postgres /var/backups/pg
+sudo -u postgres pg_dump -Fc -d shop -f /var/backups/pg/nightly.dump
+lab_psql -d shop -c "INSERT INTO orders (customer_id, total, status) VALUES (1, 999, 'new'), (2, 888, 'new')" -c "TRUNCATE settings" >/dev/null
+lab_psql -d shop -c "select count(*) from orders" > /var/lib/lab/orders-count
+```
+
+```bash check
+[ "$(lab_psql -d shop -c "select value from settings where key = 'currency'")" = RUB ] && [ "$(lab_psql -d shop -c "select count(*) from settings")" = 2 ] || fail "Данные settings не восстановлены (строк: $(lab_psql -d shop -c 'select count(*) from settings'))"
+[ "$(lab_psql -d shop -c "select count(*) from orders")" = "$(cat /var/lib/lab/orders-count)" ] || fail "Изменилась таблица orders — новые заказы после бэкапа потеряны или задвоены"
+ok "settings восстановлена, новые заказы на месте"
+```
+
+```text hint
+1. Посмотреть оглавление архива — там видно отдельные элементы: схему таблиц и данные таблиц.
+2. У утилиты восстановления есть ключи «только данные» и «только эта таблица».
+3. Восстанавливать в рабочую базу shop.
+```
+
+```bash solution
+sudo -u postgres pg_restore -l /var/backups/pg/nightly.dump | grep settings
+sudo -u postgres pg_restore -d shop --data-only -t settings /var/backups/pg/nightly.dump
+sudo -u postgres psql -d shop -c "select * from settings"
+```
+
+```text review
+Эталон: `pg_restore -d shop --data-only -t settings nightly.dump`.
+
+- Custom-формат позволяет выборочное восстановление: `-t` (таблица), `-n` (схема), `-L список.txt` (свой список элементов из `pg_restore -l`).
+- Восстанавливать «поверх» живой базы опасно: если в таблице остались строки — будут конфликты ключей. Надёжнее восстановить в отдельную базу и перенести нужное (`INSERT ... SELECT` через `dblink` или выгрузку `COPY`).
+- Защита от `TRUNCATE`/`DROP` по ошибке: отдельные роли без прав на DDL для приложения и людей, обязательный `BEGIN` в консоли (`\set AUTOCOMMIT off`).
+```
+
 ## Тест
 
 ### Чем pg_dump отличается от pg_basebackup?

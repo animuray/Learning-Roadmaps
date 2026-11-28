@@ -119,6 +119,142 @@ pipelining = True
 - [ ] Выполнить `ansible all -m shell -a "echo hi >> /tmp/x"` дважды и убедиться, что shell не идемпотентен
 - [ ] Запустить с `-vvv` и найти в выводе, как Ansible копирует и выполняет модуль на сервере
 
+## Лаборатория
+
+«Серверы» — контейнеры `lab-web1`, `lab-web2`, `lab-db1` с Python. Ansible подключается к ним не по SSH, а через Docker: переменная `ansible_connection=community.docker.docker` вместо адреса и ключа. Всё остальное — как с настоящими серверами. Заглянуть на сервер: `docker exec -it lab-web1 bash`.
+
+```bash lib
+# «Серверы» для Ansible — контейнеры lab-web1, lab-web2, lab-db1 (Python, sudo, sshd); подключение — community.docker.docker
+lab_host_image() {
+  docker image inspect lab-ansible-host:2 >/dev/null 2>&1 && return
+  docker image inspect python:3.12-slim >/dev/null 2>&1 || docker pull -q python:3.12-slim >/dev/null
+  docker build -q -t lab-ansible-host:2 - >/dev/null <<'EOF'
+FROM python:3.12-slim
+RUN apt-get update -q && apt-get install -y -q --no-install-recommends sudo openssh-server \
+ && mkdir -p /run/sshd && rm -rf /var/lib/apt/lists/*
+CMD ["sleep", "infinity"]
+EOF
+}
+lab_hosts() { lab_host_image; for h in ${*:-lab-web1 lab-web2 lab-db1}; do docker rm -f $h >/dev/null 2>&1; docker run -d --name $h --hostname $h lab-ansible-host:2 >/dev/null; done; }
+# lab_inv каталог — ansible.cfg и inventory.ini: web = lab-web1, lab-web2; db = lab-db1
+lab_inv() {
+  mkdir -p "$1"
+  printf '[defaults]\ninventory = inventory.ini\ninterpreter_python = /usr/local/bin/python3\n' > "$1/ansible.cfg"
+  printf '[web]\nlab-web1\nlab-web2\n\n[db]\nlab-db1\n\n[all:vars]\nansible_connection=community.docker.docker\n' > "$1/inventory.ini"
+}
+lab_own() { chown -R student:student "$1"; }
+# lab_play каталог аргументы — ansible-playbook от имени ученика, вывод — в /tmp/lab-ans.log
+lab_play() { su - student -c "cd $1 && ANSIBLE_NOCOLOR=1 ansible-playbook $2" > /tmp/lab-ans.log 2>&1; }
+# сумма changed по всем хостам из итогов последнего прогона
+lab_changed() { grep -E '^lab-[a-z0-9]+ +:' /tmp/lab-ans.log | grep -oE 'changed=[0-9]+' | cut -d= -f2 | awk '{s += $1} END {print s + 0}'; }
+lab_anslog() { grep -E 'fatal|ERROR|FAILED|error' /tmp/lab-ans.log | head -2 | tr '\n' ' ' | cut -c1-300; }
+```
+
+### Проект Ansible
+
+Создайте проект в `~/ansible-lab`:
+
+- `inventory.ini` — группа **`web`** из `lab-web1` и `lab-web2`; для всех хостов подключение `community.docker.docker`;
+- `ansible.cfg` — указывает inventory по умолчанию и интерпретатор Python на серверах `/usr/local/bin/python3`.
+
+Команда `ansible web -m ping`, запущенная **в каталоге проекта без ключа `-i`**, должна получить `pong` от обоих хостов.
+
+```bash setup
+lab_hosts
+rm -rf /home/student/ansible-lab
+```
+
+```bash check
+d=/home/student/ansible-lab
+[ -f $d/ansible.cfg ] || fail "Нет ~/ansible-lab/ansible.cfg"
+[ -f $d/inventory.ini ] || fail "Нет ~/ansible-lab/inventory.ini"
+inv=$(su - student -c "cd $d && ansible-config dump --only-changed" 2>/dev/null | grep DEFAULT_HOST_LIST)
+echo "$inv" | grep -q "$d/inventory.ini" || fail "ansible.cfg не задаёт inventory по умолчанию (ansible-config dump: ${inv:-ничего})"
+out=$(su - student -c "cd $d && ansible web -m ping -o" 2>&1)
+for h in lab-web1 lab-web2; do echo "$out" | grep -q "^$h | SUCCESS" || fail "$h не отвечает на ping: $(echo "$out" | grep "^$h" | cut -c1-150)"; done
+echo "$out" | grep -q lab-db1 && fail "В группе web оказался lab-db1"
+ok "$(echo "$out" | cut -d'|' -f1-2 | tr '\n' ';')"
+```
+
+```text hint
+1. Inventory в формате INI: заголовок группы в квадратных скобках и имена хостов по строке; переменные для всех хостов — в специальной секции группы «all» с суффиксом «:vars».
+2. В ansible.cfg — раздел настроек по умолчанию: путь к inventory и интерпретатор Python.
+3. Ansible ищет ansible.cfg в текущем каталоге — запускать нужно оттуда. Какой конфиг подхватился, видно в выводе ansible --version.
+```
+
+```bash solution
+mkdir -p ~/ansible-lab && cd ~/ansible-lab
+cat > inventory.ini <<'EOF'
+[web]
+lab-web1
+lab-web2
+
+[all:vars]
+ansible_connection=community.docker.docker
+EOF
+cat > ansible.cfg <<'EOF'
+[defaults]
+inventory = inventory.ini
+interpreter_python = /usr/local/bin/python3
+EOF
+ansible --version | head -2
+ansible web -m ping
+```
+
+```text review
+Эталон: `inventory.ini` с группой `[web]` и `[all:vars]`, `ansible.cfg` с `inventory` и `interpreter_python`.
+
+- Ansible — **агентless**: на сервер он заходит (обычно по SSH), копирует туда модуль на Python, выполняет и удаляет. Поэтому на сервере нужен только Python.
+- Порядок поиска конфига: `ANSIBLE_CONFIG` → `./ansible.cfg` → `~/.ansible.cfg` → `/etc/ansible/ansible.cfg`. Конфиг в репозитории проекта — норма; `ansible --version` показывает, какой подхватился.
+- С настоящими серверами в inventory пишут `ansible_host`, `ansible_user`, `ansible_ssh_private_key_file` (или берут из `~/.ssh/config`).
+- `ping` здесь — не ICMP, а проверка «Ansible может зайти и выполнить Python».
+```
+
+### Идемпотентно, а не «ещё раз»
+
+На серверах группы `web` в файле `/etc/motd` должна быть строка `Managed by Ansible` — **ровно одна**. Добейтесь этого **ad-hoc командой** Ansible (без плейбука) так, чтобы её **повторный запуск ничего не менял**. Выполните команду дважды.
+
+```bash setup
+lab_hosts lab-web1 lab-web2
+for h in lab-web1 lab-web2; do docker exec $h sh -c 'printf "Debian GNU/Linux\n" > /etc/motd'; done
+rm -rf /home/student/ansible-lab
+lab_inv /home/student/ansible-lab
+lab_own /home/student/ansible-lab
+```
+
+```bash check
+for h in lab-web1 lab-web2; do
+  n=$(docker exec $h grep -cx 'Managed by Ansible' /etc/motd)
+  [ "$n" = 1 ] || fail "На $h строка «Managed by Ansible» встречается $n раз"
+  docker exec $h grep -qx 'Debian GNU/Linux' /etc/motd || fail "На $h пропало прежнее содержимое /etc/motd"
+done
+ok "строка — ровно одна на обоих серверах"
+```
+
+```text hint
+1. Модуль для команд оболочки просто выполняет команду каждый раз — дописывание строки при повторе её задвоит.
+2. Есть модуль, который описывает **состояние** строки в файле: «такая строка должна присутствовать». Если она уже есть — он ничего не делает.
+3. Ad-hoc команда: группа, ключ модуля, ключ аргументов модуля.
+```
+
+```bash solution
+cd ~/ansible-lab
+ansible web -m lineinfile -a "path=/etc/motd line='Managed by Ansible'"
+ansible web -m lineinfile -a "path=/etc/motd line='Managed by Ansible'"
+```
+
+```text review
+Эталон: `ansible web -m lineinfile -a "path=/etc/motd line='Managed by Ansible'"` — первый раз CHANGED, второй — SUCCESS (ok).
+
+- **Идемпотентность**: модуль описывает желаемое состояние, а не действие. Прогон на уже настроенном сервере ничего не меняет — плейбук можно запускать сколько угодно раз.
+- `shell`/`command` не идемпотентны: `echo ... >> /etc/motd` при каждом запуске добавит строку. Их используют в крайнем случае и тогда добавляют `creates:`/`removes:` или `changed_when:`.
+- Цвета в выводе: зелёный — ok (ничего не меняли), жёлтый — changed, красный — failed. На собеседовании про идемпотентность спрашивают почти всегда.
+```
+
+```text notes
+-m\s+(shell|command)\b[^\n]*(>>|echo) => Строка дописывалась через shell — такая команда не идемпотентна: повторный запуск задвоил бы строку.
+```
+
 ## Тест
 
 ### Что нужно на управляемых серверах для работы Ansible?

@@ -134,6 +134,161 @@ systemctl get-default           # target по умолчанию
 - [ ] Через `systemctl edit` добавить службе `MemoryMax=` и проверить в `systemctl status`, что лимит применился
 - [ ] Перенести любую свою cron-задачу на systemd timer
 
+## Лаборатория
+
+### Своя служба
+
+Скрипт `/opt/hello/server.sh` уже написан. Оформите его как службу systemd `hello`:
+
+- работает от системного пользователя `hello` (не от root);
+- автоматически перезапускается, если упадёт;
+- запускается при загрузке системы;
+- запущена прямо сейчас.
+
+```bash setup
+systemctl disable --now hello.service >/dev/null 2>&1; rm -f /etc/systemd/system/hello.service; systemctl daemon-reload
+id hello >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin hello
+mkdir -p /opt/hello
+cat > /opt/hello/server.sh <<'EOF'
+#!/bin/bash
+# Учебная «служба»: раз в 5 секунд пишет в журнал, что жива.
+while true; do echo "hello-service alive, user=$(id -un)"; sleep 5; done
+EOF
+chmod 755 /opt/hello/server.sh
+```
+
+```bash check
+systemctl cat hello.service >/dev/null 2>&1 || fail "Служба hello не найдена: нет unit-файла hello.service"
+[ "$(systemctl is-active hello)" = active ] || fail "Служба hello не работает (состояние: $(systemctl is-active hello))"
+[ "$(systemctl is-enabled hello 2>/dev/null)" = enabled ] || fail "Служба hello не запустится при загрузке системы"
+u=$(systemctl show -p User --value hello)
+[ "$u" = hello ] || fail "Служба работает от «${u:-root}», а нужно от пользователя hello"
+r=$(systemctl show -p Restart --value hello)
+case "$r" in always|on-failure|on-abnormal) ;; *) fail "Если служба упадёт, systemd её не перезапустит";; esac
+pid=$(systemctl show -p MainPID --value hello)
+[ "$(ps -o user= -p "$pid" | tr -d ' ')" = hello ] || fail "Процесс службы (PID $pid) работает не от hello"
+ok "hello: active, enabled, User=hello, Restart=$r, PID $pid"
+```
+
+```text hint
+1. Создать unit-файл службы в каталоге для своих (администраторских) юнитов: секция с описанием, секция службы и секция установки.
+2. В секции службы: что запускать (полный путь), от какого пользователя, и политика перезапуска.
+3. В секции установки: к какой цели привязать автозапуск — к обычной многопользовательской загрузке.
+4. Перечитать конфигурацию systemd, затем включить и запустить службу — это можно одной командой.
+```
+
+```bash solution
+sudo tee /etc/systemd/system/hello.service > /dev/null <<'EOF'
+[Unit]
+Description=Hello lab service
+After=network.target
+
+[Service]
+ExecStart=/opt/hello/server.sh
+User=hello
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now hello
+```
+
+```text review
+Эталон — в «Решении».
+
+- Свои юниты кладут в `/etc/systemd/system/`, а не в `/lib/systemd/system/` (там юниты пакетов, их перезапишет обновление).
+- После любой правки unit-файла — `systemctl daemon-reload`, иначе systemd продолжит работать со старой версией.
+- `enable --now` = `enable` (автозапуск: ссылка в `multi-user.target.wants`) + `start`. Частая ошибка — сделать только `start`: после перезагрузки службы не будет.
+- `Restart=always` + `RestartSec` — перезапуск с паузой; systemd сам перестанет пытаться, если служба падает слишком часто (`StartLimitBurst`).
+- `User=` — принцип минимальных прав: веб-приложению не нужен root. Для ещё большей изоляции есть `DynamicUser=yes`, `ProtectSystem=strict`, `NoNewPrivileges=yes`.
+- Логи службы: `journalctl -u hello -f`.
+```
+
+```text notes
+/lib/systemd/system/hello => Свой unit положен в /lib/systemd/system — это каталог пакетов. Свои юниты кладут в /etc/systemd/system.
+nohup|&\s*$ => Запуск через nohup или & — не служба: после перезагрузки или падения процесс не поднимется, логи никуда не собираются.
+```
+
+### Служба не стартует
+
+Служба `report` из пакета не запускается. Разберитесь по журналу, почему, и почините её **не меняя** ни скрипт, ни исходный unit-файл `/lib/systemd/system/report.service` — изменения пакетных юнитов делают отдельным файлом-дополнением. Служба должна работать и быть в автозапуске.
+
+```bash setup
+systemctl disable --now report.service >/dev/null 2>&1
+rm -rf /etc/systemd/system/report.service /etc/systemd/system/report.service.d
+mkdir -p /opt/report
+cat > /opt/report/run.sh <<'EOF'
+#!/bin/bash
+if [ -z "${REPORT_DIR:-}" ]; then
+    echo "ОШИБКА: не задана переменная окружения REPORT_DIR (куда складывать отчёты)" >&2
+    exit 1
+fi
+mkdir -p "$REPORT_DIR"
+while true; do date > "$REPORT_DIR/last-run"; sleep 10; done
+EOF
+chmod 755 /opt/report/run.sh
+cat > /lib/systemd/system/report.service <<'EOF'
+[Unit]
+Description=Nightly report generator
+
+[Service]
+ExecStart=/opt/report/run.sh
+Restart=on-failure
+RestartSec=1
+StartLimitBurst=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+md5sum /lib/systemd/system/report.service /opt/report/run.sh > /var/lib/lab/report.md5
+systemctl daemon-reload
+systemctl start report.service >/dev/null 2>&1; true
+```
+
+```bash check
+md5sum -c --quiet /var/lib/lab/report.md5 >/dev/null 2>&1 || fail "Исходный unit-файл или скрипт изменены — так делать нельзя: при обновлении пакета правка пропадёт"
+[ "$(systemctl is-active report)" = active ] || fail "Служба report не работает (состояние: $(systemctl is-active report))"
+[ "$(systemctl is-enabled report 2>/dev/null)" = enabled ] || fail "Служба report не запустится при загрузке системы"
+ls /etc/systemd/system/report.service.d/*.conf >/dev/null 2>&1 || fail "Служба работает, но исправление не оформлено отдельным файлом-дополнением"
+d=$(systemctl show -p Environment --value report | tr ' ' '\n' | sed -n 's/^REPORT_DIR=//p')
+[ -n "$d" ] || fail "Служба запущена без настройки, которой ей не хватало"
+sleep 1
+[ -f "$d/last-run" ] || fail "Служба запущена, но не создала $d/last-run"
+ok "report работает, REPORT_DIR=$d"
+```
+
+```text hint
+1. Посмотреть статус службы и её журнал — скрипт пишет, чего ему не хватает.
+2. Пакетные юниты не правят, а дополняют: у systemctl есть команда редактирования, которая сама создаёт файл-дополнение в каталоге /etc/systemd/system/<служба>.service.d/. В нём — только раздел службы и недостающая переменная окружения.
+3. Служба могла исчерпать лимит перезапусков — сбросьте счётчик неудач, затем включите и запустите её.
+```
+
+```bash solution
+sudo mkdir -p /etc/systemd/system/report.service.d
+printf '[Service]\nEnvironment=REPORT_DIR=/var/lib/report\n' | sudo tee /etc/systemd/system/report.service.d/override.conf > /dev/null
+sudo systemctl daemon-reload
+sudo systemctl reset-failed report
+sudo systemctl enable --now report
+```
+
+```text review
+Эталон: drop-in `/etc/systemd/system/report.service.d/override.conf` с `Environment=REPORT_DIR=...`.
+
+- Интерактивно это делается командой `sudo systemctl edit report` — она сама создаёт `override.conf` и делает `daemon-reload`. Итоговую конфигурацию показывает `systemctl cat report`.
+- Drop-in переживает обновление пакета, а правка в `/lib/systemd/system` — нет. Полная замена юнита — `systemctl edit --full` (копия в `/etc/systemd/system`).
+- Диагностика всегда начинается с `systemctl status report` и `journalctl -u report -n 50` — там была причина: «не задана переменная REPORT_DIR».
+- Служба упала несколько раз подряд и упёрлась в `StartLimitBurst` — `reset-failed` сбрасывает счётчик, иначе `start` будет отказываться.
+- Службы **не читают** `~/.bashrc` и `/etc/environment` — переменные им задают в юните (`Environment=` или `EnvironmentFile=`).
+```
+
+```text notes
+(nano|vim?|tee)\s+[^\n]*/lib/systemd/system/report => Правка пакетного unit-файла пропадёт при обновлении пакета. Изменения кладут в drop-in: sudo systemctl edit report.
+(nano|vim?)\s+[^\n]*/opt/report/run\.sh => Скрипт менять не нужно: он честно сообщает, чего ему не хватает. Чинят конфигурацию службы.
+```
+
 ## Тест
 
 ### Какой PID у systemd?

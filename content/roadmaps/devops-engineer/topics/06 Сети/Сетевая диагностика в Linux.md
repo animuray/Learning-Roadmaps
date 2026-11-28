@@ -119,6 +119,101 @@ sudo nmap -sU -p 53 10.0.0.2   # UDP
 - [ ] Просканировать свою ВМ через `nmap` и сравнить результат с `ss -tulpn`
 - [ ] Получить разные исходы проверки порта: open, refused и таймаут
 
+## Лаборатория
+
+Машины — сетевые пространства имён `lab-*`: `sudo ip netns exec lab-<имя> <команда>`.
+
+### Бэкенд не видит базу
+
+Бэкенд на машине `lab-app` (10.60.0.10) не может подключиться к базе на `lab-db` (**10.60.1.20:5432**) — между ними маршрутизатор `lab-gw`. База запускается службой `lab-net-db`, адрес, который она слушает, задан в `/etc/lab-db.conf` (после правки службу нужно перезапустить). Найдите **все** причины и устраните их, чтобы `sudo ip netns exec lab-app nc -zv 10.60.1.20 5432` проходил.
+
+```bash setup
+# «Машины» задачи — network namespace lab-*, «кабели» — пары veth. Всё лабораторное начинается с lab.
+lab_net_reset() {
+  for u in $(systemctl list-units --all --plain --no-legend 'lab-net-*' | awk '{print $1}'); do
+    systemctl stop "$u" 2>/dev/null; systemctl reset-failed "$u" 2>/dev/null
+  done
+  for ns in $(ip netns list | awk '$1 ~ /^lab-/ {print $1}'); do
+    ip netns pids "$ns" | xargs -r kill -9 2>/dev/null; ip netns del "$ns"
+  done
+  for l in $(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1 | grep '^lab'); do ip link del "$l" 2>/dev/null; done
+  rm -rf /etc/netns/lab-*
+  true
+}
+# lab_ns имя — пустая «машина» lab-имя с поднятым loopback
+lab_ns() { ip netns add "lab-$1"; ip -n "lab-$1" link set lo up; }
+# lab_link ns1 if1 addr1 ns2 if2 addr2 — кабель между двумя машинами; ns «-» — сам стенд, addr «-» — без адреса
+lab_link() {
+  local t1=labt$RANDOM t2=labu$RANDOM
+  ip link add "$t1" type veth peer name "$t2"
+  _lab_end "$1" "$t1" "$2" "$3"; _lab_end "$4" "$t2" "$5" "$6"
+}
+_lab_end() {
+  if [ "$1" = - ]; then
+    ip link set "$2" name "$3"; ip link set "$3" up; [ "$4" = - ] || ip addr add "$4" dev "$3"
+  else
+    ip link set "$2" netns "lab-$1"; ip -n "lab-$1" link set "$2" name "$3"; ip -n "lab-$1" link set "$3" up
+    [ "$4" = - ] || ip -n "lab-$1" addr add "$4" dev "$3"
+  fi
+}
+# lab_bg имя ns команда... — фоновый процесс внутри машины (служба lab-net-имя)
+lab_bg() { local u=$1 ns=$2; shift 2; systemd-run -q --unit="lab-net-$u" ip netns exec "lab-$ns" "$@"; }
+# lab_wait_port ns адрес порт — дождаться, пока сервис начнёт слушать
+lab_wait_port() { for i in $(seq 40); do ip netns exec "lab-$1" ss -ltnH "src $2 and sport = :$3" | grep -q . && return 0; sleep 0.25; done; return 1; }
+lab_net_reset
+lab_ns app; lab_ns gw; lab_ns db
+lab_link app eth0 10.60.0.10/24 gw eth0 10.60.0.1/24
+lab_link gw eth1 10.60.1.1/24 db eth0 10.60.1.20/24
+ip netns exec lab-gw sysctl -qw net.ipv4.ip_forward=1
+ip -n lab-app route add default via 10.60.0.1
+echo 'LISTEN=127.0.0.1' > /etc/lab-db.conf
+cat > /opt/lab-fake-db.py <<'EOF'
+import socket
+conf = dict(l.strip().split("=", 1) for l in open("/etc/lab-db.conf") if "=" in l)
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((conf.get("LISTEN", "127.0.0.1"), 5432)); s.listen(50)
+print("fake db listens on", conf.get("LISTEN"), flush=True)
+while True:
+    c, _ = s.accept(); c.close()
+EOF
+lab_bg db db python3 /opt/lab-fake-db.py
+lab_wait_port db 127.0.0.1 5432
+```
+
+```bash check
+ip netns exec lab-app timeout 3 bash -c '</dev/tcp/10.60.1.20/5432' 2>/dev/null || {
+  ip netns exec lab-app ping -c1 -W1 10.60.1.20 >/dev/null 2>&1 || fail "С lab-app до 10.60.1.20 нет даже ping"
+  fail "lab-app пингует базу, но порт 5432 недоступен"
+}
+ok "lab-app → 10.60.1.20:5432 доступен"
+```
+
+```text hint
+1. Идти по уровням снизу вверх: есть ли у машин адреса и маршруты? Пингуется ли шлюз? Пингуется ли база с бэкенда, а бэкенд с базы? Для ответа базе нужен обратный путь.
+2. Когда сеть работает, проверить, что база слушает нужный адрес: список слушающих сокетов изнутри машины с базой. Адрес loopback снаружи недоступен.
+3. Исправить конфиг базы и перезапустить её службу.
+```
+
+```bash solution
+sudo ip netns exec lab-app ping -c1 -W1 10.60.0.1
+sudo ip netns exec lab-app ping -c1 -W1 10.60.1.20 || true
+sudo ip netns exec lab-db ip route
+sudo ip -n lab-db route add default via 10.60.1.1
+sudo ip netns exec lab-db ss -ltn
+echo 'LISTEN=0.0.0.0' | sudo tee /etc/lab-db.conf >/dev/null
+sudo systemctl restart lab-net-db
+sleep 1
+sudo ip netns exec lab-app nc -zv -w2 10.60.1.20 5432
+```
+
+```text review
+Эталон: две проблемы — у базы нет маршрута обратно (`ip route add default via 10.60.1.1` в `lab-db`) и база слушает только `127.0.0.1` (`LISTEN=0.0.0.0` + перезапуск).
+
+- Алгоритм «A не видит B»: адрес и маршрут у A → пинг шлюза → пинг B → (пинг A с B — обратный путь!) → порт: `nc -zv B 5432` → на B: `ss -ltnp` (слушает ли и какой адрес) → файрвол на B → журнал сервиса.
+- Типичные «две причины сразу» на собеседовании: `listen_addresses = 'localhost'` в PostgreSQL + закрытый порт в ufw/security group; или `bind 127.0.0.1` в Redis + отсутствующее правило файрвола.
+- `ping` проходит, а порт — нет: смотрите на сам сервис и файрвол. Пинг не проходит: адреса, маршруты, ICMP-фильтры.
+```
+
 ## Тест
 
 ### Какой командой посмотреть IP-адреса интерфейсов в современном Linux?

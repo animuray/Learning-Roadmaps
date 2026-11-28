@@ -119,6 +119,152 @@ lsns                                                 # список namespaces �
 - [ ] Через `unshare --pid --fork --mount-proc bash` создать новый PID namespace и посмотреть, какие процессы видны внутри
 - [ ] Найти PID любого Docker-контейнера на хосте (`docker inspect -f '{{.State.Pid}}'`) и зайти в его сетевой namespace через `nsenter`
 
+## Лаборатория
+
+```bash setup
+lab_unit() { systemctl stop "$1" 2>/dev/null; systemctl reset-failed "$1" 2>/dev/null; true; }
+mkdir -p /opt/lab
+```
+
+### Кто убил импорт
+
+Служба `lab-import` упала посреди работы. В её логе ничего толкового нет. Выясните по журналу **ядра**, что произошло, и запишите в `~/oom-pid.txt` PID процесса, которого убило ядро.
+
+```bash setup
+lab_unit lab-import
+# журнал на диске должен быть доступен группе systemd-journal (ученик в ней)
+systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1
+rm -f /home/student/oom-pid.txt
+systemd-run -q --unit=lab-import -p MemoryMax=40M -p MemorySwapMax=0 python3 -c "import time; time.sleep(1); a = b'x' * (300*1024*1024)"
+for i in $(seq 40); do [ "$(systemctl is-active lab-import)" = failed ] && break; sleep 0.25; done
+sleep 0.5
+journalctl -k --no-pager -o cat | grep -oE 'Killed process [0-9]+ \(python3\)' | tail -1 | awk '{print $3}' > /var/lib/lab/oom-pid
+[ -s /var/lib/lab/oom-pid ]
+```
+
+```bash check
+want=$(cat /var/lib/lab/oom-pid)
+[ -f /home/student/oom-pid.txt ] || fail "Нет ~/oom-pid.txt"
+got=$(tr -d '[:space:]' < /home/student/oom-pid.txt)
+[ "$got" = "$want" ] || fail "В ~/oom-pid.txt «$got» — это не PID процесса, которого последним убил OOM killer"
+ok "OOM killer убил PID $want"
+```
+
+```text hint
+1. Сообщения ядра доступны через journalctl с ключом «только ядро» (или старым dmesg).
+2. Ищите строку о том, что памяти не хватило и процесс был убит, — там его PID. Нужна последняя такая запись.
+3. Статус самой службы тоже подскажет причину падения.
+```
+
+```bash solution
+systemctl status lab-import --no-pager | head -5
+journalctl -k --no-pager | grep -i 'killed process' | tail -1
+journalctl -k --no-pager -o cat | grep -oE 'Killed process [0-9]+' | tail -1 | awk '{print $3}' > ~/oom-pid.txt
+```
+
+```text review
+Эталон: `journalctl -k | grep -i 'killed process'` (или `dmesg -T | grep -i oom`).
+
+- OOM killer убивает SIGKILL — программа не успевает ничего записать в свой лог. Поэтому причину ищут в журнале ядра, а у systemd-службы — в статусе: `Failed with result 'oom-kill'`.
+- `Memory cgroup out of memory` — сработал **лимит cgroup** (MemoryMax службы, limits.memory контейнера), а не закончилась память всей машины. В Kubernetes это `OOMKilled` в `kubectl describe pod`.
+- Что делать: смотреть, сколько процессу реально нужно, поднимать лимит или искать утечку. Защитить важный процесс от OOM killer — `OOMScoreAdjust=-500` в юните (или `oom_score_adj`).
+```
+
+### Ограничить память службе
+
+Служба `lab-cache` (файл `/etc/systemd/system/lab-cache.service`) может съесть всю память сервера. Ограничьте ей память **100 МБ** средствами systemd так, чтобы ограничение действовало сейчас и **сохранилось** после перезапуска службы и перезагрузки. Служба должна работать.
+
+```bash setup
+lab_unit lab-cache
+rm -rf /etc/systemd/system/lab-cache.service.d /etc/systemd/system.control/lab-cache.service.d /run/systemd/system.control/lab-cache.service.d
+cat > /etc/systemd/system/lab-cache.service <<'EOF'
+[Unit]
+Description=Lab cache service
+
+[Service]
+ExecStart=/usr/bin/python3 -c "import time; a = b'x' * (20*1024*1024); time.sleep(10**7)"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl start lab-cache
+```
+
+```bash check
+[ "$(systemctl is-active lab-cache)" = active ] || fail "Служба lab-cache не работает"
+[ "$(systemctl show -p MemoryMax --value lab-cache)" = 104857600 ] || fail "Ограничение памяти службы сейчас: $(systemctl show -p MemoryMax --value lab-cache)"
+cg=/sys/fs/cgroup$(systemctl show -p ControlGroup --value lab-cache)
+[ "$(cat $cg/memory.max 2>/dev/null)" = 104857600 ] || fail "В cgroup службы memory.max = $(cat $cg/memory.max 2>/dev/null) — ограничение не применено к работающей службе"
+grep -rqsE '^MemoryMax=(100M|104857600)' /etc/systemd/system/lab-cache.service /etc/systemd/system/lab-cache.service.d /etc/systemd/system.control/lab-cache.service.d \
+  || fail "Ограничение действует, но не сохранено в настройках службы — после перезагрузки пропадёт"
+ok "lab-cache: MemoryMax=100M ($cg/memory.max)"
+```
+
+```text hint
+1. Ограничение памяти — свойство службы в разделе [Service]. Его можно задать отдельным файлом-дополнением к юниту либо командой systemctl, которая меняет свойство работающей службы.
+2. У этой команды есть режим «только до перезагрузки» — он здесь не подходит.
+3. Проверить: свойство службы и файл memory.max в её cgroup.
+```
+
+```bash solution
+sudo systemctl set-property lab-cache MemoryMax=100M
+systemctl show -p MemoryMax lab-cache
+cat /sys/fs/cgroup/system.slice/lab-cache.service/memory.max
+```
+
+```text review
+Эталон: `sudo systemctl set-property lab-cache MemoryMax=100M` (или drop-in `[Service] MemoryMax=100M` + `daemon-reload` + `restart`).
+
+- `set-property` применяет лимит к работающей службе сразу и сохраняет его в `/etc/systemd/system.control/`; с `--runtime` — только до перезагрузки.
+- Под капотом — cgroup v2: `memory.max` в каталоге службы в `/sys/fs/cgroup`. Docker (`--memory`) и Kubernetes (`limits.memory`) делают то же самое.
+- `MemoryHigh=` — мягкий порог (ядро начинает отбирать память), `MemoryMax=` — жёсткий (дальше OOM). `CPUQuota=50%`, `TasksMax=`, `IOWeight=` — другие ресурсы.
+- Сколько служба потребляет сейчас: `systemctl status lab-cache` (строка Memory) или `systemd-cgtop`.
+```
+
+```text notes
+--runtime => Ограничение ставилось с --runtime — оно пропадёт после перезагрузки.
+echo\s+[^\n]*memory\.max => memory.max записывался напрямую в cgroup — systemd об этом не знает и при перезапуске службы сбросит значение. Ограничения служб задают через systemd.
+```
+
+### Отдельный PID namespace
+
+Запустите команду `ps -e` в **новом PID namespace** со своим `/proc`, чтобы она видела только процессы этого namespace, и сохраните её вывод в `~/ns-ps.txt`.
+
+```bash setup
+rm -f /home/student/ns-ps.txt
+```
+
+```bash check
+f=/home/student/ns-ps.txt
+[ -s $f ] || fail "~/ns-ps.txt пуст или не создан"
+grep -q systemd $f && fail "В выводе видны процессы системы (systemd) — команда выполнялась в общем PID namespace"
+n=$(grep -cE '^[[:space:]]*[0-9]+' $f)
+[ "$n" -ge 1 ] && [ "$n" -le 5 ] || fail "В выводе $n процессов — это не изолированный namespace"
+awk '$1 == 1' $f | grep -q . || fail "В выводе нет процесса с PID 1 — у нового namespace свой PID 1"
+ok "в namespace видно процессов: $n ($(awk 'NR>1 {print $1":"$NF}' $f | tr '\n' ' '))"
+```
+
+```text hint
+1. Есть утилита, которая запускает программу в новых namespace. Нужны три ключа: новый PID namespace, отдельный дочерний процесс (он и станет PID 1) и свежий /proc, иначе ps покажет процессы хоста.
+2. Создавать namespace может только root.
+3. Вывод команды перенаправить в файл.
+```
+
+```bash solution
+sudo unshare --pid --fork --mount-proc ps -e > ~/ns-ps.txt
+cat ~/ns-ps.txt
+```
+
+```text review
+Эталон: `sudo unshare --pid --fork --mount-proc ps -e`.
+
+- Внутри нового PID namespace первый процесс получает PID 1 и видит только своих потомков. `--mount-proc` монтирует новый `/proc`, иначе `ps` читал бы `/proc` хоста.
+- Контейнер — это и есть набор namespace (pid, net, mnt, uts, ipc, user, cgroup) + cgroups для лимитов + своя файловая система. Docker собирает это за вас.
+- Зайти в namespace работающего процесса: `nsenter -t <PID> -n ip a` — сеть контейнера без утилит внутри контейнера.
+- Список namespace в системе: `lsns`.
+```
+
 ## Тест
 
 ### Когда срабатывает OOM Killer?

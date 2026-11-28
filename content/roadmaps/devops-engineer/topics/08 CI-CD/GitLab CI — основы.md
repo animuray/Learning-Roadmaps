@@ -170,6 +170,310 @@ workflow:
 - [ ] Добавить `workflow:rules`, чтобы не было дублирующихся пайплайнов для ветки и merge request
 - [ ] Вывести в задаче `CI_COMMIT_SHORT_SHA`, `CI_COMMIT_REF_SLUG` и `CI_PIPELINE_SOURCE`
 
+## Лаборатория
+
+GitLab-сервера на стенде нет, но есть **`gitlab-ci-local`** — он выполняет `.gitlab-ci.yml` прямо в репозитории, как раннер с shell executor: этапы, `needs`, `rules`, артефакты. Запуск всего пайплайна — `gitlab-ci-local`, одной задачи — `gitlab-ci-local <задача>`, список задач — `gitlab-ci-local --list`.
+
+В `~/ci-basics` — проект: `app.py` (утилита с функцией `add` и ключом `--version`) и тесты `test_app.py` (`python3 -m unittest test_app`).
+
+```bash lib
+# Пайплайны GitLab CI выполняются локально утилитой gitlab-ci-local (shell executor — задачи идут прямо на стенде)
+# lab_ci_repo каталог — новый репозиторий ученика с одним коммитом (файлы кладёт вызывающий до коммита)
+lab_ci_repo() { rm -rf "$1"; mkdir -p "$1"; }
+lab_ci_commit() { chown -R student:student "$1"; su - student -c "cd $1 && git init -q -b main 2>/dev/null; git add -A && git commit -qm 'Initial commit'"; }
+# lab_ci_run каталог [ключи] — пайплайн от имени ученика; вывод — в /tmp/lab-ci.log, код возврата — код пайплайна
+lab_ci_run() { su - student -c "cd $1 && timeout 300 gitlab-ci-local $2" > /tmp/lab-ci.log 2>&1; }
+# lab_ci_preview каталог — итоговый YAML после include, extends и default (JSON)
+lab_ci_preview() { su - student -c "cd $1 && gitlab-ci-local --preview" 2>/dev/null | sed -n '/^---$/,$p' | python3 -c 'import sys,yaml,json; print(json.dumps(yaml.safe_load(sys.stdin)))'; }
+# lab_ci_jobs каталог [ветка] — список задач (JSON); с веткой — во временной копии репозитория на этой ветке
+lab_ci_jobs() {
+  if [ -n "$2" ]; then
+    rm -rf /tmp/lab-ci-branch; su - student -c "git clone -q $1 /tmp/lab-ci-branch && cd /tmp/lab-ci-branch && cp $1/.gitlab-ci*.yml . 2>/dev/null; [ -d $1/ci ] && mkdir -p ci && cp -r $1/ci/. ci/; git switch -qc $2 && gitlab-ci-local --list-json" 2>/dev/null
+  else
+    su - student -c "cd $1 && gitlab-ci-local --list-json" 2>/dev/null
+  fi
+}
+lab_ci_log() { sed 's/\x1b\[[0-9;]*m//g' /tmp/lab-ci.log | grep -vE '^\s*$' | tail -n "${1:-4}" | tr '\n' ' ' | cut -c1-300; }
+lab_drm() { docker rm -f "$@" >/dev/null 2>&1; true; }
+# образ есть локально или скачивается (если ученик почистил образы через prune)
+lab_img() { for i in "$@"; do docker image inspect "$i" >/dev/null 2>&1 || docker pull -q "$i" >/dev/null; done; }
+# lab_wait_http URL [строка] — дождаться ответа
+lab_wait_http() { for i in $(seq 60); do curl -s --max-time 1 "$1" 2>/dev/null | grep -q "${2:-.}" && return 0; sleep 0.25; done; return 1; }
+d=/home/student/ci-basics
+lab_ci_base() {
+  lab_ci_repo $d
+  cat > $d/app.py <<'EOF'
+import sys
+VERSION = "1.0.0"
+def add(a, b):
+    return a + b
+if __name__ == "__main__":
+    if "--version" in sys.argv:
+        print(VERSION)
+    else:
+        print(add(2, 3))
+EOF
+  cat > $d/test_app.py <<'EOF'
+import unittest
+from app import add
+class TestAdd(unittest.TestCase):
+    def test_add(self):
+        self.assertEqual(add(2, 3), 5)
+EOF
+  printf '.gitlab-ci-local/\n__pycache__/\ndist/\n' > $d/.gitignore
+}
+lab_ci_base_pipeline() {
+  cat > $d/.gitlab-ci.yml <<'EOF'
+stages: [lint, test, build]
+
+lint:
+  stage: lint
+  script:
+    - python3 -m py_compile app.py
+
+unit:
+  stage: test
+  script:
+    - python3 -m unittest -v test_app
+
+smoke:
+  stage: test
+  script:
+    - python3 app.py --version
+
+build:
+  stage: build
+  script:
+    - mkdir -p dist
+    - tar -czf dist/app.tar.gz app.py
+  artifacts:
+    paths: [dist/]
+EOF
+}
+```
+
+```bash setup
+su - student -c 'git config --global user.name >/dev/null || git config --global user.name Student; git config --global user.email >/dev/null || git config --global user.email student@stand.local'
+```
+
+### Первый пайплайн
+
+Напишите `~/ci-basics/.gitlab-ci.yml` из трёх этапов по порядку — **lint**, **test**, **build**:
+
+- в **lint** — задача, проверяющая, что `app.py` компилируется (`python3 -m py_compile app.py`);
+- в **test** — **две** задачи, которые выполняются параллельно: модульные тесты и проверка запуска `python3 app.py --version`;
+- в **build** — задача, которая упаковывает `app.py` в `dist/app.tar.gz` и сохраняет каталог `dist/` как **артефакт**.
+
+Пайплайн должен проходить: `gitlab-ci-local` в каталоге проекта.
+
+```bash setup
+lab_ci_base
+lab_ci_commit $d
+```
+
+```bash check
+[ -f $d/.gitlab-ci.yml ] || fail "Нет ~/ci-basics/.gitlab-ci.yml"
+p=$(lab_ci_preview $d) && [ -n "$p" ] && [ "$p" != null ] || fail "gitlab-ci-local не может разобрать .gitlab-ci.yml"
+echo "$p" | python3 -c '
+import json, sys
+p = json.load(sys.stdin)
+st = [s for s in p.get("stages", []) if not s.startswith(".")]
+def fail(m): print("✗ " + m); sys.exit(1)
+if [s for s in st if s in ("lint", "test", "build")] != ["lint", "test", "build"]: fail(f"Этапы не lint → test → build: {st}")
+jobs = {k: v for k, v in p.items() if isinstance(v, dict) and "script" in v and not k.startswith(".")}
+by = {}
+for k, v in jobs.items(): by.setdefault(v.get("stage", "test"), []).append(k)
+if not by.get("lint"): fail("В этапе lint нет задач")
+n_test = len(by.get("test", []))
+if n_test < 2: fail(f"В этапе test задач: {n_test}")
+b = [jobs[k] for k in by.get("build", [])]
+if not b: fail("В этапе build нет задач")
+if not any("dist" in str(j.get("artifacts", {}).get("paths", [])) for j in b): fail("Задача сборки не сохраняет dist/ как артефакт")
+' || exit 1
+lab_ci_run $d || fail "Пайплайн не проходит: $(lab_ci_log)"
+f=$(find $d/.gitlab-ci-local/artifacts -path '*dist/app.tar.gz' 2>/dev/null | head -1)
+[ -n "$f" ] && tar -tzf "$f" | grep -qx app.py || fail "Пайплайн прошёл, но артефакта dist/app.tar.gz с app.py нет"
+ok "пайплайн прошёл: $(sed 's/\x1b\[[0-9;]*m//g' /tmp/lab-ci.log | grep -E '^ *PASS' | awk '{print $2}' | xargs)"
+```
+
+```text hint
+1. В начале файла — список этапов по порядку.
+2. Каждая задача — ключ верхнего уровня с именем, внутри — этап и список команд. Задачи одного этапа выполняются параллельно, этапы — по очереди.
+3. У задачи сборки — раздел артефактов со списком путей.
+4. Запустить пайплайн локально и посмотреть итог по задачам.
+```
+
+```bash solution
+cat > ~/ci-basics/.gitlab-ci.yml <<'EOF'
+stages: [lint, test, build]
+
+lint:
+  stage: lint
+  script:
+    - python3 -m py_compile app.py
+
+unit:
+  stage: test
+  script:
+    - python3 -m unittest -v test_app
+
+smoke:
+  stage: test
+  script:
+    - python3 app.py --version
+
+build:
+  stage: build
+  script:
+    - mkdir -p dist
+    - tar -czf dist/app.tar.gz app.py
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 week
+EOF
+cd ~/ci-basics && gitlab-ci-local
+```
+
+```text review
+Эталон — в «Решении».
+
+- Этапы идут по очереди, задачи одного этапа — параллельно (если хватает раннеров). Упала задача — следующие этапы не запускаются: **fail fast** — быстрые проверки (lint) ставят первыми.
+- Артефакты — файлы, которые GitLab сохраняет после задачи и отдаёт задачам следующих этапов (и для скачивания в интерфейсе). `expire_in` — чтобы не копить их вечно.
+- На настоящем GitLab тот же файл в корне репозитория запускает пайплайн на каждый push. Проверить синтаксис до коммита — CI Lint в интерфейсе (Build → Pipeline editor) или `gitlab-ci-local --preview`.
+- В задачах без `image:` раннер с docker executor берёт образ по умолчанию; хорошая практика — явно указывать `image: python:3.12-slim`.
+```
+
+### Деплой только из main
+
+В `~/ci-basics` уже есть пайплайн lint → test → build. Добавьте этап **deploy** с двумя задачами:
+
+- **`deploy-staging`** — выполняется **автоматически**, но **только** в ветке `main`;
+- **`deploy-production`** — тоже только в `main`, но запускается **вручную**.
+
+В любой другой ветке этих задач в пайплайне быть не должно. Скрипты деплоя — просто `echo` с названием окружения.
+
+```bash setup
+lab_ci_base
+lab_ci_base_pipeline
+lab_ci_commit $d
+```
+
+```bash check
+m=$(lab_ci_jobs $d) || true
+[ -n "$m" ] || fail "gitlab-ci-local не может разобрать .gitlab-ci.yml"
+w() { echo "$1" | jq -r --arg n "$2" '[.[] | select(.name == $n) | .when][0] // "нет"'; }
+[ "$(w "$m" deploy-staging)" = on_success ] || fail "В main задача deploy-staging: «$(w "$m" deploy-staging)» — должна выполняться автоматически"
+[ "$(w "$m" deploy-production)" = manual ] || fail "В main задача deploy-production: «$(w "$m" deploy-production)» — должна запускаться вручную"
+[ "$(echo "$m" | jq -r '[.[] | select(.name == "deploy-staging") | .stage][0]')" = deploy ] || fail "deploy-staging не в этапе deploy"
+f=$(lab_ci_jobs $d feature/login)
+[ -n "$f" ] || fail "Не удалось получить список задач для другой ветки"
+for j in deploy-staging deploy-production; do
+  x=$(w "$f" $j); [ "$x" = нет ] || [ "$x" = never ] || fail "В ветке feature/login задача $j есть в пайплайне (when: $x)"
+done
+lab_ci_run $d || fail "Пайплайн в main не проходит: $(lab_ci_log)"
+ok "main: staging — автоматически, production — вручную; в других ветках деплоя нет"
+```
+
+```text hint
+1. Добавить этап в список этапов.
+2. Условия запуска задачи задаются списком правил: условие на переменную с именем текущей ветки, и для правила можно указать способ запуска «вручную».
+3. Если ни одно правило не подошло, задача в пайплайн не попадает.
+4. Проверить список задач в main и в новой ветке (создайте её и снова выведите список).
+```
+
+```bash solution
+cd ~/ci-basics
+sed -i 's/^stages: \[lint, test, build\]$/stages: [lint, test, build, deploy]/' .gitlab-ci.yml
+cat >> .gitlab-ci.yml <<'EOF'
+
+deploy-staging:
+  stage: deploy
+  script:
+    - echo "deploy to staging"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+deploy-production:
+  stage: deploy
+  script:
+    - echo "deploy to production"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+EOF
+gitlab-ci-local --list
+```
+
+```text review
+Эталон: `rules: - if: $CI_COMMIT_BRANCH == "main"` (для прода — `when: manual`).
+
+- `rules` проверяются сверху вниз до первого совпадения; не совпало ни одно — задачи нет. Часто последним правилом пишут `- when: never` для наглядности.
+- Старые `only:`/`except:` устарели — в новых пайплайнах только `rules`.
+- `when: manual` — кнопка «Play» в интерфейсе. Для прода добавляют `environment: production` и защиту окружения (deploy только от определённых людей).
+- Полезные переменные: `$CI_COMMIT_BRANCH`, `$CI_COMMIT_TAG` (деплой по тегу релиза), `$CI_PIPELINE_SOURCE` (`push`, `merge_request_event`, `schedule`), `$CI_DEFAULT_BRANCH` (вместо хардкода `main`).
+```
+
+```text notes
+\bonly:|\bexcept: => Использовались only/except — они устарели, в новых пайплайнах — rules.
+```
+
+### Экспериментальная задача не должна ронять пайплайн
+
+Команда добавила экспериментальные тесты `test_experimental.py` — они пока падают. Добавьте в этап **test** задачу **`experimental`**, которая их запускает (`python3 -m unittest test_experimental`). Её падение **не должно** валить пайплайн, а падение обычных тестов — **должно**, как и раньше.
+
+```bash setup
+lab_ci_base
+lab_ci_base_pipeline
+cat > $d/test_experimental.py <<'EOF'
+import unittest
+from app import add
+class TestExperimental(unittest.TestCase):
+    def test_add_strings(self):
+        self.assertEqual(add("2", "3"), 5)
+EOF
+lab_ci_commit $d
+```
+
+```bash check
+m=$(lab_ci_jobs $d); [ -n "$m" ] || fail "gitlab-ci-local не может разобрать .gitlab-ci.yml"
+[ "$(echo "$m" | jq -r '[.[] | select(.name == "experimental") | .stage][0]')" = test ] || fail "Задачи experimental в этапе test нет"
+[ "$(echo "$m" | jq -r '[.[] | select(.name == "experimental") | .allow_failure][0]')" = true ] || fail "Падение experimental сейчас валит пайплайн"
+others=$(echo "$m" | jq -r '[.[] | select(.name != "experimental" and .allow_failure == true) | .name] | join(", ")')
+[ -z "$others" ] || fail "Падение разрешено и другим задачам: $others"
+grep -q test_experimental $d/.gitlab-ci.yml || fail "Задача experimental не запускает test_experimental"
+lab_ci_run $d || fail "Пайплайн падает: $(lab_ci_log)"
+sed 's/\x1b\[[0-9;]*m//g' /tmp/lab-ci.log | grep -qE 'WARN +experimental' || fail "Задача experimental не выполнилась или не упала — она должна запускать падающие тесты"
+ok "experimental падает с предупреждением, пайплайн проходит"
+```
+
+```text hint
+1. Добавить задачу в этап тестов с запуском нужного модуля.
+2. У задачи есть параметр, разрешающий ей падать: пайплайн отметит её предупреждением и пойдёт дальше.
+3. Запустить пайплайн и посмотреть статус задачи в итоге.
+```
+
+```bash solution
+cd ~/ci-basics
+cat >> .gitlab-ci.yml <<'EOF'
+
+experimental:
+  stage: test
+  script:
+    - python3 -m unittest -v test_experimental
+  allow_failure: true
+EOF
+gitlab-ci-local | tail -8
+```
+
+```text review
+Эталон: `allow_failure: true`.
+
+- В интерфейсе GitLab такая задача — оранжевая с восклицательным знаком, пайплайн — «passed with warnings».
+- `allow_failure: exit_codes: [42]` — разрешать только конкретный код выхода (например, «нашлись предупреждения линтера», но не «линтер сломался»).
+- Не злоупотребляйте: задача, которой всегда разрешено падать, скоро начнёт падать всегда, и никто не заметит. Временный флаг — с задачей в трекере, когда его снять.
+- Manual-задачи по умолчанию тоже `allow_failure: true` — иначе пайплайн «висел» бы в ожидании кнопки.
+```
+
 ## Тест
 
 ### Как называется файл конфигурации пайплайна GitLab CI?

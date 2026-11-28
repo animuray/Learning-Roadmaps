@@ -116,6 +116,201 @@ ENV APP_VERSION=${APP_VERSION}
 - [ ] Добавить HEALTHCHECK и увидеть статус `healthy` в `docker ps`
 - [ ] Запустить контейнер и выполнить `docker exec myapp id` — убедиться, что процесс не от root
 
+## Лаборатория
+
+В `~/app/app.py` — маленькое веб-приложение на Python (только стандартная библиотека): слушает порт 8000, на `/` отвечает `hello from <APP_VERSION>`, на `/health` — `ok`.
+
+```bash setup
+lab_drm() { docker rm -f "$@" >/dev/null 2>&1; true; }
+# образ есть локально или скачивается (если ученик почистил образы через prune)
+lab_img() { for i in "$@"; do docker image inspect "$i" >/dev/null 2>&1 || docker pull -q "$i" >/dev/null; done; }
+# lab_wait_http URL [строка] — дождаться ответа
+lab_wait_http() { for i in $(seq 60); do curl -s --max-time 1 "$1" 2>/dev/null | grep -q "${2:-.}" && return 0; sleep 0.25; done; return 1; }
+lab_img python:3.12-slim
+mkdir -p /home/student/app
+cat > /home/student/app/app.py <<'EOF'
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+VERSION = os.environ.get("APP_VERSION", "dev")
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"ok" if self.path == "/health" else f"hello from {VERSION}".encode()
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(body)
+
+HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+EOF
+chown -R student:student /home/student/app
+# базовый Dockerfile — для задач, где он уже «написан»
+lab_base_dockerfile() {
+  cat > /home/student/app/Dockerfile <<'EOF'
+FROM python:3.12-slim
+WORKDIR /app
+COPY app.py .
+RUN useradd -r -u 10001 app
+USER app
+EXPOSE 8000
+CMD ["python3", "app.py"]
+EOF
+  chown student:student /home/student/app/Dockerfile
+}
+```
+
+### Первый образ
+
+Напишите `~/app/Dockerfile` для этого приложения и соберите образ **`myapp:0.1`**:
+
+- основа — `python:3.12-slim`;
+- процесс в контейнере работает **не от root**;
+- команда запуска — в **exec-форме** (JSON-массив).
+
+Запустите из образа контейнер **`myapp`** в фоне с портом **8170** хоста → 8000 контейнера.
+
+```bash setup
+lab_drm myapp
+docker rmi -f myapp:0.1 >/dev/null 2>&1
+rm -f /home/student/app/Dockerfile
+true
+```
+
+```bash check
+docker image inspect myapp:0.1 >/dev/null 2>&1 || fail "Образа myapp:0.1 нет"
+[ "$(docker inspect -f '{{.State.Running}}' myapp 2>/dev/null)" = true ] || fail "Контейнер myapp не запущен"
+[ "$(docker inspect -f '{{.Config.Image}}' myapp)" = myapp:0.1 ] || fail "Контейнер myapp запущен не из myapp:0.1"
+cmd=$(docker image inspect -f '{{json .Config.Cmd}} {{json .Config.Entrypoint}}' myapp:0.1)
+echo "$cmd" | grep -q '"/bin/sh","-c"' && fail "Команда запуска в shell-форме: $cmd — процесс приложения не будет PID 1 и не получит SIGTERM"
+uid=$(docker exec myapp id -u 2>/dev/null)
+[ -n "$uid" ] && [ "$uid" != 0 ] || fail "Процесс в контейнере работает от root"
+r=$(curl -s --max-time 3 http://127.0.0.1:8170/)
+[ "$r" = "hello from dev" ] || fail "localhost:8170 отвечает «$r»"
+ok "myapp:0.1 — uid $uid, CMD $(docker image inspect -f '{{json .Config.Cmd}}' myapp:0.1)"
+```
+
+```text hint
+1. Инструкции по порядку: базовый образ, рабочий каталог, копирование файла, создание системного пользователя (утилита useradd есть в образе), переключение на него, документирование порта, команда запуска массивом строк.
+2. Собрать образ с тегом из каталога приложения.
+3. Запустить контейнер в фоне с именем и публикацией порта, проверить curl.
+```
+
+```bash solution
+cat > ~/app/Dockerfile <<'EOF'
+FROM python:3.12-slim
+WORKDIR /app
+COPY app.py .
+RUN useradd -r -u 10001 app
+USER app
+EXPOSE 8000
+CMD ["python3", "app.py"]
+EOF
+docker build -q -t myapp:0.1 ~/app
+docker run -d --name myapp -p 8170:8000 myapp:0.1
+sleep 1
+curl -s localhost:8170
+```
+
+```text review
+Эталон — в «Решении».
+
+- `CMD ["python3", "app.py"]` (exec-форма) — приложение становится PID 1 и получает сигналы напрямую. Shell-форма `CMD python3 app.py` запускает `/bin/sh -c`, и SIGTERM от `docker stop` достаётся оболочке, а не приложению: остановка ждёт 10 секунд и заканчивается SIGKILL.
+- `USER` с числовым UID (`10001`) удобен в Kubernetes: `runAsNonRoot` проверяет UID, а не имя.
+- `EXPOSE` ничего не публикует — это документация для людей и инструментов. Публикует `-p`.
+- `WORKDIR` вместо `RUN cd`: каждый `RUN` — отдельный процесс, `cd` в нём не влияет на следующие инструкции.
+```
+
+```text notes
+CMD\s+python => Команда запуска записана в shell-форме — используйте JSON-массив.
+```
+
+### Версия при сборке
+
+Сделайте так, чтобы версия приложения задавалась **при сборке**: Dockerfile принимает аргумент сборки `APP_VERSION` и передаёт его приложению через переменную окружения с тем же именем. Соберите образ **`myapp:0.2`** с версией `0.2` и запустите контейнер **`myapp2`** с портом **8172** хоста → 8000 контейнера. Приложение должно отвечать `hello from 0.2`.
+
+```bash setup
+lab_drm myapp2
+docker rmi -f myapp:0.2 >/dev/null 2>&1
+lab_base_dockerfile
+```
+
+```bash check
+docker image inspect myapp:0.2 >/dev/null 2>&1 || fail "Образа myapp:0.2 нет"
+docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' myapp:0.2 | grep -qx 'APP_VERSION=0.2' || fail "В образе myapp:0.2 нет переменной окружения APP_VERSION=0.2"
+grep -qE '^\s*ARG\s+APP_VERSION' /home/student/app/Dockerfile || fail "В Dockerfile версия не принимается аргументом сборки"
+[ "$(docker inspect -f '{{.State.Running}}' myapp2 2>/dev/null)" = true ] || fail "Контейнер myapp2 не запущен"
+r=$(curl -s --max-time 3 http://127.0.0.1:8172/)
+[ "$r" = "hello from 0.2" ] || fail "localhost:8172 отвечает «$r»"
+ok "myapp:0.2 → $r"
+```
+
+```text hint
+1. В Dockerfile объявить аргумент сборки, а затем переменную окружения, значение которой берётся из этого аргумента. Аргументы сборки не попадают в работающий контейнер сами по себе.
+2. При сборке передать значение аргумента ключом сборки.
+```
+
+```bash solution
+sed -i 's/^WORKDIR \/app$/WORKDIR \/app\nARG APP_VERSION=dev\nENV APP_VERSION=$APP_VERSION/' ~/app/Dockerfile
+cat ~/app/Dockerfile
+docker build -q --build-arg APP_VERSION=0.2 -t myapp:0.2 ~/app
+docker run -d --name myapp2 -p 8172:8000 myapp:0.2
+sleep 1
+curl -s localhost:8172
+```
+
+```text review
+Эталон: `ARG APP_VERSION=dev` + `ENV APP_VERSION=$APP_VERSION`, сборка `--build-arg APP_VERSION=0.2`.
+
+- `ARG` живёт только во время сборки, `ENV` — и при сборке, и в контейнере. Чтобы значение дошло до приложения, его перекладывают из ARG в ENV.
+- **Секреты через ARG/ENV не передают**: они видны в `docker history` и `docker inspect`. Для секретов при сборке — `RUN --mount=type=secret`, в рантайме — переменные окружения при запуске или файлы-секреты.
+- В CI версию обычно берут из тега или SHA коммита: `--build-arg APP_VERSION=$CI_COMMIT_SHORT_SHA`, а образ тегируют тем же значением.
+```
+
+### Проверка здоровья
+
+Добавьте в образ **HEALTHCHECK**, который проверяет `http://localhost:8000/health` (в образе нет curl — подойдёт сам Python). Соберите образ **`myapp:0.3`** и запустите контейнер **`myapp3`** (порт публиковать не обязательно). Контейнер должен перейти в состояние **healthy**.
+
+```bash setup
+lab_drm myapp3
+docker rmi -f myapp:0.3 >/dev/null 2>&1
+lab_base_dockerfile
+```
+
+```bash check
+docker image inspect myapp:0.3 >/dev/null 2>&1 || fail "Образа myapp:0.3 нет"
+[ -n "$(docker image inspect -f '{{if .Config.Healthcheck}}yes{{end}}' myapp:0.3)" ] || fail "В образе myapp:0.3 нет HEALTHCHECK"
+[ "$(docker inspect -f '{{.State.Running}}' myapp3 2>/dev/null)" = true ] || fail "Контейнер myapp3 не запущен"
+for i in $(seq 40); do s=$(docker inspect -f '{{.State.Health.Status}}' myapp3); [ "$s" = healthy ] && break; [ "$s" = unhealthy ] && break; sleep 1; done
+[ "$s" = healthy ] || fail "Состояние myapp3 — $s. Последняя проверка: $(docker inspect -f '{{range .State.Health.Log}}{{.Output}}{{end}}' myapp3 | tail -2 | tr '\n' ' ' | head -c 200)"
+ok "myapp3: healthy"
+```
+
+```text hint
+1. Инструкция проверки здоровья в Dockerfile: интервал, тайм-аут, число попыток и команда. Команда должна завершаться с кодом 0, если всё хорошо, и с ненулевым — если нет.
+2. Однострочник на Python может открыть URL из стандартной библиотеки — при ошибке он выбросит исключение и завершится с ошибкой.
+3. Собрать, запустить и посмотреть статус в списке контейнеров (появится через интервал проверки).
+```
+
+```bash solution
+cat >> ~/app/Dockerfile <<'EOF'
+HEALTHCHECK --interval=5s --timeout=3s --retries=3 \
+  CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+EOF
+docker build -q -t myapp:0.3 ~/app
+docker run -d --name myapp3 myapp:0.3
+sleep 8
+docker ps --filter name=myapp3
+```
+
+```text review
+Эталон: `HEALTHCHECK --interval=5s --timeout=3s --retries=3 CMD ["python3", "-c", "import urllib.request; ..."]`.
+
+- Статусы: `starting` → `healthy` или `unhealthy` (после `retries` неудач подряд). Сам Docker больной контейнер **не перезапускает** — но им пользуются Compose (`depends_on: condition: service_healthy`) и Swarm.
+- В Kubernetes HEALTHCHECK из образа игнорируется — там свои `livenessProbe`/`readinessProbe` в манифесте.
+- Проверка должна быть лёгкой и проверять сам сервис, а не внешние зависимости: упала база — перезапуск приложения не поможет.
+- Ставить в образ curl только ради healthcheck — лишний вес и поверхность атаки; хватает средств самого языка или маленького бинарника.
+```
+
 ## Тест
 
 ### Какая инструкция задаёт базовый образ?

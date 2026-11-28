@@ -110,6 +110,149 @@ sudo ss -tulpn                  # что слушает сервер
 - [ ] Подключиться к закрытому порту (`nc -zv localhost 9999`) и получить Connection refused; затем к адресу, где пакеты теряются (например, `nc -zv -w 5 10.255.255.1 80`), и получить таймаут
 - [ ] Записать рукопожатие через `sudo tcpdump -i lo port 9000` (подробнее — в теме про tcpdump)
 
+## Лаборатория
+
+Сервер `lab-tsrv` (10.30.0.2) подключён к стенду кабелем: со стенда до него можно достучаться напрямую. Внутри сервера команды — через `sudo ip netns exec lab-tsrv ...`.
+
+```bash setup
+# «Машины» задачи — network namespace lab-*, «кабели» — пары veth. Всё лабораторное начинается с lab.
+lab_net_reset() {
+  for u in $(systemctl list-units --all --plain --no-legend 'lab-net-*' | awk '{print $1}'); do
+    systemctl stop "$u" 2>/dev/null; systemctl reset-failed "$u" 2>/dev/null
+  done
+  for ns in $(ip netns list | awk '$1 ~ /^lab-/ {print $1}'); do
+    ip netns pids "$ns" | xargs -r kill -9 2>/dev/null; ip netns del "$ns"
+  done
+  for l in $(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1 | grep '^lab'); do ip link del "$l" 2>/dev/null; done
+  rm -rf /etc/netns/lab-*
+  true
+}
+# lab_ns имя — пустая «машина» lab-имя с поднятым loopback
+lab_ns() { ip netns add "lab-$1"; ip -n "lab-$1" link set lo up; }
+# lab_link ns1 if1 addr1 ns2 if2 addr2 — кабель между двумя машинами; ns «-» — сам стенд, addr «-» — без адреса
+lab_link() {
+  local t1=labt$RANDOM t2=labu$RANDOM
+  ip link add "$t1" type veth peer name "$t2"
+  _lab_end "$1" "$t1" "$2" "$3"; _lab_end "$4" "$t2" "$5" "$6"
+}
+_lab_end() {
+  if [ "$1" = - ]; then
+    ip link set "$2" name "$3"; ip link set "$3" up; [ "$4" = - ] || ip addr add "$4" dev "$3"
+  else
+    ip link set "$2" netns "lab-$1"; ip -n "lab-$1" link set "$2" name "$3"; ip -n "lab-$1" link set "$3" up
+    [ "$4" = - ] || ip -n "lab-$1" addr add "$4" dev "$3"
+  fi
+}
+# lab_bg имя ns команда... — фоновый процесс внутри машины (служба lab-net-имя)
+lab_bg() { local u=$1 ns=$2; shift 2; systemd-run -q --unit="lab-net-$u" ip netns exec "lab-$ns" "$@"; }
+# lab_wait_port ns адрес порт — дождаться, пока сервис начнёт слушать
+lab_wait_port() { for i in $(seq 40); do ip netns exec "lab-$1" ss -ltnH "src $2 and sport = :$3" | grep -q . && return 0; sleep 0.25; done; return 1; }
+lab_net_reset
+lab_ns tsrv
+lab_link - labtc0 10.30.0.1/24 tsrv eth0 10.30.0.2/24
+cat > /opt/lab-listen.py <<'EOF'
+import socket, sys, threading
+def serve(port):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", port)); s.listen(50)
+    while True:
+        c, _ = s.accept(); c.close()
+for p in sys.argv[1:]:
+    threading.Thread(target=serve, args=(int(p),), daemon=True).start()
+threading.Event().wait()
+EOF
+```
+
+### Открыт, закрыт или фильтруется
+
+Проверьте со стенда порты **22, 80, 5432, 6379** на `10.30.0.2` и запишите в `~/ports.txt` по строке на порт: `порт состояние`, где состояние — одно из:
+
+- `open` — порт принимает соединения;
+- `refused` — узел отвечает отказом (сервиса нет);
+- `filtered` — ответа нет совсем (пакеты отбрасываются).
+
+```bash setup
+rm -f /home/student/ports.txt
+lab_bg tcp-listen tsrv python3 /opt/lab-listen.py 22 80 6379
+ip netns exec lab-tsrv nft -f - <<'EOF'
+table inet filter {
+  chain input { type filter hook input priority 0; policy accept; tcp dport 6379 drop; }
+}
+EOF
+lab_wait_port tsrv 0.0.0.0 80
+```
+
+```bash check
+f=/home/student/ports.txt
+[ -f $f ] || fail "Нет ~/ports.txt"
+for want in "22 open" "80 open" "5432 refused" "6379 filtered"; do
+  p=${want%% *}
+  got=$(awk -v p=$p '$1 == p {print $2}' $f | tr 'A-Z' 'a-z')
+  [ "$got" = "${want#* }" ] || fail "Для порта $p указано «${got:-ничего}» — это не так"
+done
+ok "22 и 80 открыты, 5432 — отказ, 6379 — фильтруется"
+```
+
+```text hint
+1. Утилита netcat умеет только проверить подключение (без отправки данных) и ограничить ожидание секундами.
+2. Различайте исходы по сообщению и по времени: мгновенный отказ («Connection refused» — узел прислал сброс соединения) и долгое молчание до тайм-аута.
+```
+
+```bash solution
+for p in 22 80 5432 6379; do
+  out=$(nc -zv -w 2 10.30.0.2 $p 2>&1)
+  case "$out" in
+    *succeeded*) s=open ;;
+    *refused*) s=refused ;;
+    *) s=filtered ;;
+  esac
+  echo "$p $s"
+done | tee ~/ports.txt
+```
+
+```text review
+Эталон: `nc -zv -w 2 10.30.0.2 <порт>`.
+
+- **open** — на SYN пришёл SYN-ACK. **refused** — пришёл RST: узел жив, но порт никто не слушает (сервис упал, слушает другой адрес). **filtered** — тишина до тайм-аута: пакеты режет файрвол (DROP), security group или их нет маршрута.
+- Это сразу говорит, куда смотреть: refused → `ss -ltnp` на сервере; тайм-аут → файрволы и маршрутизация.
+- `nmap -p 22,80,5432,6379 10.30.0.2` покажет то же самое таблицей. Сканировать чужие сети без разрешения нельзя.
+- Без nc: `timeout 2 bash -c '</dev/tcp/10.30.0.2/80' && echo open`.
+```
+
+### Сообщение по UDP
+
+На сервере `10.30.0.2` порт **5140/udp** принимает сообщения для журнала (как syslog). Отправьте ему со стенда одно сообщение — строку `hello-udp`.
+
+```bash setup
+rm -f /var/lib/lab/udp.log
+touch /var/lib/lab/udp.log
+lab_bg udp-recv tsrv socat -u UDP4-RECV:5140,bind=10.30.0.2 OPEN:/var/lib/lab/udp.log,append
+sleep 0.5
+```
+
+```bash check
+grep -q hello-udp /var/lib/lab/udp.log || fail "Сообщение hello-udp не дошло до сервера (принято: «$(head -c 60 /var/lib/lab/udp.log)»)"
+ok "сервер получил: $(tr '\n' ' ' < /var/lib/lab/udp.log)"
+```
+
+```text hint
+1. netcat умеет работать с UDP — для этого есть отдельный ключ. У UDP нет соединения: данные просто отправляются датаграммой.
+2. Передать строку на вход netcat и ограничить ожидание, чтобы команда не висела.
+3. Обратите внимание: сам netcat не узнает, дошло ли сообщение, — подтверждений у UDP нет.
+```
+
+```bash solution
+echo hello-udp | nc -u -w1 10.30.0.2 5140
+```
+
+```text review
+Эталон: `echo hello-udp | nc -u -w1 10.30.0.2 5140` (или `logger -n 10.30.0.2 -P 5140 -d hello-udp`).
+
+- UDP без установки соединения и подтверждений: отправитель не знает, дошла ли датаграмма. Поэтому `nc -zu` про UDP-порт ничего надёжного не скажет: «open|filtered».
+- На UDP работают DNS (53), DHCP, NTP, syslog (514), VXLAN в Kubernetes, QUIC (HTTP/3). Потери допустимы или повторяются самим приложением.
+- Проверить, что сервер слушает UDP: `ss -lun`; увидеть датаграммы: `tcpdump -n udp port 5140`.
+```
+
 ## Тест
 
 ### Какие флаги передаются при установке TCP-соединения?

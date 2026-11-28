@@ -119,6 +119,71 @@ kubectl debug node/worker-1 -it --image=ubuntu
 - [ ] Зайти на ноду через `kubectl debug node/...` и посмотреть контейнеры через `crictl`
 - [ ] Прочитать документацию Istio или Linkerd и описать, какие задачи mesh решил бы в вашем проекте
 
+## Лаборатория
+
+```bash lib
+# Kubernetes на стенде — k3s (один узел). root работает с /etc/rancher/k3s/k3s.yaml, ученик — со своим ~/.kube/config
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# lab_kns имя — чистый namespace задачи (старый удаляется вместе со всем содержимым)
+lab_kns() {
+  kubectl delete ns "$1" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1
+  kubectl create ns "$1" >/dev/null
+}
+# убрать с узла метки и taint-ы, которые оставляют задачи про размещение подов
+lab_knode() {
+  kubectl taint nodes --all lab-dedicated- >/dev/null 2>&1
+  kubectl label nodes --all disktype- zone- >/dev/null 2>&1
+  true
+}
+# lab_kready ns селектор [секунд] — дождаться готовности подов
+lab_kready() { kubectl -n "$1" wait --for=condition=Ready pod -l "$2" --timeout="${3:-90}s" >/dev/null 2>&1; }
+# lab_kfiles каталог — каталог манифестов ученика (пустой)
+lab_kfiles() { rm -rf "$1"; mkdir -p "$1"; chown -R student:student "$1"; }
+lab_kj() { kubectl "$@" -o json 2>/dev/null; }
+lab_traefik() { kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'; }
+```
+
+```bash setup
+lab_knode
+```
+
+### Защита от одновременного выселения
+
+У Deployment **`api`** в namespace **`lab-adv`** 3 реплики. При обслуживании узлов (drain) Kubernetes может выселить их все разом. Создайте **PodDisruptionBudget** **`api`**, который требует, чтобы **минимум 2** пода `app=api` оставались доступны при добровольных выселениях.
+
+```bash setup
+lab_kns lab-adv
+kubectl -n lab-adv create deployment api --image=hashicorp/http-echo:1.0 --replicas=3 --port=5678 -- /http-echo "-text=ok" >/dev/null
+kubectl -n lab-adv rollout status deploy/api --timeout=90s >/dev/null
+```
+
+```bash check
+p=$(lab_kj -n lab-adv get pdb api) || fail "PodDisruptionBudget api нет"
+[ "$(echo "$p" | jq -r .spec.minAvailable)" = 2 ] || fail "minAvailable = $(echo "$p" | jq -r .spec.minAvailable)"
+[ "$(echo "$p" | jq -r .spec.selector.matchLabels.app)" = api ] || fail "PDB выбирает не поды app=api"
+for i in $(seq 20); do a=$(lab_kj -n lab-adv get pdb api | jq -r .status.disruptionsAllowed); [ "$a" = 1 ] && break; sleep 1; done
+[ "$a" = 1 ] || fail "PDB не видит поды: разрешённых выселений $a (ожидалось 1)"
+ok "PDB api: minAvailable 2, можно выселить 1 под"
+```
+
+```text hint
+1. Каркас — kubectl create poddisruptionbudget с селектором и минимумом доступных.
+2. Проверить статус: сколько выселений разрешено сейчас.
+```
+
+```bash solution
+kubectl -n lab-adv create poddisruptionbudget api --selector=app=api --min-available=2
+kubectl -n lab-adv get pdb api
+```
+
+```text review
+Эталон: `kubectl create pdb api --selector=app=api --min-available=2`.
+
+- PDB защищает от **добровольных** выселений: `kubectl drain`, обновление узлов в облаке, кластерный автоскейлер. От падения узла не спасает.
+- `minAvailable` или `maxUnavailable` (число или процент). Слишком строгий PDB (`minAvailable` = числу реплик) заблокирует drain навсегда — частая причина «обновление кластера зависло».
+- Вместе с PDB используют anti-affinity (реплики на разных узлах) — иначе одна авария всё равно уронит все поды.
+```
+
 ## Тест
 
 ### Что такое оператор в Kubernetes?

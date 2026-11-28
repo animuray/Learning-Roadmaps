@@ -93,6 +93,80 @@ docker context use prod
 - [ ] Обратиться к Docker API напрямую: `curl --unix-socket /var/run/docker.sock http://localhost/containers/json`
 - [ ] Настроить `docker context` для подключения к Docker на второй ВМ по SSH
 
+## Лаборатория
+
+### Docker API без docker CLI
+
+Клиент `docker` — всего лишь программа, которая ходит в REST API демона через сокет `/var/run/docker.sock`. Узнайте **версию Docker Engine** (поле `Version` у сервера), обратившись к API **напрямую через curl**, и запишите её в `~/engine.txt`.
+
+```bash setup
+rm -f /home/student/engine.txt
+```
+
+```bash check
+want=$(docker version --format '{{.Server.Version}}')
+[ -f /home/student/engine.txt ] || fail "Нет ~/engine.txt"
+got=$(tr -d '[:space:]"' < /home/student/engine.txt)
+[ "$got" = "$want" ] || fail "В ~/engine.txt «$got» — это не версия Docker Engine"
+ok "Docker Engine $want"
+```
+
+```text hint
+1. curl умеет ходить не по TCP, а через unix-сокет — для этого есть отдельный ключ; хост в URL тогда любой.
+2. У API демона есть адрес «версия»; ответ в JSON — поле с версией удобно достать утилитой jq.
+```
+
+```bash solution
+curl -s --unix-socket /var/run/docker.sock http://localhost/version | jq .
+curl -s --unix-socket /var/run/docker.sock http://localhost/version | jq -r .Version > ~/engine.txt
+```
+
+```text review
+Эталон: `curl --unix-socket /var/run/docker.sock http://localhost/version | jq -r .Version`.
+
+- Всё, что делает CLI, — запросы к API: `GET /containers/json` (docker ps), `POST /containers/create`, `GET /images/json`. Им пользуются Portainer, Traefik, Watchtower, CI-раннеры.
+- **Доступ к docker.sock = root на хосте**: через API можно запустить контейнер с примонтированным `/` хоста. Поэтому группа `docker` — по сути sudo, а прокидывать сокет в контейнеры (`-v /var/run/docker.sock:...`) опасно.
+- Цепочка компонентов: `docker` (CLI) → `dockerd` (API, сети, образы) → `containerd` (жизненный цикл контейнеров) → `containerd-shim` → `runc` (создаёт namespaces и cgroups). Kubernetes ходит сразу в containerd, минуя dockerd.
+```
+
+```text notes
+docker\s+(version|info) => Версию узнали через docker CLI — он делает тот же запрос к API. Здесь цель — увидеть сам API: curl --unix-socket.
+```
+
+### Где Docker хранит данные
+
+Узнайте, какой **драйвер хранилища** использует Docker и в каком **каталоге** на хосте он хранит образы, контейнеры и тома. Запишите в `~/docker-storage.txt` две строки: драйвер и каталог.
+
+```bash setup
+rm -f /home/student/docker-storage.txt
+```
+
+```bash check
+d=$(docker info --format '{{.Driver}}'); r=$(docker info --format '{{.DockerRootDir}}')
+[ -f /home/student/docker-storage.txt ] || fail "Нет ~/docker-storage.txt"
+l1=$(sed -n 1p /home/student/docker-storage.txt | tr -d '[:space:]'); l2=$(sed -n 2p /home/student/docker-storage.txt | tr -d '[:space:]')
+[ "$l1" = "$d" ] || fail "Драйвер хранилища «$l1» указан неверно"
+[ "${l2%/}" = "$r" ] || fail "Каталог «$l2» указан неверно"
+ok "драйвер $d, данные в $r ($(sudo du -sh $r 2>/dev/null | cut -f1))"
+```
+
+```text hint
+Общая информация о демоне Docker содержит раздел о хранилище и корневой каталог данных. Её можно вывести целиком или попросить только нужные поля шаблоном формата.
+```
+
+```bash solution
+docker info | grep -E 'Storage Driver|Docker Root Dir'
+{ docker info --format '{{.Driver}}'; docker info --format '{{.DockerRootDir}}'; } > ~/docker-storage.txt
+```
+
+```text review
+Эталон: `docker info` → `Storage Driver`, `Docker Root Dir: /var/lib/docker`.
+
+- Классический драйвер — `overlay2`: слои образа как `lowerdir`, слой контейнера — `upperdir` (тема «Файловые системы»), данные в `/var/lib/docker/overlay2`. С Docker 29 по умолчанию образы хранит containerd (`overlayfs` + `driver-type io.containerd.snapshotter.v1`), их слои — в `/var/lib/containerd`. Механизм тот же — overlayfs.
+- `/var/lib/docker` часто съедает диск: образы, остановленные контейнеры, логи контейнеров (`/var/lib/docker/containers/*/*-json.log`), тома. Смотреть: `docker system df`, чистить: `docker system prune` (осторожно с `-a` и `--volumes`).
+- Перенести данные на другой диск — `"data-root"` в `/etc/docker/daemon.json` при остановленном демоне.
+```
+
 ## Тест
 
 ### По какой архитектуре устроен Docker?

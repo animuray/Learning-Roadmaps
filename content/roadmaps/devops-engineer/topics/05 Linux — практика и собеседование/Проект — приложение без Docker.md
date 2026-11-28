@@ -121,6 +121,194 @@ npm run build            # сборка статических файлов в d
 - [ ] Специально воспроизвести три ошибки из таблицы и починить их
 - [ ] Описать в README команды запуска и раздел «Проблемы и решения»
 
+## Лаборатория
+
+Приложение «Заметки»: бэкенд на Python (`/opt/notes-api/app.py`, только стандартная библиотека и драйвер PostgreSQL) и база PostgreSQL. Задача — развернуть его на сервере так, как это делают без Docker.
+
+```bash setup
+# приложение и база — общие для задач темы
+mkdir -p /opt/notes-api
+cat > /opt/notes-api/app.py <<'EOF'
+#!/usr/bin/env python3
+"""Заметки: GET /health — проверка базы, GET /notes — число заметок. Настройки — из окружения."""
+import os, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import psycopg2
+
+DSN = os.environ.get("DATABASE_URL")
+PORT = int(os.environ.get("PORT", "8000"))
+if not DSN:
+    print("ОШИБКА: не задана переменная окружения DATABASE_URL", file=sys.stderr)
+    sys.exit(1)
+
+class Handler(BaseHTTPRequestHandler):
+    def reply(self, code, text):
+        self.send_response(code); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.end_headers()
+        self.wfile.write(text.encode())
+    def do_GET(self):
+        try:
+            with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
+                cur.execute("create table if not exists notes (id serial primary key, body text)")
+                cur.execute("select count(*) from notes")
+                n = cur.fetchone()[0]
+        except Exception as e:
+            return self.reply(500, f"db error: {e}")
+        self.reply(200, "db ok" if self.path == "/health" else f"notes: {n}")
+
+print(f"notes-api слушает 127.0.0.1:{PORT}", flush=True)
+HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+EOF
+chmod 755 /opt/notes-api/app.py
+id notes >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin notes
+sudo -u postgres psql -qXtA -c "select 1 from pg_roles where rolname = 'notes'" | grep -q 1 || sudo -u postgres psql -qX -c "CREATE ROLE notes LOGIN PASSWORD 'notes-pass'" >/dev/null
+sudo -u postgres psql -qXtA -c "select 1 from pg_database where datname = 'notesdb'" | grep -q 1 || sudo -u postgres psql -qX -c "CREATE DATABASE notesdb OWNER notes" >/dev/null
+```
+
+### Бэкенд как служба
+
+Запустите бэкенд как службу systemd **`notes-api`**:
+
+- от системного пользователя `notes` (уже создан);
+- с переменной окружения `DATABASE_URL=postgresql://notes:notes-pass@localhost/notesdb`;
+- с перезапуском при падении;
+- служба включена в автозапуск и работает.
+
+Бэкенд слушает `127.0.0.1:8000`; `curl localhost:8000/health` должен отвечать `db ok`.
+
+```bash setup
+systemctl disable --now notes-api >/dev/null 2>&1
+rm -rf /etc/systemd/system/notes-api.service /etc/systemd/system/notes-api.service.d
+systemctl daemon-reload
+```
+
+```bash check
+[ -f /etc/systemd/system/notes-api.service ] || fail "Нет /etc/systemd/system/notes-api.service"
+[ "$(systemctl is-active notes-api)" = active ] || fail "Служба notes-api не работает: $(journalctl -u notes-api -n 2 --no-pager -o cat | tr '\n' ' ')"
+[ "$(systemctl is-enabled notes-api)" = enabled ] || fail "Служба не в автозапуске"
+[ "$(systemctl show -p User --value notes-api)" = notes ] || fail "Служба работает от «$(systemctl show -p User --value notes-api)»"
+case "$(systemctl show -p Restart --value notes-api)" in always|on-failure|on-abnormal) ;; *) fail "При падении служба не перезапустится";; esac
+r=$(curl -s --max-time 5 http://127.0.0.1:8000/health)
+[ "$r" = "db ok" ] || fail "localhost:8000/health отвечает: «${r:-нет ответа}»"
+ok "notes-api: $r, PID $(systemctl show -p MainPID --value notes-api)"
+```
+
+```text hint
+1. Unit-файл службы: описание; в разделе службы — что запускать, от какого пользователя, переменная окружения и политика перезапуска; раздел установки — обычная многопользовательская загрузка.
+2. Перечитать конфигурацию systemd, включить и запустить.
+3. Если служба падает — первое, что смотреть, это её журнал: приложение пишет, чего ему не хватает.
+```
+
+```bash solution
+sudo tee /etc/systemd/system/notes-api.service >/dev/null <<'EOF'
+[Unit]
+Description=Notes API
+After=network.target postgresql.service
+
+[Service]
+User=notes
+Environment=DATABASE_URL=postgresql://notes:notes-pass@localhost/notesdb
+ExecStart=/usr/bin/python3 /opt/notes-api/app.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now notes-api
+sleep 1
+curl -s localhost:8000/health
+```
+
+```text review
+Эталон — в «Решении».
+
+- `After=postgresql.service` — порядок запуска при загрузке (если база на этом же сервере). `Requires=`/`Wants=` — зависимость, `After=` — только порядок.
+- Секреты в `Environment=` видны всем через `systemctl show`. Лучше `EnvironmentFile=/etc/notes-api.env` с правами 600 или `LoadCredential=`.
+- Порядок диагностики «приложение не работает»: `systemctl status` → `journalctl -u notes-api -n 50` → `ss -ltnp | grep 8000` → `curl -v localhost:8000/health`.
+- Бэкенд слушает только `127.0.0.1` — наружу его выставит nginx (следующая задача). Так принято: приложение не торчит в интернет напрямую.
+```
+
+```text notes
+nohup|&\s*$|screen|tmux => Бэкенд запускался вручную в фоне — после перезагрузки или падения он не поднимется. Для постоянной работы — служба systemd.
+```
+
+### nginx перед бэкендом
+
+Бэкенд `notes-api` уже работает на `127.0.0.1:8000`. Опубликуйте его через **nginx** для сайта `notes.local`: запросы на порт 80 с заголовком `Host: notes.local` должны проксироваться на бэкенд. Сайт оформите отдельным файлом в `/etc/nginx/sites-available/` и включите. Конфигурация nginx должна проходить проверку, а сам nginx — применить её без остановки.
+
+```bash setup
+systemctl disable --now notes-api >/dev/null 2>&1
+mkdir -p /etc/systemd/system
+cat > /etc/systemd/system/notes-api.service <<'EOF'
+[Unit]
+Description=Notes API
+After=network.target postgresql.service
+
+[Service]
+User=notes
+Environment=DATABASE_URL=postgresql://notes:notes-pass@localhost/notesdb
+ExecStart=/usr/bin/python3 /opt/notes-api/app.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now notes-api >/dev/null 2>&1
+rm -f /etc/nginx/sites-enabled/notes* /etc/nginx/sites-available/notes*
+nginx -t -q && systemctl reload nginx
+```
+
+```bash check
+nginx -t >/dev/null 2>&1 || fail "nginx -t находит ошибку в конфигурации"
+ls /etc/nginx/sites-available/ | grep -q . || fail "В /etc/nginx/sites-available/ нет файла сайта"
+grep -lqs 'notes.local' /etc/nginx/sites-enabled/* || fail "Сайт notes.local не включён (в sites-enabled его нет)"
+r=$(curl -s --max-time 5 -H 'Host: notes.local' http://127.0.0.1/health)
+[ "$r" = "db ok" ] || fail "http://notes.local/health отвечает: «$(echo "$r" | head -c 80)» — запросы не доходят до бэкенда (конфигурация не применена или прокси настроен не туда)"
+ok "notes.local → 127.0.0.1:8000: $r"
+```
+
+```text hint
+1. Файл сайта: блок сервера, который слушает 80-й порт и отвечает на имя notes.local; в корневом location — проксирование на адрес бэкенда. Полезно передать бэкенду исходные Host и IP клиента заголовками.
+2. Включить сайт символической ссылкой из каталога включённых сайтов.
+3. Проверить синтаксис и перечитать конфигурацию nginx без остановки.
+```
+
+```bash solution
+sudo tee /etc/nginx/sites-available/notes >/dev/null <<'EOF'
+server {
+    listen 80;
+    server_name notes.local;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+EOF
+sudo ln -sf /etc/nginx/sites-available/notes /etc/nginx/sites-enabled/notes
+sudo nginx -t
+sudo systemctl reload nginx
+curl -s -H 'Host: notes.local' http://127.0.0.1/health
+```
+
+```text review
+Эталон — в «Решении»: `server_name notes.local` + `proxy_pass http://127.0.0.1:8000` → ссылка в `sites-enabled` → `nginx -t` → `reload`.
+
+- `sites-available` — все конфиги, `sites-enabled` — ссылки на включённые (схема Debian/Ubuntu). В RHEL — просто файлы в `/etc/nginx/conf.d/*.conf`.
+- `X-Real-IP`/`X-Forwarded-For` — без них бэкенд видит все запросы от `127.0.0.1`. `Host` — чтобы бэкенд знал, по какому имени к нему пришли.
+- **Всегда** `nginx -t` перед `reload`: с ошибкой reload не применится (nginx продолжит со старым конфигом), а restart — уронит сайт.
+- 502 Bad Gateway — nginx не достучался до бэкенда (не запущен, не тот порт); 504 — бэкенд не ответил вовремя. Причина — в `/var/log/nginx/error.log`.
+- Следующий шаг — HTTPS: `certbot --nginx -d notes.example.com` (тема TLS).
+```
+
+```text notes
+systemctl\s+restart\s+nginx => nginx перезапускался — работает, но reload применяет конфиг без разрыва текущих соединений, а при ошибке в конфиге оставляет старый.
+```
+
 ## Тест
 
 ### Зачем запускать приложение сначала без Docker?

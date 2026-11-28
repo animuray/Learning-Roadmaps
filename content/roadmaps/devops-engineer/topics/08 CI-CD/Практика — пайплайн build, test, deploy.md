@@ -145,6 +145,178 @@ verify:
 - [ ] Выполнить откат через Re-deploy предыдущего деплоя в Environments
 - [ ] Повторить пайплайн на Jenkins (по желанию)
 
+## Лаборатория
+
+```bash lib
+# Пайплайны GitLab CI выполняются локально утилитой gitlab-ci-local (shell executor — задачи идут прямо на стенде)
+# lab_ci_repo каталог — новый репозиторий ученика с одним коммитом (файлы кладёт вызывающий до коммита)
+lab_ci_repo() { rm -rf "$1"; mkdir -p "$1"; }
+lab_ci_commit() { chown -R student:student "$1"; su - student -c "cd $1 && git init -q -b main 2>/dev/null; git add -A && git commit -qm 'Initial commit'"; }
+# lab_ci_run каталог [ключи] — пайплайн от имени ученика; вывод — в /tmp/lab-ci.log, код возврата — код пайплайна
+lab_ci_run() { su - student -c "cd $1 && timeout 300 gitlab-ci-local $2" > /tmp/lab-ci.log 2>&1; }
+# lab_ci_preview каталог — итоговый YAML после include, extends и default (JSON)
+lab_ci_preview() { su - student -c "cd $1 && gitlab-ci-local --preview" 2>/dev/null | sed -n '/^---$/,$p' | python3 -c 'import sys,yaml,json; print(json.dumps(yaml.safe_load(sys.stdin)))'; }
+# lab_ci_jobs каталог [ветка] — список задач (JSON); с веткой — во временной копии репозитория на этой ветке
+lab_ci_jobs() {
+  if [ -n "$2" ]; then
+    rm -rf /tmp/lab-ci-branch; su - student -c "git clone -q $1 /tmp/lab-ci-branch && cd /tmp/lab-ci-branch && cp $1/.gitlab-ci*.yml . 2>/dev/null; [ -d $1/ci ] && mkdir -p ci && cp -r $1/ci/. ci/; git switch -qc $2 && gitlab-ci-local --list-json" 2>/dev/null
+  else
+    su - student -c "cd $1 && gitlab-ci-local --list-json" 2>/dev/null
+  fi
+}
+lab_ci_log() { sed 's/\x1b\[[0-9;]*m//g' /tmp/lab-ci.log | grep -vE '^\s*$' | tail -n "${1:-4}" | tr '\n' ' ' | cut -c1-300; }
+lab_drm() { docker rm -f "$@" >/dev/null 2>&1; true; }
+# образ есть локально или скачивается (если ученик почистил образы через prune)
+lab_img() { for i in "$@"; do docker image inspect "$i" >/dev/null 2>&1 || docker pull -q "$i" >/dev/null; done; }
+# lab_wait_http URL [строка] — дождаться ответа
+lab_wait_http() { for i in $(seq 60); do curl -s --max-time 1 "$1" 2>/dev/null | grep -q "${2:-.}" && return 0; sleep 0.25; done; return 1; }
+```
+
+### Пайплайн от линтера до проверки после деплоя
+
+В `~/ci-deploy` — приложение (`app.py`, тесты `test_app.py`, `Dockerfile`), в `~/ci-target/compose.yaml` — описание «прод-сервера»: контейнер `ci-deploy-app` из образа `ci-deploy-app:${APP_TAG}` на порту **8188**. Напишите `.gitlab-ci.yml`, который выполняется через `gitlab-ci-local` (задачи — прямо на стенде, Docker доступен):
+
+1. **lint** — проверка Dockerfile линтером hadolint (`docker run --rm -i hadolint/hadolint:v2.12.0 < Dockerfile`);
+2. **test** — модульные тесты;
+3. **build** — образ `ci-deploy-app` с тегом **короткого SHA коммита**; версию (тот же SHA) передать в образ аргументом сборки `APP_VERSION`;
+4. **deploy** — запуск `~/ci-target/compose.yaml` с `APP_TAG` = SHA коммита;
+5. **verify** — проверка `http://localhost:8188/health` с повторами; если приложение не ответило — пайплайн **падает**.
+
+После пайплайна на `localhost:8188` работает версия, равная SHA последнего коммита.
+
+```bash setup
+su - student -c 'git config --global user.name >/dev/null || git config --global user.name Student; git config --global user.email >/dev/null || git config --global user.email student@stand.local'
+lab_img python:3.12-slim hadolint/hadolint:v2.12.0
+docker rm -f ci-deploy-app >/dev/null 2>&1
+d=/home/student/ci-deploy
+lab_ci_repo $d
+cat > $d/app.py <<'EOF'
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+VERSION = os.environ.get("APP_VERSION", "dev")
+
+def greeting(name):
+    return f"hello, {name}"
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"ok" if self.path == "/health" else f"version {VERSION}".encode()
+        self.send_response(200); self.end_headers(); self.wfile.write(body)
+
+if __name__ == "__main__":
+    HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+EOF
+cat > $d/test_app.py <<'EOF'
+import unittest
+from app import greeting
+class TestGreeting(unittest.TestCase):
+    def test_greeting(self):
+        self.assertEqual(greeting("ci"), "hello, ci")
+EOF
+cat > $d/Dockerfile <<'EOF'
+FROM python:3.12-slim
+ARG APP_VERSION=dev
+ENV APP_VERSION=$APP_VERSION
+WORKDIR /app
+COPY app.py .
+USER 10001
+EXPOSE 8000
+CMD ["python3", "app.py"]
+EOF
+printf '.gitlab-ci-local/\n__pycache__/\n' > $d/.gitignore
+lab_ci_commit $d
+mkdir -p /home/student/ci-target
+cat > /home/student/ci-target/compose.yaml <<'EOF'
+services:
+  app:
+    image: ci-deploy-app:${APP_TAG:?нужна переменная APP_TAG}
+    container_name: ci-deploy-app
+    ports:
+      - "8188:8000"
+    restart: unless-stopped
+EOF
+chown -R student:student /home/student/ci-target
+```
+
+```bash check
+d=/home/student/ci-deploy
+[ -f $d/.gitlab-ci.yml ] || fail "Нет ~/ci-deploy/.gitlab-ci.yml"
+p=$(lab_ci_preview $d); [ -n "$p" ] && [ "$p" != null ] || fail "gitlab-ci-local не может разобрать .gitlab-ci.yml"
+st=$(echo "$p" | jq -r '[.stages[] | select(startswith(".") | not)] | join(" ")')
+[ "$st" = "lint test build deploy verify" ] || fail "Этапы: «$st» — нужны lint, test, build, deploy, verify по порядку"
+scripts=$(echo "$p" | jq -r '[to_entries[] | select(.value | type == "object" and has("script")) | .value.script[]] | join("\n")')
+echo "$scripts" | grep -q hadolint || fail "В пайплайне нет проверки Dockerfile через hadolint"
+echo "$scripts" | grep -qE 'CI_COMMIT_SHORT_SHA' || fail "Образ не тегируется SHA коммита"
+docker rm -f ci-deploy-app >/dev/null 2>&1
+lab_ci_run $d || fail "Пайплайн не проходит: $(lab_ci_log)"
+sha=$(su - student -c "cd $d && git rev-parse --short=8 HEAD")
+img=$(docker inspect -f '{{.Config.Image}}' ci-deploy-app 2>/dev/null) || fail "После пайплайна контейнер ci-deploy-app не запущен"
+[ "$img" = "ci-deploy-app:$sha" ] || fail "Запущен образ «$img», а нужен ci-deploy-app:$sha"
+r=$(curl -s --max-time 3 localhost:8188/)
+[ "$r" = "version $sha" ] || fail "localhost:8188 отвечает «$r» — версия в образ не передана"
+# верификация должна ловить сломанный деплой
+docker rm -f ci-deploy-app >/dev/null 2>&1
+lab_ci_run $d verify && fail "Задача verify проходит, когда приложение не запущено, — она не проверяет деплой"
+su - student -c "cd ~/ci-target && APP_TAG=$sha docker compose up -d" >/dev/null 2>&1
+ok "пайплайн выкатил ci-deploy-app:$sha, verify ловит неработающее приложение"
+```
+
+```text hint
+1. Пять этапов по порядку и по задаче в каждом.
+2. Линтеру Dockerfile передаётся на стандартный ввод. Тесты — модуль unittest.
+3. Сборка: тег образа и аргумент сборки из готовой переменной с коротким SHA коммита.
+4. Деплой: переменная окружения с тегом и запуск compose-файла сервера в фоне.
+5. Проверка: curl с флагом «падать при HTTP-ошибке», повторами и паузой между ними. Пока контейнер стартует, соединение то отклоняется, то сбрасывается — повторять нужно при любой ошибке, а не только при отказе.
+```
+
+```bash solution
+cat > ~/ci-deploy/.gitlab-ci.yml <<'EOF'
+stages: [lint, test, build, deploy, verify]
+
+lint:
+  stage: lint
+  script:
+    - docker run --rm -i hadolint/hadolint:v2.12.0 < Dockerfile
+
+test:
+  stage: test
+  script:
+    - python3 -m unittest -v test_app
+
+build:
+  stage: build
+  script:
+    - docker build -t ci-deploy-app:$CI_COMMIT_SHORT_SHA --build-arg APP_VERSION=$CI_COMMIT_SHORT_SHA .
+
+deploy:
+  stage: deploy
+  script:
+    - APP_TAG=$CI_COMMIT_SHORT_SHA docker compose -f $HOME/ci-target/compose.yaml up -d
+
+verify:
+  stage: verify
+  script:
+    - curl -fsS --retry 10 --retry-delay 1 --retry-all-errors http://localhost:8188/health
+    - curl -fsS http://localhost:8188/
+EOF
+cd ~/ci-deploy && gitlab-ci-local
+```
+
+```text review
+Эталон — в «Решении».
+
+- Порядок — **fail fast**: дешёвые проверки (линтер, тесты) до дорогой сборки; деплой — только проверенного образа.
+- Тег = SHA коммита: по запущенному контейнеру видно, какой код в проде, и откат — это деплой предыдущего SHA. `latest` так не умеет.
+- **verify после деплоя** — без него «пайплайн зелёный, а прод лежит». `curl -f` превращает HTTP 4xx/5xx в ошибку, `--retry-all-errors` — повторяет и при сброшенном соединении (Docker-прокси принимает его раньше, чем готово приложение), `--retry-connrefused` ловит только отказ.
+- На настоящем GitLab образ пушат в реестр (`$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA`), а деплой идёт на удалённый сервер по SSH с ключом из переменной типа File, или через `kubectl`/Helm/Argo CD.
+- Следующий шаг — `environment: production` у deploy: в GitLab появится история деплоев и кнопка Re-deploy для отката.
+```
+
+```text notes
+:latest\b => Образ тегировался latest — по нему не понять, какой код в проде, и не откатиться. Тег — SHA коммита.
+```
+
 ## Тест
 
 ### Почему для CI создают отдельный SSH-ключ, а не используют личный?

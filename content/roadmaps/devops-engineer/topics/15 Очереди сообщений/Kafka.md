@@ -121,6 +121,123 @@ kafka-configs.sh --bootstrap-server kafka:9092 --alter --entity-type topics --en
 - [ ] Включить compaction на топике и проверить, что остаётся последнее значение по ключу
 - [ ] Подключить kafka_exporter к Prometheus и построить график lag
 
+## Лаборатория
+
+Kafka 3.8 работает в контейнере **`kafka`** (один брокер в режиме KRaft, без ZooKeeper), адрес `localhost:9092`. Утилиты Kafka — внутри контейнера: `docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 ...`.
+
+```bash lib
+lab_drm() { docker rm -f "$@" >/dev/null 2>&1; true; }
+# образ есть локально или скачивается (если ученик почистил образы через prune)
+lab_img() { for i in "$@"; do docker image inspect "$i" >/dev/null 2>&1 || docker pull -q "$i" >/dev/null; done; }
+# lab_wait_http URL [строка] — дождаться ответа
+lab_wait_http() { for i in $(seq 60); do curl -s --max-time 1 "$1" 2>/dev/null | grep -q "${2:-.}" && return 0; sleep 0.25; done; return 1; }
+K=/opt/kafka/bin
+# lab_kafka — брокер Kafka (контейнер kafka, порт 9092)
+lab_kafka() {
+  lab_img apache/kafka:3.8.1
+  if [ "$(docker inspect -f '{{.State.Running}}' kafka 2>/dev/null)" != true ]; then
+    docker rm -f kafka >/dev/null 2>&1
+    docker run -d --name kafka -p 127.0.0.1:9092:9092 -e KAFKA_HEAP_OPTS="-Xmx384m -Xms384m" apache/kafka:3.8.1 >/dev/null
+  fi
+  for i in $(seq 60); do docker exec kafka $K/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 && return 0; sleep 1; done
+}
+lab_kt() { docker exec kafka $K/kafka-topics.sh --bootstrap-server localhost:9092 "$@" 2>/dev/null; }
+lab_kg() { docker exec kafka $K/kafka-consumer-groups.sh --bootstrap-server localhost:9092 "$@" 2>/dev/null; }
+```
+
+```bash setup
+lab_kafka
+```
+
+### Топик для заказов
+
+Создайте топик **`orders`**:
+
+- **3 партиции** — чтобы заказы могли обрабатывать до трёх потребителей параллельно;
+- сообщения хранятся **1 сутки** (параметр топика `retention.ms`).
+
+Отправьте в него хотя бы одно сообщение и прочитайте его консольным потребителем.
+
+```bash setup
+lab_kt --delete --topic orders >/dev/null; sleep 2; true
+```
+
+```bash check
+d=$(lab_kt --describe --topic orders) || fail "Топика orders нет"
+[ -n "$d" ] || fail "Топика orders нет"
+n=$(echo "$d" | grep -oE 'PartitionCount: [0-9]+' | awk '{print $2}')
+[ "$n" = 3 ] || fail "Партиций в orders: $n"
+r=$(docker exec kafka $K/kafka-configs.sh --bootstrap-server localhost:9092 --entity-type topics --entity-name orders --describe 2>/dev/null | grep -oE 'retention.ms=[0-9]+' | head -1 | cut -d= -f2)
+[ "$r" = 86400000 ] || fail "Срок хранения сообщений в orders: ${r:-по умолчанию (7 суток)}"
+off=$(docker exec kafka $K/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic orders 2>/dev/null | awk -F: '{s += $3} END {print s + 0}')
+[ "$off" -ge 1 ] || fail "В топике orders нет ни одного сообщения"
+ok "orders: 3 партиции, retention 1 сутки, сообщений: $off"
+```
+
+```text hint
+1. Утилита управления топиками: создать топик с числом партиций и параметром конфигурации (ключ config, значение — миллисекунды).
+2. Консольный продюсер читает сообщения со стандартного ввода — по строке на сообщение.
+3. Консольному потребителю нужно указать «читать с начала» и ограничить число сообщений, иначе он будет ждать вечно.
+```
+
+```bash solution
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic orders --partitions 3 --config retention.ms=86400000
+echo '{"order": 1, "total": 990}' | docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic orders
+docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic orders --from-beginning --max-messages 1 --timeout-ms 10000
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic orders
+```
+
+```text review
+Эталон: `kafka-topics.sh --create --topic orders --partitions 3 --config retention.ms=86400000`.
+
+- **Партиция** — единица параллелизма: в группе потребителей каждую партицию читает один потребитель. 3 партиции = максимум 3 параллельных обработчика. Увеличить число партиций можно, уменьшить — нет.
+- Порядок гарантирован только **внутри партиции**: сообщения с одним ключом (`order_id`) попадают в одну партицию — так заказ обрабатывается по порядку.
+- Kafka хранит сообщения по времени или размеру (`retention.ms`, `retention.bytes`) независимо от того, прочитали их или нет: это журнал, а не очередь. Перечитать историю можно в любой момент.
+- В продакшене: `--replication-factor 3` и `min.insync.replicas=2` — переживает потерю брокера без потери сообщений.
+```
+
+### Отставание потребителей
+
+В топик **`payments`** записано 100 сообщений. Группа потребителей **`billing`** обработала только часть. Узнайте **суммарное отставание** (lag) группы `billing` по топику и запишите число в `~/lag.txt`. Затем **сбросьте смещения** группы на начало топика — нужно переобработать все платежи. Отставание после сброса должно стать равным 100.
+
+```bash setup
+lab_kt --delete --topic payments >/dev/null; sleep 2
+lab_kt --create --topic payments --partitions 2 >/dev/null
+seq 1 100 | sed 's/^/payment-/' | docker exec -i kafka $K/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic payments >/dev/null 2>&1
+docker exec kafka $K/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic payments --group billing --from-beginning --max-messages 63 --timeout-ms 15000 >/dev/null 2>&1
+lab_kg --describe --group billing | awk '$2 == "payments" {s += $6} END {print s}' > /var/lib/lab/kafka-lag
+rm -f /home/student/lag.txt
+```
+
+```bash check
+want=$(cat /var/lib/lab/kafka-lag)
+[ -f /home/student/lag.txt ] || fail "Нет ~/lag.txt"
+[ "$(tr -d '[:space:]' < /home/student/lag.txt)" = "$want" ] || fail "В ~/lag.txt «$(tr -d '[:space:]' < /home/student/lag.txt)» — это не отставание группы billing до сброса"
+now=$(lab_kg --describe --group billing | awk '$2 == "payments" {s += $6} END {print s + 0}')
+[ "$now" = 100 ] || fail "Отставание группы billing сейчас $now — смещения не сброшены на начало"
+ok "lag был $want, после сброса — 100"
+```
+
+```text hint
+1. Утилита групп потребителей показывает по каждой партиции текущее смещение группы, последнее смещение топика и разницу между ними.
+2. Отставание — сумма по всем партициям топика.
+3. У той же утилиты есть режим сброса смещений: на начало, на конец, на время. Без ключа «выполнить» она только показывает план.
+```
+
+```bash solution
+docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group billing
+docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group billing 2>/dev/null | awk '$2 == "payments" {s += $6} END {print s}' > ~/lag.txt
+docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group billing --topic payments --reset-offsets --to-earliest --execute
+```
+
+```text review
+Эталон: `kafka-consumer-groups.sh --describe --group billing` (колонка LAG) → `--reset-offsets --to-earliest --execute`.
+
+- **Consumer lag** — главная метрика Kafka для эксплуатации: растёт — потребители не успевают (мало экземпляров, медленная обработка, упали). Алерт на рост lag, метрики — kafka-exporter или Burrow.
+- Сброс смещений — только при **остановленных** потребителях группы, иначе Kafka откажет. Варианты: `--to-earliest`, `--to-latest` (пропустить накопившееся), `--to-datetime 2026-11-28T10:00:00.000`, `--shift-by -100`.
+- Потребитель должен быть идемпотентным: при переобработке тот же платёж не должен списаться дважды.
+```
+
 ## Тест
 
 ### Что такое партиция в Kafka?

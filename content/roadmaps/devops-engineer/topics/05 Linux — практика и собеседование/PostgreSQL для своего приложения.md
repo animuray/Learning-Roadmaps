@@ -149,6 +149,112 @@ DATABASE_URL=postgresql://app:пароль@localhost:5432/appdb
 - [ ] Поднять вторую ВМ и подключиться к базе с неё: настроить `listen_addresses`, `pg_hba.conf` и ufw только для её адреса
 - [ ] Специально воспроизвести ошибки `no pg_hba.conf entry` и `Peer authentication failed` и разобраться по логам
 
+## Лаборатория
+
+PostgreSQL 16 уже установлен и запущен. Подключиться администратором: `sudo -u postgres psql`.
+
+### Роль и база для приложения
+
+Создайте для приложения роль **`app`** с паролем **`app-secret-42`** и базу **`appdb`**, владельцем которой будет `app`. Приложение должно подключаться по сети к localhost: `psql -h localhost -U app -d appdb` с этим паролем.
+
+```bash setup
+sudo -u postgres psql -qX -c "DROP DATABASE IF EXISTS appdb" -c "DROP ROLE IF EXISTS app" >/dev/null 2>&1
+true
+```
+
+```bash check
+q() { sudo -u postgres psql -qXtA -c "$1" 2>/dev/null; }
+[ "$(q "select 1 from pg_roles where rolname = 'app'")" = 1 ] || fail "Роли app нет"
+[ "$(q "select rolcanlogin from pg_roles where rolname = 'app'")" = t ] || fail "Роль app не может входить в систему (это роль без LOGIN)"
+[ "$(q "select 1 from pg_database where datname = 'appdb'")" = 1 ] || fail "Базы appdb нет"
+[ "$(q "select pg_get_userbyid(datdba) from pg_database where datname = 'appdb'")" = app ] || fail "Владелец appdb — $(q "select pg_get_userbyid(datdba) from pg_database where datname = 'appdb'")"
+out=$(PGPASSWORD=app-secret-42 psql -h localhost -U app -d appdb -qXtA -c "create table if not exists lab_check(x int); select current_user" 2>&1)
+[ "$out" = app ] || fail "Подключиться как app по паролю не получается: $out"
+PGPASSWORD=app-secret-42 psql -h localhost -U app -d appdb -qX -c "drop table lab_check" >/dev/null 2>&1
+ok "app → appdb по паролю работает"
+```
+
+```text hint
+1. Подключиться к PostgreSQL администратором — от системного пользователя postgres.
+2. Создать роль с правом входа и паролем.
+3. Создать базу, сразу указав владельца, — тогда приложение сможет создавать в ней таблицы.
+4. Проверить подключение по сети к localhost от имени новой роли.
+```
+
+```bash solution
+sudo -u postgres psql -c "CREATE ROLE app LOGIN PASSWORD 'app-secret-42'"
+sudo -u postgres psql -c "CREATE DATABASE appdb OWNER app"
+PGPASSWORD=app-secret-42 psql -h localhost -U app -d appdb -c '\conninfo'
+```
+
+```text review
+Эталон: `CREATE ROLE app LOGIN PASSWORD '...'` → `CREATE DATABASE appdb OWNER app`.
+
+- `CREATE USER` = `CREATE ROLE ... LOGIN`. Без `LOGIN` роль — просто группа прав.
+- Владелец базы может создавать в схеме `public` таблицы. С PostgreSQL 15 обычные роли **больше не могут** создавать таблицы в `public` чужой базы — частая ошибка «permission denied for schema public» при `OWNER postgres`.
+- `-h localhost` — подключение по TCP с паролем (`scram-sha-256` в `pg_hba.conf`). Без `-h` psql идёт через unix-сокет, где по умолчанию `peer`: имя роли должно совпадать с системным пользователем — отсюда «Peer authentication failed for user app».
+- Пароль в командной строке виден в истории и `ps`. Для приложения — переменная `DATABASE_URL` из секретов, для себя — `~/.pgpass` (права 600).
+```
+
+### Открыть базу для сервера приложений
+
+Бэкенд переезжает на отдельный сервер в сети `10.20.30.0/24`. Настройте PostgreSQL так, чтобы:
+
+- он слушал **все** сетевые интерфейсы, а не только localhost;
+- подключения из `10.20.30.0/24` к базе **`appdb`** под ролью **`app`** проходили **по паролю** (`scram-sha-256`), и только они — без доступа ко всем базам и всем ролям.
+
+Настройки должны быть **применены** к работающему серверу.
+
+```bash setup
+conf=/etc/postgresql/16/main
+sudo -u postgres psql -qX -c "DROP DATABASE IF EXISTS appdb" -c "DROP ROLE IF EXISTS app" >/dev/null 2>&1
+sudo -u postgres psql -qX -c "CREATE ROLE app LOGIN PASSWORD 'app-secret-42'" -c "CREATE DATABASE appdb OWNER app" >/dev/null
+sed -i '/10\.20\.30\./d' $conf/pg_hba.conf
+sed -i "s/^listen_addresses.*/#listen_addresses = 'localhost'/" $conf/postgresql.conf
+rm -f $conf/conf.d/*.conf
+sudo -u postgres psql -qX -c "ALTER SYSTEM RESET listen_addresses" >/dev/null
+systemctl restart postgresql
+```
+
+```bash check
+q() { sudo -u postgres psql -qXtA -c "$1" 2>/dev/null; }
+[ "$(q 'show listen_addresses')" = "*" ] || fail "Работающий сервер слушает только «$(q 'show listen_addresses')»"
+err=$(q "select line_number || ': ' || error from pg_hba_file_rules where error is not null")
+[ -z "$err" ] && [ "$(q "select count(*) from pg_hba_file_rules where error is not null")" = 0 ] || fail "В pg_hba.conf есть ошибочные строки: $err"
+rule=$(q "select line_number, database, user_name, auth_method from pg_hba_file_rules where type = 'host' and address = '10.20.30.0' and netmask = '255.255.255.0'")
+[ -n "$rule" ] || fail "В действующих правилах доступа нет строки для сети 10.20.30.0/24 (файл изменён, но не перечитан?)"
+echo "$rule" | grep -q '|{appdb}|{app}|scram-sha-256$' || fail "Правило для 10.20.30.0/24 не то: $rule (нужны база appdb, роль app, scram-sha-256)"
+ok "listen_addresses=*; правило: $rule"
+```
+
+```text hint
+1. Найти конфигурацию кластера: адреса прослушивания задаются в основном файле, правила доступа — в файле правил аутентификации.
+2. Добавить правило: тип подключения по сети, база, роль, адрес сети с маской, метод с паролем.
+3. Правила аутентификации применяются перечитыванием конфигурации, а смена адресов прослушивания требует перезапуска.
+4. Проверить действующие правила — в системном представлении с правилами из файла (там видны и ошибки).
+```
+
+```bash solution
+conf=/etc/postgresql/16/main
+sudo sed -i "s/^#\?listen_addresses.*/listen_addresses = '*'/" $conf/postgresql.conf
+echo "host    appdb    app    10.20.30.0/24    scram-sha-256" | sudo tee -a $conf/pg_hba.conf >/dev/null
+sudo systemctl restart postgresql
+sudo -u postgres psql -c "show listen_addresses" -c "select line_number, type, database, user_name, address, auth_method from pg_hba_file_rules where address = '10.20.30.0'"
+```
+
+```text review
+Эталон: `listen_addresses = '*'` в `postgresql.conf` + строка `host appdb app 10.20.30.0/24 scram-sha-256` в `pg_hba.conf` → `systemctl restart postgresql`.
+
+- `listen_addresses` меняется только **перезапуском**; правила `pg_hba.conf` — `reload` (`SELECT pg_reload_conf()` или `systemctl reload postgresql`). Какой параметр что требует — колонка `context` в `pg_settings` (`postmaster` = перезапуск).
+- Правила `pg_hba.conf` читаются **сверху вниз до первого совпадения**. Широкое правило выше узкого «съест» его.
+- Никогда: `host all all 0.0.0.0/0 trust`. Минимум — конкретная база, роль, сеть и пароль; плюс файрвол только для адресов бэкендов (`ufw allow from 10.20.30.0/24 to any port 5432`).
+- `pg_hba_file_rules` показывает правила из файла и ошибки в них ещё до reload — проверка перед применением.
+```
+
+```text notes
+\b(all\s+all|0\.0\.0\.0/0|trust)\b => В правилах доступа встречались all/0.0.0.0/trust — так база открывается шире, чем нужно. Разрешайте конкретную базу, роль и сеть с паролем.
+```
+
 ## Тест
 
 ### Как зайти в консоль PostgreSQL суперпользователем сразу после установки в Ubuntu?

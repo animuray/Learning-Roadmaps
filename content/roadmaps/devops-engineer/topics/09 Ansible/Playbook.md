@@ -202,6 +202,204 @@ ansible-playbook site.yml -e "app_port=9000"   # extra vars
 - [ ] Прогнать плейбук с `--check --diff`, `--tags` и `--limit`
 - [ ] Выкатить изменение на группу по одному хосту через `serial: 1`
 
+## Лаборатория
+
+«Серверы» — контейнеры `lab-web1`, `lab-web2`, `lab-db1`; проект `~/ansible-lab` с `ansible.cfg` и `inventory.ini` (группы `web` и `db`) готов.
+
+```bash lib
+# «Серверы» для Ansible — контейнеры lab-web1, lab-web2, lab-db1 (Python, sudo, sshd); подключение — community.docker.docker
+lab_host_image() {
+  docker image inspect lab-ansible-host:2 >/dev/null 2>&1 && return
+  docker image inspect python:3.12-slim >/dev/null 2>&1 || docker pull -q python:3.12-slim >/dev/null
+  docker build -q -t lab-ansible-host:2 - >/dev/null <<'EOF'
+FROM python:3.12-slim
+RUN apt-get update -q && apt-get install -y -q --no-install-recommends sudo openssh-server \
+ && mkdir -p /run/sshd && rm -rf /var/lib/apt/lists/*
+CMD ["sleep", "infinity"]
+EOF
+}
+lab_hosts() { lab_host_image; for h in ${*:-lab-web1 lab-web2 lab-db1}; do docker rm -f $h >/dev/null 2>&1; docker run -d --name $h --hostname $h lab-ansible-host:2 >/dev/null; done; }
+# lab_inv каталог — ansible.cfg и inventory.ini: web = lab-web1, lab-web2; db = lab-db1
+lab_inv() {
+  mkdir -p "$1"
+  printf '[defaults]\ninventory = inventory.ini\ninterpreter_python = /usr/local/bin/python3\n' > "$1/ansible.cfg"
+  printf '[web]\nlab-web1\nlab-web2\n\n[db]\nlab-db1\n\n[all:vars]\nansible_connection=community.docker.docker\n' > "$1/inventory.ini"
+}
+lab_own() { chown -R student:student "$1"; }
+# lab_play каталог аргументы — ansible-playbook от имени ученика, вывод — в /tmp/lab-ans.log
+lab_play() { su - student -c "cd $1 && ANSIBLE_NOCOLOR=1 ansible-playbook $2" > /tmp/lab-ans.log 2>&1; }
+# сумма changed по всем хостам из итогов последнего прогона
+lab_changed() { grep -E '^lab-[a-z0-9]+ +:' /tmp/lab-ans.log | grep -oE 'changed=[0-9]+' | cut -d= -f2 | awk '{s += $1} END {print s + 0}'; }
+lab_anslog() { grep -E 'fatal|ERROR|FAILED|error' /tmp/lab-ans.log | head -2 | tr '\n' ' ' | cut -c1-300; }
+```
+
+```bash setup
+lab_hosts
+rm -rf /home/student/ansible-lab
+lab_inv /home/student/ansible-lab
+lab_own /home/student/ansible-lab
+```
+
+### Конфиг и handler
+
+Напишите плейбук `~/ansible-lab/site.yml` из **двух плеев**:
+
+1. для группы **`web`**: файл **`/opt/app/app.conf`** из **шаблона** `templates/app.conf.j2` со строкой `port={{ app_port }}`, где `app_port` по умолчанию **8080** (переменная плея). При **изменении** конфига должен срабатывать handler **`restart app`**, который дописывает строку в `/opt/app/restarts.log` (имитация перезапуска приложения: `echo restarted >> /opt/app/restarts.log`);
+2. для группы **`db`**: каталог **`/var/lib/appdb`**.
+
+Handler должен срабатывать **только когда конфиг действительно изменился**: повторный прогон — без перезапуска, прогон с `-e app_port=9000` — с перезапуском.
+
+```bash check
+d=/home/student/ansible-lab
+[ -f $d/site.yml ] || fail "Нет ~/ansible-lab/site.yml"
+[ -f $d/templates/app.conf.j2 ] || fail "Нет шаблона ~/ansible-lab/templates/app.conf.j2"
+for h in lab-web1 lab-web2; do docker exec $h rm -rf /opt/app; done
+lab_play $d site.yml || fail "Плейбук падает: $(lab_anslog)"
+for h in lab-web1 lab-web2; do
+  [ "$(docker exec $h cat /opt/app/app.conf 2>/dev/null)" = "port=8080" ] || fail "На $h /opt/app/app.conf: «$(docker exec $h cat /opt/app/app.conf 2>&1)»"
+  [ "$(docker exec $h grep -c restarted /opt/app/restarts.log 2>/dev/null)" = 1 ] || fail "На $h после первого прогона handler не сработал ровно один раз"
+done
+docker exec lab-db1 test -d /var/lib/appdb || fail "На lab-db1 нет /var/lib/appdb"
+docker exec lab-db1 test -e /opt/app/app.conf && fail "Конфиг приложения попал и на lab-db1"
+lab_play $d site.yml || fail "Повторный прогон падает: $(lab_anslog)"
+[ "$(docker exec lab-web1 grep -c restarted /opt/app/restarts.log)" = 1 ] || fail "Handler сработал при повторном прогоне, хотя конфиг не менялся"
+lab_play $d "site.yml -e app_port=9000" || fail "Прогон с -e app_port=9000 падает: $(lab_anslog)"
+[ "$(docker exec lab-web1 cat /opt/app/app.conf)" = "port=9000" ] || fail "С -e app_port=9000 конфиг не поменялся"
+[ "$(docker exec lab-web1 grep -c restarted /opt/app/restarts.log)" = 2 ] || fail "После изменения конфига handler не сработал"
+lab_play $d site.yml >/dev/null
+ok "handler срабатывает только при изменении конфига"
+```
+
+```text hint
+1. Плейбук — список плеев; у каждого свои хосты, переменные, задачи и (у первого) handlers.
+2. Каталог создать до шаблона. Задача с шаблоном «уведомляет» handler по его имени.
+3. Handler — задача в отдельном разделе; выполняется в конце плея и только если уведомившая задача что-то изменила.
+4. Переменные из ключа -e сильнее переменных плея.
+```
+
+```bash solution
+cd ~/ansible-lab
+mkdir -p templates
+echo 'port={{ app_port }}' > templates/app.conf.j2
+cat > site.yml <<'EOF'
+- name: Веб-серверы
+  hosts: web
+  become: true
+  vars:
+    app_port: 8080
+  tasks:
+    - name: Каталог приложения
+      ansible.builtin.file:
+        path: /opt/app
+        state: directory
+        mode: "0755"
+
+    - name: Конфиг приложения
+      ansible.builtin.template:
+        src: app.conf.j2
+        dest: /opt/app/app.conf
+        mode: "0644"
+      notify: restart app
+
+  handlers:
+    - name: restart app
+      ansible.builtin.shell: echo restarted >> /opt/app/restarts.log
+
+- name: Базы данных
+  hosts: db
+  become: true
+  tasks:
+    - name: Каталог данных
+      ansible.builtin.file:
+        path: /var/lib/appdb
+        state: directory
+        mode: "0750"
+EOF
+ansible-playbook site.yml && ansible-playbook site.yml | tail -4
+```
+
+```text review
+Эталон — в «Решении»: `template` + `notify: restart app` + раздел `handlers`.
+
+- Handler выполняется **один раз в конце плея**, сколько бы задач его ни уведомили, и только если хоть одна из них дала `changed`. Изменили три конфига nginx — один reload.
+- Упал плей до конца — уведомлённые handler-ы не выполнятся, и сервис останется со старым конфигом. Выход — `--force-handlers` или `meta: flush_handlers` в нужном месте.
+- На настоящем сервере handler — `ansible.builtin.service: name=nginx state=reloaded`, а перед ним проверка конфига (`validate` у шаблона).
+- Приоритет переменных: `-e` сильнее всего; затем переменные задачи/плея; затем host_vars/group_vars; defaults ролей — слабее всего.
+```
+
+```text notes
+state:\s*restarted => В задачах был безусловный перезапуск — так сервис перезапускается при каждом прогоне. Перезапуск при изменениях — через handler.
+```
+
+### Пользователи из списка
+
+Добавьте в `~/ansible-lab/users.yml` плейбук для **всех** хостов, который создаёт пользователей **циклом** по списку из переменной `team`:
+
+- `alice` — оболочка `/bin/bash`, группы `sudo` и `adm`;
+- `bob` — оболочка `/bin/bash`, группа `adm`;
+- `ci` — оболочка `/usr/sbin/nologin`, без дополнительных групп.
+
+Список — **одна переменная** со списком словарей, задача создания пользователей — **одна**. Существующие группы пользователей при этом не должны теряться.
+
+```bash setup
+rm -f /home/student/ansible-lab/users.yml
+```
+
+```bash check
+d=/home/student/ansible-lab
+[ -f $d/users.yml ] || fail "Нет ~/ansible-lab/users.yml"
+n=$(python3 -c 'import yaml,sys; p=yaml.safe_load(open(sys.argv[1])); print(sum(1 for pl in p for t in pl.get("tasks", []) if any(k.endswith("user") for k in t)))' $d/users.yml 2>/dev/null)
+[ "$n" = 1 ] || fail "Задач с модулем user: ${n:-?} — нужна одна задача с циклом"
+grep -qE '^\s*(loop|with_items):' $d/users.yml || fail "Пользователи создаются не циклом"
+lab_play $d users.yml || fail "Плейбук падает: $(lab_anslog)"
+for h in lab-web1 lab-web2 lab-db1; do
+  for u in alice:/bin/bash:sudo,adm bob:/bin/bash:adm ci:/usr/sbin/nologin:; do
+    name=${u%%:*}; rest=${u#*:}; sh=${rest%%:*}; grps=${rest#*:}
+    docker exec $h id $name >/dev/null 2>&1 || fail "На $h нет пользователя $name"
+    [ "$(docker exec $h getent passwd $name | cut -d: -f7)" = "$sh" ] || fail "У $name на $h оболочка не $sh"
+    for g in $(echo $grps | tr ',' ' '); do docker exec $h id -nG $name | tr ' ' '\n' | grep -qx $g || fail "$name на $h не в группе $g"; done
+  done
+done
+ok "alice, bob, ci созданы на трёх хостах одной задачей"
+```
+
+```text hint
+1. Переменная плея — список словарей с полями имени, оболочки и списка групп.
+2. Одна задача с модулем пользователей и циклом по этому списку; поля текущего элемента — через переменную цикла.
+3. Чтобы не потерять уже существующие группы пользователя, у модуля есть параметр «добавлять к группам, а не заменять».
+```
+
+```bash solution
+cat > ~/ansible-lab/users.yml <<'EOF'
+- name: Пользователи команды
+  hosts: all
+  become: true
+  vars:
+    team:
+      - { name: alice, shell: /bin/bash, groups: [sudo, adm] }
+      - { name: bob, shell: /bin/bash, groups: [adm] }
+      - { name: ci, shell: /usr/sbin/nologin, groups: [] }
+  tasks:
+    - name: Создать пользователей
+      ansible.builtin.user:
+        name: "{{ item.name }}"
+        shell: "{{ item.shell }}"
+        groups: "{{ item.groups }}"
+        append: true
+      loop: "{{ team }}"
+EOF
+cd ~/ansible-lab && ansible-playbook users.yml
+```
+
+```text review
+Эталон: `loop: "{{ team }}"` и `item.name`, `item.shell`, `item.groups`, `append: true`.
+
+- `append: true` — как `usermod -aG`: без него Ansible **заменит** группы пользователя списком из задачи, и он вылетит из остальных.
+- `loop` — современная форма; `with_items` встречается в старых плейбуках. Для словаря — `loop: "{{ users | dict2items }}"`.
+- `loop_control: label: "{{ item.name }}"` — чтобы в выводе было имя, а не весь словарь (и пароли из него).
+- Удаление пользователей — тот же цикл со `state: absent` по списку уволенных; хранить список людей в одном месте (group_vars) — основа «онбординга кодом».
+```
+
 ## Тест
 
 ### В каком порядке выполняются задачи плея на нескольких хостах (стратегия по умолчанию)?

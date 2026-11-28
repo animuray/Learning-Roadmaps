@@ -120,6 +120,117 @@ curl -u user:pass https://api.example.com    # базовая аутентифи
 - [ ] Остановить бэкенд за прокси (когда настроите nginx) и посмотреть, какой код вернёт прокси
 - [ ] В браузере открыть инструменты разработчика → Network и посмотреть заголовки запросов к любому сайту
 
+## Лаборатория
+
+На стенде работает API приложения на `http://127.0.0.1:8095`.
+
+```bash setup
+systemctl stop lab-http-api 2>/dev/null; systemctl reset-failed lab-http-api 2>/dev/null
+ver="2.$((RANDOM % 9)).$((RANDOM % 20))"
+tok=$(tr -dc a-zA-Z0-9 </dev/urandom | head -c 24)
+echo "$ver" > /var/lib/lab/api-version
+echo "$tok" > /var/lib/lab/api-token
+echo "$tok" > /home/student/api-token.txt && chown student:student /home/student/api-token.txt
+: > /var/lib/lab/api-notes.log
+cat > /opt/lab-http-api.py <<'EOF'
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+VER = open("/var/lib/lab/api-version").read().strip()
+TOK = open("/var/lib/lab/api-token").read().strip()
+class H(BaseHTTPRequestHandler):
+    def send(self, code, body, ctype="application/json"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype); self.send_header("X-App-Version", VER); self.end_headers()
+        self.wfile.write(body.encode())
+    def do_GET(self):
+        if self.path == "/api/health": return self.send(503, '{"status": "degraded", "reason": "cache unavailable"}')
+        self.send(404, '{"error": "not found"}')
+    def do_POST(self):
+        if self.path != "/api/notes": return self.send(404, '{"error": "not found"}')
+        if self.headers.get("Authorization") != f"Bearer {TOK}": return self.send(401, '{"error": "need Authorization: Bearer <token>"}')
+        if "json" not in (self.headers.get("Content-Type") or ""): return self.send(415, '{"error": "Content-Type must be application/json"}')
+        try: data = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        except Exception: return self.send(400, '{"error": "invalid JSON"}')
+        if not isinstance(data, dict) or not data.get("title"): return self.send(400, '{"error": "field title is required"}')
+        open("/var/lib/lab/api-notes.log", "a").write(data["title"] + "\n")
+        self.send(201, json.dumps({"id": 1, "title": data["title"]}))
+HTTPServer(("127.0.0.1", 8095), H).serve_forever()
+EOF
+systemd-run -q --unit=lab-http-api python3 /opt/lab-http-api.py
+for i in $(seq 40); do ss -ltnH 'sport = :8095' | grep -q . && break; sleep 0.25; done
+```
+
+### Код ответа и заголовок
+
+Мониторинг сообщает, что API нездоров. Узнайте, какой **код ответа** возвращает `http://127.0.0.1:8095/api/health` и какая версия приложения указана в заголовке ответа **`X-App-Version`**. Запишите в `~/health.txt` одну строку: `код версия` (например, `200 1.0.0`).
+
+```bash setup
+rm -f /home/student/health.txt
+```
+
+```bash check
+want="503 $(cat /var/lib/lab/api-version)"
+[ -f /home/student/health.txt ] || fail "Нет ~/health.txt"
+got=$(tr -s ' \t' ' ' < /home/student/health.txt | head -1 | sed 's/^ //; s/ $//')
+[ "$got" = "$want" ] || fail "В ~/health.txt «$got» — код или версия не совпадают с ответом API"
+ok "/api/health → $want"
+```
+
+```text hint
+1. curl по умолчанию показывает только тело ответа. Есть ключи «показать заголовки ответа» и «подробный вывод» — в нём видна и строка статуса.
+2. Ещё у curl есть ключ формата вывода: в нём можно попросить только код ответа.
+```
+
+```bash solution
+curl -si http://127.0.0.1:8095/api/health
+code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8095/api/health)
+ver=$(curl -s -D - -o /dev/null http://127.0.0.1:8095/api/health | awk -F': ' 'tolower($1) == "x-app-version" {print $2}' | tr -d '\r')
+echo "$code $ver" > ~/health.txt
+```
+
+```text review
+Эталон: `curl -i` (заголовки + тело) или `curl -v`; код — `curl -s -o /dev/null -w '%{http_code}'`.
+
+- 2xx — успех, 3xx — перенаправление, 4xx — ошибка клиента (401 — нет авторизации, 403 — нельзя, 404 — нет такого), 5xx — ошибка сервера (500 — упало, 502/504 — прокси не достучался до бэкенда, 503 — сервис временно недоступен).
+- `-w` в curl — готовый мини-мониторинг: `-w '%{http_code} %{time_total}s\n'`, а ещё `time_connect`, `time_starttransfer` — где именно тормозит запрос.
+- Health-check с 503 при деградации — правильная практика: балансировщик и Kubernetes уберут такой экземпляр из ротации.
+```
+
+### Создать запись через API
+
+Создайте через API заметку с заголовком **`devops`**: запрос `POST http://127.0.0.1:8095/api/notes` с JSON-телом `{"title": "devops"}`. API требует токен в заголовке авторизации — он лежит в `~/api-token.txt`. Если API отказывает, читайте его ответ: он объясняет, чего не хватает.
+
+```bash setup
+: > /var/lib/lab/api-notes.log
+```
+
+```bash check
+grep -qx devops /var/lib/lab/api-notes.log || fail "Заметки devops в API нет"
+ok "заметка создана"
+```
+
+```text hint
+1. Метод запроса, заголовки и тело задаются ключами curl. Тело должно быть JSON, и сервер должен знать, что это JSON, — по заголовку типа содержимого.
+2. Авторизация — заголовок со схемой Bearer и токеном. Токен можно подставить из файла через $(...).
+3. Смотрите код и тело ответа: 401, 415 и 400 означают разные проблемы.
+```
+
+```bash solution
+curl -s -X POST http://127.0.0.1:8095/api/notes \
+  -H "Authorization: Bearer $(cat ~/api-token.txt)" \
+  -H 'Content-Type: application/json' \
+  -d '{"title": "devops"}'
+```
+
+```text review
+Эталон: `curl -X POST -H "Authorization: Bearer ..." -H 'Content-Type: application/json' -d '{"title": "devops"}' URL`.
+
+- `-d` сам делает запрос POST, но с `Content-Type: application/x-www-form-urlencoded` — API, ждущее JSON, ответит 415 или 400. В новых curl есть `--json '{"title":"devops"}'` — ставит оба заголовка.
+- 401 — не представились (нет токена или он неверный), 403 — представились, но нельзя.
+- Токен в командной строке попадает в историю оболочки. В скриптах его читают из файла или переменной окружения, как здесь.
+- Для API удобны `jq` (разбор ответа: `curl ... | jq .id`) и `-f` (вернуть ненулевой код при 4xx/5xx — для скриптов и CI).
+```
+
 ## Тест
 
 ### Какой метод HTTP используют для получения ресурса без изменений?

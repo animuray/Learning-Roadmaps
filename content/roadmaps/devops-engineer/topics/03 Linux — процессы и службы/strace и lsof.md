@@ -111,6 +111,161 @@ sudo lsof +L1 | grep deleted
 - [ ] Воспроизвести «удалённый, но открытый файл»: `python3 -c "import time; f=open('/tmp/big','w'); f.write('x'*10**8); f.flush(); time.sleep(600)" &`, удалить файл, найти его через `lsof +L1` и посмотреть `df`
 - [ ] Смонтировать диск или каталог, зайти в него в другом терминале и разобраться с ошибкой `target is busy` через `fuser` или `lsof`
 
+## Лаборатория
+
+```bash setup
+lab_unit() { systemctl stop "$1" 2>/dev/null; systemctl reset-failed "$1" 2>/dev/null; true; }
+mkdir -p /opt/lab
+```
+
+### Место пропало, а файлов нет
+
+Служба `lab-logger` пишет лог, который кто-то удалил командой `rm`. Место на диске при этом не освободилось: `du` не находит, куда оно делось. Освободите место, **не останавливая и не перезапуская** `lab-logger`.
+
+```bash setup
+lab_unit lab-logger
+rm -f /var/tmp/lab-app.log
+cat > /opt/lab/lab-logger <<'EOF'
+#!/usr/bin/env python3
+import time
+f = open("/var/tmp/lab-app.log", "a")
+f.write("x" * (200 * 1024 * 1024))
+f.flush()
+while True:
+    f.write(time.ctime() + " still logging\n"); f.flush(); time.sleep(2)
+EOF
+chmod 755 /opt/lab/lab-logger
+systemd-run -q --unit=lab-logger -p User=student /opt/lab/lab-logger
+for i in $(seq 50); do [ "$(stat -c %s /var/tmp/lab-app.log 2>/dev/null || echo 0)" -gt 200000000 ] && break; sleep 0.2; done
+rm -f /var/tmp/lab-app.log
+systemctl show -p MainPID --value lab-logger > /var/lib/lab/logger-pid
+```
+
+```bash check
+pid=$(cat /var/lib/lab/logger-pid)
+[ -d /proc/$pid ] || fail "Процесс lab-logger (PID $pid) больше не работает — его остановили или перезапустили"
+fd=$(ls -l /proc/$pid/fd 2>/dev/null | awk '/lab-app.log \(deleted\)/ {print $9}' | head -1)
+[ -n "$fd" ] || fail "lab-logger больше не держит удалённый лог — похоже, его перезапустили"
+sz=$(stat -L -c %s /proc/$pid/fd/$fd)
+[ "$sz" -lt 10485760 ] || fail "Удалённый, но открытый файл всё ещё занимает $((sz / 1024 / 1024)) МБ"
+ok "место освобождено, lab-logger работает (файл сейчас $sz байт)"
+```
+
+```text hint
+1. Найти файлы, которые удалены, но всё ещё открыты каким-то процессом, — у lsof есть ключ «файлы без единой ссылки в каталогах».
+2. Запомнить PID процесса и номер дескриптора (колонка FD, без буквы режима).
+3. Через путь к дескриптору в /proc файл можно обнулить, не трогая процесс, — например, пустым перенаправлением.
+```
+
+```bash solution
+lsof +L1 2>/dev/null | grep lab-app.log
+pid=$(pgrep -f /opt/lab/lab-logger)
+fd=$(ls -l /proc/$pid/fd | awk '/lab-app.log \(deleted\)/ {print $9}')
+: > /proc/$pid/fd/$fd
+df -h /var/tmp
+```
+
+```text review
+Эталон: `lsof +L1` → `: > /proc/<PID>/fd/<N>`.
+
+- Классика ночных алертов «диск 100%»: лог удалили `rm` вместо ротации, а процесс продолжает держать файл. `df` видит занятое место, `du` — нет, потому что у файла больше нет имени.
+- Варианты: обнулить через `/proc/PID/fd/N` (процесс продолжает писать), перезапустить программу (дескриптор закроется) или `reload`, если программа переоткрывает логи.
+- Профилактика — logrotate с `postrotate`/`copytruncate` вместо ручного `rm`, и правило: живые логи обнуляют (`: > app.log`), а не удаляют.
+- `lsof -p PID` — все файлы процесса, `lsof /var/log/app.log` — кто держит файл, `lsof -i :80` — кто на порту.
+```
+
+```text notes
+systemctl\s+(restart|stop)\s+lab-logger|kill\s+[^\n]*lab-logger => lab-logger останавливали или перезапускали — по условию так нельзя. Место освобождают обнулением через /proc/PID/fd.
+```
+
+### Кто занял порт
+
+Новое приложение не стартует: «Address already in use», порт `7070` кем-то занят. Найдите процесс, который **слушает TCP-порт 7070**, и запишите его PID в `~/port-pid.txt`.
+
+```bash setup
+lab_unit lab-squatter
+rm -f /home/student/port-pid.txt
+systemd-run -q --unit=lab-squatter python3 -m http.server 7070 --bind 0.0.0.0 --directory /tmp
+for i in $(seq 20); do ss -ltnH 'sport = :7070' | grep -q . && break; sleep 0.25; done
+```
+
+```bash check
+want=$(systemctl show -p MainPID --value lab-squatter)
+[ -f /home/student/port-pid.txt ] || fail "Нет ~/port-pid.txt"
+got=$(tr -d '[:space:]' < /home/student/port-pid.txt)
+[ "$got" = "$want" ] || fail "В ~/port-pid.txt «$got» — это не процесс, который слушает порт 7070"
+ok "порт 7070 слушает PID $want ($(ps -o args= -p $want))"
+```
+
+```text hint
+1. Список слушающих сокетов вместе с процессами показывает утилита ss (или lsof с фильтром по порту). Процесс принадлежит root — без прав администратора колонка процессов будет пустой.
+2. Отфильтровать по порту и достать PID.
+```
+
+```bash solution
+sudo ss -ltnp 'sport = :7070'
+sudo lsof -t -iTCP:7070 -sTCP:LISTEN > ~/port-pid.txt
+```
+
+```text review
+Эталон: `sudo ss -ltnp 'sport = :7070'` или `sudo lsof -iTCP:7070 -sTCP:LISTEN`.
+
+- `ss -ltnp`: `l` — слушающие, `t` — TCP, `n` — номера вместо имён, `p` — процессы. Для UDP — `-u`. Это первая команда при «порт занят» и «сервис недоступен».
+- Без `sudo` процессы других пользователей не видны — частая причина «ss показывает порт, но без процесса».
+- `fuser 7070/tcp` — коротко PID; `fuser -k 7070/tcp` — сразу убить (осторожно).
+- Дальше решают: остановить лишнее (`systemctl stop ...`) или перенести своё приложение на другой порт.
+```
+
+### Какой конфиг ищет программа
+
+Утилита `lab-tool` (запускается через `sudo lab-tool`) при старте ищет свой файл настроек, не находит его и молча завершается с ошибкой. Документации нет. Выясните **трассировкой системных вызовов**, какой файл она пытается найти, и создайте его (пустым). После этого `sudo lab-tool` должна печатать `config ok`.
+
+```bash setup
+rm -rf /etc/labtool-*
+d=/etc/labtool-$(tr -dc a-z0-9 </dev/urandom | head -c 6)
+echo "$d/settings.ini" > /var/lib/lab/labtool-conf
+cat > /usr/local/bin/lab-tool <<EOF
+#!/bin/bash
+[ -r "$d/settings.ini" ] && { echo "config ok"; exit 0; }
+exit 1
+EOF
+chmod 700 /usr/local/bin/lab-tool
+```
+
+```bash check
+c=$(cat /var/lib/lab/labtool-conf)
+[ -f "$c" ] || fail "Файла, который ищет lab-tool, нет"
+[ "$(/usr/local/bin/lab-tool)" = "config ok" ] || fail "lab-tool по-прежнему не находит настройки"
+ok "lab-tool нашла $c"
+```
+
+```text hint
+1. Запустить утилиту под трассировщиком системных вызовов (от root, как и саму утилиту), следя и за дочерними процессами.
+2. Оставить только вызовы, которые работают с путями к файлам, и найти неудачные — с ошибкой «нет такого файла».
+3. Создать нужный каталог и файл.
+```
+
+```bash solution
+sudo strace -f -e trace=file lab-tool 2>&1 | grep ENOENT | grep -v -e '/lib' -e '/usr/' | tail -3
+c=$(sudo strace -f -e trace=file lab-tool 2>&1 | grep -oE '"/etc/labtool-[^"]+"' | tr -d '"' | head -1)
+sudo mkdir -p "$(dirname "$c")"
+sudo touch "$c"
+sudo lab-tool
+```
+
+```text review
+Эталон: `sudo strace -f -e trace=file lab-tool 2>&1 | grep ENOENT`.
+
+- `strace` показывает каждый системный вызов: какие файлы программа открывает (`openat`), проверяет (`access`, `stat`), куда подключается (`connect`), что пишет. Это способ понять «чёрный ящик» без исходников.
+- Полезные ключи: `-f` — следить за дочерними процессами, `-e trace=file|network|process`, `-p PID` — подключиться к работающему процессу, `-o файл` — вывод в файл, `-tt -T` — время и длительность вызовов (ищем, на чём висит).
+- Типичные находки: программа читает не тот конфиг, ищет библиотеку не там, висит на `connect` к недоступному хосту или на `futex` (ждёт блокировку).
+- strace сильно замедляет программу — на нагруженном проде с осторожностью.
+```
+
+```text notes
+cat\s+[^\n]*/usr/local/bin/lab-tool => Путь подсмотрели в исходнике скрипта. Здесь это возможно, но у бинарных программ исходника нет — strace работает с любыми.
+```
+
 ## Тест
 
 ### Что показывает strace?

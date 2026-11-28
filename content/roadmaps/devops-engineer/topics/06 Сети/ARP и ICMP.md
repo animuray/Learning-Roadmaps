@@ -95,6 +95,136 @@ mtr -rwc 100 example.com        # отчёт по 100 пакетам — удо�
 - [ ] Найти хост, который не отвечает на ping, но открывает сайт (`curl -I`), и объяснить, почему так бывает
 - [ ] Сравнить `traceroute` в режимах UDP, ICMP и TCP до одного и того же сайта
 
+## Лаборатория
+
+Машины — сетевые пространства имён `lab-*`: `sudo ip netns exec lab-<имя> <команда>`.
+
+```bash setup
+# «Машины» задачи — network namespace lab-*, «кабели» — пары veth. Всё лабораторное начинается с lab.
+lab_net_reset() {
+  for u in $(systemctl list-units --all --plain --no-legend 'lab-net-*' | awk '{print $1}'); do
+    systemctl stop "$u" 2>/dev/null; systemctl reset-failed "$u" 2>/dev/null
+  done
+  for ns in $(ip netns list | awk '$1 ~ /^lab-/ {print $1}'); do
+    ip netns pids "$ns" | xargs -r kill -9 2>/dev/null; ip netns del "$ns"
+  done
+  for l in $(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1 | grep '^lab'); do ip link del "$l" 2>/dev/null; done
+  rm -rf /etc/netns/lab-*
+  true
+}
+# lab_ns имя — пустая «машина» lab-имя с поднятым loopback
+lab_ns() { ip netns add "lab-$1"; ip -n "lab-$1" link set lo up; }
+# lab_link ns1 if1 addr1 ns2 if2 addr2 — кабель между двумя машинами; ns «-» — сам стенд, addr «-» — без адреса
+lab_link() {
+  local t1=labt$RANDOM t2=labu$RANDOM
+  ip link add "$t1" type veth peer name "$t2"
+  _lab_end "$1" "$t1" "$2" "$3"; _lab_end "$4" "$t2" "$5" "$6"
+}
+_lab_end() {
+  if [ "$1" = - ]; then
+    ip link set "$2" name "$3"; ip link set "$3" up; [ "$4" = - ] || ip addr add "$4" dev "$3"
+  else
+    ip link set "$2" netns "lab-$1"; ip -n "lab-$1" link set "$2" name "$3"; ip -n "lab-$1" link set "$3" up
+    [ "$4" = - ] || ip -n "lab-$1" addr add "$4" dev "$3"
+  fi
+}
+# lab_bg имя ns команда... — фоновый процесс внутри машины (служба lab-net-имя)
+lab_bg() { local u=$1 ns=$2; shift 2; systemd-run -q --unit="lab-net-$u" ip netns exec "lab-$ns" "$@"; }
+# lab_wait_port ns адрес порт — дождаться, пока сервис начнёт слушать
+lab_wait_port() { for i in $(seq 40); do ip netns exec "lab-$1" ss -ltnH "src $2 and sport = :$3" | grep -q . && return 0; sleep 0.25; done; return 1; }
+```
+
+### Ping молчит, а узел жив
+
+Машина `lab-pc` (10.20.0.1) и сервер `lab-srv` (10.20.0.2) в одной подсети. Сервер не отвечает на ping, но у него работает веб-сервер на порту 80. Узнайте **MAC-адрес** сервера так, как его знает `lab-pc`, и запишите в `~/mac.txt`.
+
+```bash setup
+lab_net_reset
+rm -f /home/student/mac.txt
+lab_ns pc; lab_ns srv
+lab_link pc eth0 10.20.0.1/24 srv eth0 10.20.0.2/24
+ip netns exec lab-srv nft -f - <<'EOF'
+table inet filter {
+  chain input { type filter hook input priority 0; policy accept; icmp type echo-request drop; }
+}
+EOF
+lab_bg srv-web srv python3 -m http.server 80 --bind 10.20.0.2 --directory /tmp
+lab_wait_port srv 10.20.0.2 80
+```
+
+```bash check
+want=$(ip -n lab-srv link show eth0 | awk '/link\/ether/ {print $2}')
+[ -f /home/student/mac.txt ] || fail "Нет ~/mac.txt"
+got=$(tr -d '[:space:]' < /home/student/mac.txt | tr 'A-F' 'a-f')
+[ "$got" = "$want" ] || fail "В ~/mac.txt «$got» — это не MAC-адрес 10.20.0.2"
+ok "10.20.0.2 → $want"
+```
+
+```text hint
+1. Попробовать ping и подключиться к веб-серверу изнутри lab-pc — узел отвечает по TCP, просто фильтрует ICMP.
+2. Чтобы отправить любой пакет соседу в своей подсети, машина сначала узнаёт его MAC по протоколу ARP и кладёт в таблицу соседей. Посмотрите эту таблицу у lab-pc.
+```
+
+```bash solution
+sudo ip netns exec lab-pc ping -c1 -W1 10.20.0.2 || true
+sudo ip netns exec lab-pc curl -s -o /dev/null -w '%{http_code}\n' http://10.20.0.2/
+sudo ip -n lab-pc neigh show 10.20.0.2
+sudo ip -n lab-pc neigh show 10.20.0.2 | awk '{print $5}' > ~/mac.txt
+```
+
+```text review
+Эталон: любой пакет к 10.20.0.2 (ping или curl) → `ip neigh show 10.20.0.2`.
+
+- ARP работает **до** ICMP: даже неудачный ping заполняет таблицу соседей. Запись `REACHABLE`/`STALE` с MAC — узел жив на канальном уровне; `FAILED`/`INCOMPLETE` — в подсети никто не отвечает на этот IP (выключен, не тот VLAN, опечатка в адресе).
+- Узел, который не отвечает на ping, — нормальное явление: облачные security groups и файрволы часто режут ICMP. Проверяйте нужный порт: `nc -zv`, `curl`.
+- Конфликт IP: два MAC отвечают на один адрес — видно в `arping -D` или `tcpdump arp`.
+- Очистить запись: `ip neigh flush 10.20.0.2`. Старый аналог — `arp -n`.
+```
+
+### Путь пакета
+
+Клиент `lab-client` ходит к серверу `10.21.3.30` через несколько маршрутизаторов. Определите, через какие узлы проходят пакеты, и запишите в `~/hops.txt` IP-адреса **всех хопов по порядку** (включая сам сервер) — по одному на строку.
+
+```bash setup
+lab_net_reset
+rm -f /home/student/hops.txt
+lab_ns client; lab_ns r1; lab_ns r2; lab_ns server
+lab_link client eth0 10.21.1.10/24 r1 eth0 10.21.1.1/24
+lab_link r1 eth1 10.21.2.1/24 r2 eth0 10.21.2.2/24
+lab_link r2 eth1 10.21.3.1/24 server eth0 10.21.3.30/24
+for r in r1 r2; do ip netns exec lab-$r sysctl -qw net.ipv4.ip_forward=1; done
+ip -n lab-client route add default via 10.21.1.1
+ip -n lab-r1 route add 10.21.3.0/24 via 10.21.2.2
+ip -n lab-r2 route add default via 10.21.2.1
+ip -n lab-server route add default via 10.21.3.1
+```
+
+```bash check
+[ -f /home/student/hops.txt ] || fail "Нет ~/hops.txt"
+got=$(grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' /home/student/hops.txt | tr '\n' ' ' | sed 's/ $//')
+[ "$got" = "10.21.1.1 10.21.2.2 10.21.3.30" ] || fail "Путь «$got» не совпадает с реальным (хопов на самом деле: $(ip netns exec lab-client traceroute -n -w1 -q1 10.21.3.30 2>/dev/null | tail -n +2 | wc -l))"
+ok "путь: $got"
+```
+
+```text hint
+1. Есть утилита, которая показывает маршрут по шагам: она шлёт пакеты с постепенно растущим временем жизни (TTL), и каждый маршрутизатор на пути отвечает, когда TTL у него обнуляется.
+2. Запустить её изнутри клиента без разрешения имён — так быстрее.
+3. Записать адреса из вывода по порядку.
+```
+
+```bash solution
+sudo ip netns exec lab-client traceroute -n -w1 -q1 10.21.3.30
+sudo ip netns exec lab-client traceroute -n -w1 -q1 10.21.3.30 | awk 'NR > 1 {print $2}' > ~/hops.txt
+```
+
+```text review
+Эталон: `traceroute -n 10.21.3.30` (или `mtr -n`, `tracepath`).
+
+- traceroute шлёт пакеты с TTL = 1, 2, 3…; маршрутизатор, у которого TTL обнулился, отвечает ICMP **Time Exceeded** — так становится известен его адрес.
+- `* * *` на хопе — маршрутизатор не отвечает на такие пакеты (фильтр), но пересылает дальше. Звёздочки до самого конца — пакеты где-то теряются.
+- Режимы: по умолчанию UDP, `-I` — ICMP, `-T -p 443` — TCP SYN на порт (пройдёт там, где UDP и ICMP режут). `mtr` — traceroute + ping в реальном времени с процентом потерь на каждом хопе: главный инструмент для жалоб «сеть тормозит».
+```
+
 ## Тест
 
 ### Для чего нужен протокол ARP?

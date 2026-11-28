@@ -113,6 +113,194 @@ ps -T -p 1234
 - [ ] Найти три процесса, занимающих больше всего памяти, с помощью `ps aux --sort=-%mem`
 - [ ] Попробовать завершить процесс другого пользователя без sudo и прочитать ошибку
 
+## Лаборатория
+
+```bash setup
+# процессы задач запускаются как временные systemd-юниты: живут независимо от сессии и легко убираются перед новым запуском
+lab_unit() { systemctl stop "$1" 2>/dev/null; systemctl reset-failed "$1" 2>/dev/null; true; }
+mkdir -p /opt/lab
+```
+
+### Остановить процесс правильно
+
+На сервере работает генератор отчётов `report-gen` — он больше не нужен. Найдите его процесс и завершите так, чтобы программа **успела корректно остановиться**: сохранить состояние и убрать за собой.
+
+```bash setup
+lab_unit lab-report
+cat > /opt/lab/report-gen <<'EOF'
+#!/bin/bash
+# Генератор отчётов: при SIGTERM аккуратно сохраняет состояние и выходит.
+state=/tmp/report-gen.state
+echo "running" > $state
+trap 'echo "stopped gracefully" > $state; exit 0' TERM INT
+while true; do sleep 1; done
+EOF
+chmod 755 /opt/lab/report-gen
+rm -f /tmp/report-gen.state
+systemd-run -q --unit=lab-report -p User=student /opt/lab/report-gen
+for i in $(seq 20); do [ -f /tmp/report-gen.state ] && break; sleep 0.2; done
+```
+
+```bash check
+pgrep -f /opt/lab/report-gen >/dev/null && fail "Процесс report-gen всё ещё работает (PID $(pgrep -f /opt/lab/report-gen | head -1))"
+grep -q "stopped gracefully" /tmp/report-gen.state 2>/dev/null || fail "Процесс завершён, но не успел сохранить состояние: его остановили сигналом, который программа не может перехватить"
+ok "report-gen остановлен корректно"
+```
+
+```text hint
+1. Найти процесс по имени (по полной командной строке) и узнать его PID.
+2. Отправить ему сигнал «пожалуйста, завершись» — тот, что команда отправки сигналов шлёт по умолчанию. Программа его перехватит и уберёт за собой.
+3. Убедиться, что процесса больше нет.
+```
+
+```bash solution
+pgrep -af report-gen
+kill "$(pgrep -f /opt/lab/report-gen)"
+sleep 1
+pgrep -f report-gen || echo "остановлен"
+```
+
+```text review
+Эталон: `pgrep -f report-gen` → `kill <PID>` (это SIGTERM, 15).
+
+- SIGTERM — вежливая просьба: программа может перехватить его, закрыть файлы и соединения, дописать состояние. Так останавливают всё: `systemctl stop`, `docker stop`, Kubernetes при удалении пода.
+- SIGKILL (`kill -9`) перехватить нельзя: ядро убивает процесс сразу, без уборки — недописанные файлы, висящие lock-файлы, оборванные транзакции. Это последнее средство, если процесс не реагирует на TERM за разумное время.
+- `pgrep -f` ищет по всей командной строке (`/opt/lab/report-gen` — скрипт, имя процесса у него `report-gen`, а запущен он bash). `pgrep -a` показывает и саму команду — удобно проверить, что нашли то, что нужно.
+```
+
+```text notes
+kill\s+-(9|KILL|SIGKILL)\b|pkill\s+-(9|KILL) => Использовался SIGKILL. Программа не успевает убрать за собой; начинайте с обычного kill (SIGTERM) и переходите к -9, только если процесс не реагирует.
+```
+
+### Найти родителя процесса
+
+На сервере висит процесс `sleep 7777`. Его запустил какой-то другой процесс. Найдите **PID родителя** и запишите его в `~/parent.txt`.
+
+```bash setup
+lab_unit lab-super
+pkill -fx 'sleep 7777' 2>/dev/null
+cat > /opt/lab/supervisor.sh <<'EOF'
+#!/bin/bash
+sleep 7777 &
+wait
+EOF
+chmod 755 /opt/lab/supervisor.sh
+rm -f /home/student/parent.txt
+systemd-run -q --unit=lab-super -p User=student /opt/lab/supervisor.sh
+for i in $(seq 20); do pgrep -fx 'sleep 7777' >/dev/null && break; sleep 0.2; done
+```
+
+```bash check
+child=$(pgrep -fx 'sleep 7777' | head -1)
+[ -n "$child" ] || fail "Процесса sleep 7777 нет — задачу нужно начать заново"
+want=$(ps -o ppid= -p "$child" | tr -d ' ')
+[ -f /home/student/parent.txt ] || fail "Нет ~/parent.txt"
+got=$(tr -d '[:space:]' < /home/student/parent.txt)
+[ "$got" = "$want" ] || fail "В ~/parent.txt «$got» — это не PID родителя процесса sleep 7777"
+ok "sleep 7777 (PID $child) ← родитель $want: $(ps -o args= -p "$want")"
+```
+
+```text hint
+1. Найти PID процесса sleep с этим аргументом.
+2. Вывести для него только поле «PID родителя» — у ps можно задать нужные колонки и убрать заголовок.
+3. Можно посмотреть и всё дерево процессов с номерами — родитель будет ступенькой выше.
+```
+
+```bash solution
+ps -o ppid= -p "$(pgrep -fx 'sleep 7777')" | tr -d ' ' > ~/parent.txt
+pstree -ps "$(pgrep -fx 'sleep 7777')"
+```
+
+```text review
+Эталон: `ps -o ppid= -p $(pgrep -fx 'sleep 7777')`; наглядно — `pstree -ps <PID>`.
+
+- `ps -o` задаёт колонки: `pid,ppid,user,stat,etime,args`; `=` после имени убирает заголовок — удобно для скриптов.
+- `ps -ef` тоже показывает PPID, а `ps -ef --forest` или `pstree -p` — дерево целиком.
+- Зачем это нужно: убьёте дочерний процесс — родитель (supervisor, systemd, Docker) запустит его снова. Разбираться нужно с тем, кто запускает.
+```
+
+### Кто съел память
+
+Один из процессов пользователя `student` занимает подозрительно много оперативной памяти. Найдите процесс пользователя `student` с наибольшим **RSS** и запишите его PID в `~/top-mem.txt`.
+
+```bash setup
+lab_unit lab-memhog
+rm -f /home/student/top-mem.txt
+systemd-run -q --unit=lab-memhog -p User=student -p RuntimeMaxSec=3600 python3 -c "a = b'x' * (250*1024*1024); import time; time.sleep(10**6)"
+for i in $(seq 30); do [ "$(ps -o rss= -p "$(systemctl show -p MainPID --value lab-memhog)" 2>/dev/null | tr -d ' ')" -gt 200000 ] 2>/dev/null && break; sleep 0.3; done
+```
+
+```bash check
+want=$(ps -u student -o pid=,rss= --sort=-rss | head -1 | awk '{print $1}')
+[ -f /home/student/top-mem.txt ] || fail "Нет ~/top-mem.txt"
+got=$(tr -d '[:space:]' < /home/student/top-mem.txt)
+[ "$got" = "$want" ] || fail "В ~/top-mem.txt «$got» — у этого процесса не наибольший RSS среди процессов student"
+ok "PID $want: $(ps -o rss=,args= -p $want | awk '{printf "%d МБ, %s", $1/1024, substr($0, index($0,$2))}')"
+```
+
+```text hint
+1. Вывести процессы только нужного пользователя.
+2. Отсортировать по резидентной памяти по убыванию — у ps есть ключ сортировки, минус перед полем означает «по убыванию».
+3. Взять PID из первой строки.
+```
+
+```bash solution
+ps -u student -o pid=,rss=,args= --sort=-rss | head -3
+ps -u student -o pid= --sort=-rss | head -1 | tr -d ' ' > ~/top-mem.txt
+```
+
+```text review
+Эталон: `ps -u student -o pid,rss,args --sort=-rss | head`.
+
+- **RSS** — сколько процесс реально держит в оперативной памяти; **VSZ** — сколько адресного пространства он зарезервировал (обычно намного больше и мало что значит).
+- `ps aux --sort=-%mem | head` — то же для всех пользователей; в `top` — сортировка по памяти клавишей `M`.
+- У процессов с общими библиотеками RSS частично пересекается — сумма RSS всех процессов может быть больше всей памяти. Точнее — PSS (`smem`, `/proc/PID/smaps_rollup`).
+```
+
+### Завершить все процессы пользователя
+
+Пользователь `guest` оставил на сервере кучу процессов. Завершите **все** его процессы одной командой (корректно, сигналом по умолчанию).
+
+```bash setup
+id guest >/dev/null 2>&1 || useradd -m -s /bin/bash guest
+pkill -KILL -u guest 2>/dev/null; sleep 0.5
+for u in 1 2 3; do lab_unit lab-guest$u; done
+systemd-run -q --unit=lab-guest1 -p User=guest sleep 100000
+systemd-run -q --unit=lab-guest2 -p User=guest bash -c 'while sleep 5; do :; done'
+systemd-run -q --unit=lab-guest3 -p User=guest python3 -c 'import time; time.sleep(10**6)'
+sleep 0.5
+```
+
+```bash check
+n=$(pgrep -u guest | wc -l)
+[ "$n" = 0 ] || fail "У guest ещё работает процессов: $n ($(pgrep -u guest -l | awk '{print $2}' | sort -u | tr '\n' ' '))"
+ok "у guest не осталось процессов"
+```
+
+```text hint
+Есть команда, которая отправляет сигнал всем процессам, подходящим под условие, — в том числе «все процессы этого пользователя». Чужие процессы может останавливать только администратор.
+```
+
+```bash solution
+pgrep -u guest -l
+sudo pkill -u guest
+sleep 1
+pgrep -u guest || echo "процессов нет"
+```
+
+```text review
+Эталон: `sudo pkill -u guest`.
+
+- Без `sudo` — `Operation not permitted`: обычный пользователь может слать сигналы только своим процессам.
+- `pkill`/`pgrep` фильтруют по имени, пользователю (`-u`), терминалу (`-t`), родителю (`-P`). Сначала полезно посмотреть, кого заденет: `pgrep -u guest -l`.
+- Для пользователя с активными входами есть `loginctl terminate-user guest` — закроет и его сессии.
+- `killall имя` убивает по точному имени процесса; осторожно на Solaris/AIX — там `killall` убивает **все** процессы.
+```
+
+```text notes
+kill\s+-9|pkill\s+-(9|KILL) => Использовался SIGKILL — процессам не дали завершиться корректно. Начинайте с сигнала по умолчанию.
+```
+
 ## Тест
 
 ### Чем процесс отличается от программы?

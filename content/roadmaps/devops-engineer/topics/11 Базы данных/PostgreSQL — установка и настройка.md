@@ -137,6 +137,126 @@ REVOKE CONNECT ON DATABASE app FROM PUBLIC;
 - [ ] Создать новую таблицу после выдачи прав и убедиться, что без `ALTER DEFAULT PRIVILEGES` readonly её не видит
 - [ ] Поставить PgBouncer перед базой и подключиться через него
 
+## Лаборатория
+
+PostgreSQL 16 установлен из пакетов Ubuntu и работает (кластер `16/main`, порт 5432). Администратор — `sudo -u postgres psql`.
+
+```bash lib
+# PostgreSQL 16 на стенде: кластер 16/main, порт 5432. Администратор — системный пользователь postgres.
+lab_psql() { sudo -u postgres psql -qXtA "$@"; }
+# lab_shopdb — учебная база shop: customers, orders (крупная), audit_log (самая крупная), settings
+lab_shopdb() {
+  lab_psql -c "DROP DATABASE IF EXISTS shop WITH (FORCE)" -c "CREATE DATABASE shop" >/dev/null
+  lab_psql -d shop >/dev/null <<'EOF'
+CREATE TABLE customers (id serial PRIMARY KEY, name text, city text);
+CREATE TABLE orders (id serial PRIMARY KEY, customer_id int REFERENCES customers, total numeric, status text, created_at timestamptz DEFAULT now());
+CREATE TABLE audit_log (id bigserial PRIMARY KEY, event text, payload text, at timestamptz DEFAULT now());
+CREATE TABLE settings (key text PRIMARY KEY, value text);
+INSERT INTO customers (name, city) SELECT 'customer ' || g, (ARRAY['Москва','Казань','Пермь'])[1 + g % 3] FROM generate_series(1, 2000) g;
+INSERT INTO orders (customer_id, total, status) SELECT 1 + g % 2000, (g % 500) * 10, (ARRAY['new','paid','shipped'])[1 + g % 3] FROM generate_series(1, 30000) g;
+INSERT INTO audit_log (event, payload) SELECT 'event ' || g, repeat(md5(g::text), 8) FROM generate_series(1, 60000) g;
+INSERT INTO settings VALUES ('currency', 'RUB'), ('vat', '20');
+EOF
+}
+```
+
+### Где что лежит
+
+Запишите в `~/pg-paths.txt` три строки — пути работающего кластера:
+
+1. каталог данных;
+2. основной файл конфигурации;
+3. файл правил аутентификации (pg_hba).
+
+Узнайте их **у самого сервера**, а не по памяти.
+
+```bash setup
+rm -f /home/student/pg-paths.txt
+```
+
+```bash check
+f=/home/student/pg-paths.txt
+[ -f $f ] || fail "Нет ~/pg-paths.txt"
+for p in "1:data_directory:каталог данных" "2:config_file:основной файл конфигурации" "3:hba_file:файл pg_hba"; do
+  n=${p%%:*}; rest=${p#*:}; set=${rest%%:*}; name=${rest#*:}
+  want=$(lab_psql -c "show $set")
+  got=$(sed -n "${n}p" $f | tr -d '[:space:]')
+  [ "${got%/}" = "$want" ] || fail "Строка $n («$got») — это не $name сервера"
+done
+ok "$(tr '\n' ' ' < $f)"
+```
+
+```text hint
+1. Подключиться к серверу администратором.
+2. У команды «показать параметр» есть параметры с путями к данным, конфигурации и файлу правил доступа.
+3. Можно и одной командой из оболочки с ключами «без лишнего вывода».
+```
+
+```bash solution
+for s in data_directory config_file hba_file; do sudo -u postgres psql -qXtA -c "show $s"; done > ~/pg-paths.txt
+cat ~/pg-paths.txt
+pg_lsclusters
+```
+
+```text review
+Эталон: `SHOW data_directory; SHOW config_file; SHOW hba_file;`.
+
+- В Debian/Ubuntu конфиги отдельно от данных: `/etc/postgresql/16/main/` (postgresql.conf, pg_hba.conf), данные — `/var/lib/postgresql/16/main`, логи — `/var/log/postgresql/`. В RHEL и в Docker-образе всё лежит в каталоге данных.
+- `pg_lsclusters`, `pg_ctlcluster 16 main restart`, `pg_createcluster` — обёртки Debian для нескольких кластеров и версий на одном сервере.
+- `SELECT name, setting, source, sourcefile FROM pg_settings WHERE source <> 'default'` — что и где переопределено.
+```
+
+### Настроить и применить
+
+Настройте работающий сервер:
+
+- `max_connections` = **150**;
+- `work_mem` = **16MB**;
+- `log_min_duration_statement` = **500ms** — писать в лог запросы дольше полсекунды.
+
+Все три значения должны **действовать сейчас** (проверяется через `SHOW`) и **сохраниться** после перезапуска.
+
+```bash setup
+lab_psql -c "ALTER SYSTEM RESET max_connections" -c "ALTER SYSTEM RESET work_mem" -c "ALTER SYSTEM RESET log_min_duration_statement" >/dev/null
+sed -i -E 's/^(max_connections|work_mem|log_min_duration_statement)\s*=.*$/#&/' /etc/postgresql/16/main/postgresql.conf
+sed -i -E 's/^#+(max_connections = 100)/\1/' /etc/postgresql/16/main/postgresql.conf
+systemctl restart postgresql
+```
+
+```bash check
+[ "$(lab_psql -c 'show max_connections')" = 150 ] || fail "max_connections сейчас $(lab_psql -c 'show max_connections') — у этого параметра контекст «перезапуск»"
+[ "$(lab_psql -c 'show work_mem')" = 16MB ] || fail "work_mem сейчас $(lab_psql -c 'show work_mem')"
+[ "$(lab_psql -c 'show log_min_duration_statement')" = 500ms ] || fail "log_min_duration_statement сейчас $(lab_psql -c 'show log_min_duration_statement')"
+p=$(lab_psql -c "select string_agg(name || '=' || coalesce(sourcefile, source), ' ') from pg_settings where name in ('max_connections','work_mem','log_min_duration_statement') and source in ('default','command line','environment variable')")
+[ -z "$p" ] || fail "Не все значения записаны в файлы конфигурации: $p"
+pend=$(lab_psql -c "select string_agg(name, ', ') from pg_settings where pending_restart")
+[ -z "$pend" ] || fail "Есть параметры, ожидающие перезапуска: $pend"
+ok "max_connections=150, work_mem=16MB, log_min_duration_statement=500ms"
+```
+
+```text hint
+1. Изменить параметры можно командой SQL «изменить систему» (она пишет в отдельный файл автонастроек) или правкой основного конфига.
+2. У каждого параметра есть контекст: одни применяются перечитыванием конфигурации, другие — только перезапуском сервера. Контекст виден в системном представлении настроек.
+3. После изменений: перечитать или перезапустить — и проверить, что нет параметров, ожидающих перезапуска.
+```
+
+```bash solution
+sudo -u postgres psql -c "ALTER SYSTEM SET max_connections = 150" -c "ALTER SYSTEM SET work_mem = '16MB'" -c "ALTER SYSTEM SET log_min_duration_statement = '500ms'"
+sudo -u postgres psql -c "select name, context from pg_settings where name in ('max_connections', 'work_mem', 'log_min_duration_statement')"
+sudo systemctl restart postgresql
+sudo -u postgres psql -c "show max_connections" -c "show work_mem" -c "show log_min_duration_statement"
+```
+
+```text review
+Эталон: `ALTER SYSTEM SET ...` → `systemctl restart postgresql` (из-за `max_connections`).
+
+- `ALTER SYSTEM` пишет в `postgresql.auto.conf` — он читается **после** `postgresql.conf` и побеждает. Удобно, но легко забыть, где задано значение: смотрите `sourcefile` в `pg_settings`.
+- Контексты: `postmaster` — только перезапуск (`max_connections`, `shared_buffers`, `listen_addresses`), `sighup` — `pg_reload_conf()` / `systemctl reload`, `user` — можно менять даже в сессии (`SET work_mem`).
+- `pending_restart = true` в `pg_settings` — значение изменено, но ещё не действует. Проверять после каждой правки.
+- `max_connections` не поднимают бездумно: каждое соединение — процесс с памятью. Сотни подключений от приложений собирают пулером (PgBouncer).
+- `log_min_duration_statement` — главный инструмент поиска медленных запросов; дальше — `pg_stat_statements`.
+```
+
 ## Тест
 
 ### Какие три условия нужны, чтобы к PostgreSQL можно было подключиться с другого сервера?

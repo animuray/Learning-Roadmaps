@@ -114,6 +114,145 @@ sudo iptables -t nat -L DOCKER -n                   # правила пробр�
 - [ ] Запустить `nicolaka/netshoot` в сети приложения и проверить DNS, порты и маршруты
 - [ ] Найти veth-интерфейсы контейнеров на хосте: `ip link` и `bridge link`
 
+## Лаборатория
+
+```bash setup
+lab_drm() { docker rm -f "$@" >/dev/null 2>&1; true; }
+# образ есть локально или скачивается (если ученик почистил образы через prune)
+lab_img() { for i in "$@"; do docker image inspect "$i" >/dev/null 2>&1 || docker pull -q "$i" >/dev/null; done; }
+# lab_wait_http URL [строка] — дождаться ответа
+lab_wait_http() { for i in $(seq 60); do curl -s --max-time 1 "$1" 2>/dev/null | grep -q "${2:-.}" && return 0; sleep 0.25; done; return 1; }
+lab_img redis:7-alpine alpine:3.20 nginx:1.27-alpine
+```
+
+### Связь контейнеров по имени
+
+Создайте сеть Docker **`appnet`** и запустите в ней два контейнера: **`db`** (образ `redis:7-alpine`) и **`app`** (образ `alpine:3.20`, команда `sleep 100000`). Контейнер `app` должен обращаться к Redis **по имени** `db` на порту 6379.
+
+```bash setup
+lab_drm db app
+docker network rm appnet >/dev/null 2>&1; true
+```
+
+```bash check
+docker network inspect appnet >/dev/null 2>&1 || fail "Сети appnet нет"
+for c in db app; do
+  [ "$(docker inspect -f '{{.State.Running}}' $c 2>/dev/null)" = true ] || fail "Контейнер $c не запущен"
+  docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' $c | grep -qw appnet || fail "Контейнер $c не подключён к сети appnet"
+done
+docker exec app nc -z -w 2 db 6379 || fail "Из app не подключиться к db:6379 по имени"
+ok "app → db:6379 по имени в сети appnet"
+```
+
+```text hint
+1. Создать пользовательскую сеть типа bridge.
+2. Запустить оба контейнера в фоне с именами и указанием сети.
+3. Проверить из app подключение к порту по имени (в alpine есть nc).
+```
+
+```bash solution
+docker network create appnet
+docker run -d --name db --network appnet redis:7-alpine
+docker run -d --name app --network appnet alpine:3.20 sleep 100000
+sleep 1
+docker exec app nc -zv db 6379
+```
+
+```text review
+Эталон: `docker network create appnet` + `--network appnet` у обоих контейнеров.
+
+- В **пользовательской** сети работает встроенный DNS Docker (`127.0.0.11`): имя контейнера = DNS-имя. В стандартной сети `bridge` имён нет — только IP, которые меняются при пересоздании.
+- Compose создаёт такую сеть сам: сервисы видят друг друга по именам сервисов.
+- Порт 6379 не публиковался (`-p` не нужен): внутри сети контейнеры общаются напрямую. Публикуют только то, что должно быть доступно с хоста или снаружи.
+```
+
+### Порт только для хоста
+
+Запустите Redis в контейнере **`cache`** (образ `redis:7-alpine`) так, чтобы его порт **6380** на хосте вёл на 6379 контейнера, но был доступен **только с самого хоста** — не снаружи.
+
+```bash setup
+lab_drm cache
+```
+
+```bash check
+[ "$(docker inspect -f '{{.State.Running}}' cache 2>/dev/null)" = true ] || fail "Контейнер cache не запущен"
+b=$(docker inspect -f '{{range $p, $c := .NetworkSettings.Ports}}{{range $c}}{{$p}}={{.HostIp}}:{{.HostPort}} {{end}}{{end}}' cache)
+echo "$b" | grep -q '6379/tcp=127.0.0.1:6380' || fail "Порт 6379 контейнера опубликован так: «${b:-никак}» — нужен 6380 только на 127.0.0.1"
+echo "$b" | grep -qE '6379/tcp=(0\.0\.0\.0|::|):' && fail "Порт опубликован и на всех интерфейсах: $b"
+redis-cli -p 6380 ping 2>/dev/null | grep -q PONG || fail "С хоста redis-cli -p 6380 ping не отвечает"
+ok "cache: $b"
+```
+
+```text hint
+У ключа публикации порта есть полная форма из трёх частей: адрес хоста, порт хоста и порт контейнера.
+```
+
+```bash solution
+docker run -d --name cache -p 127.0.0.1:6380:6379 redis:7-alpine
+sleep 1
+redis-cli -p 6380 ping
+```
+
+```text review
+Эталон: `-p 127.0.0.1:6380:6379`.
+
+- `-p 6380:6379` слушает на `0.0.0.0` — порт открыт в интернет, и **ufw этого не видит**: Docker пишет свои правила iptables раньше правил ufw. Сотни тысяч Redis и Elasticsearch без пароля утекли именно так.
+- Базам и кэшам публикация обычно вообще не нужна — к ним ходят контейнеры по внутренней сети. На хост — только для отладки и только на `127.0.0.1`.
+- Проверить, что реально слушает хост: `ss -ltnp | grep 6380` (процесс `docker-proxy`).
+```
+
+### Изоляция сетей
+
+Соберите схему из трёх контейнеров:
+
+- **`front`** (`nginx:1.27-alpine`) — в сети **`frontnet`**;
+- **`store`** (`redis:7-alpine`) — в сети **`backnet`**;
+- **`api`** (`alpine:3.20`, `sleep 100000`) — **в обеих** сетях.
+
+`api` должен достучаться и до `front:80`, и до `store:6379`, а `front` до `store` — **нет**.
+
+```bash setup
+lab_drm front store api
+docker network rm frontnet backnet >/dev/null 2>&1; true
+```
+
+```bash check
+for c in front store api; do [ "$(docker inspect -f '{{.State.Running}}' $c 2>/dev/null)" = true ] || fail "Контейнер $c не запущен"; done
+nets() { docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' $1; }
+nets front | grep -qw frontnet && ! nets front | grep -qw backnet || fail "front должен быть только в frontnet (сейчас: $(nets front))"
+nets store | grep -qw backnet && ! nets store | grep -qw frontnet || fail "store должен быть только в backnet (сейчас: $(nets store))"
+nets api | grep -qw frontnet && nets api | grep -qw backnet || fail "api должен быть в обеих сетях (сейчас: $(nets api))"
+docker exec api nc -z -w 2 front 80 || fail "api не достаёт до front:80"
+docker exec api nc -z -w 2 store 6379 || fail "api не достаёт до store:6379"
+docker exec front sh -c 'nc -z -w 2 store 6379' 2>/dev/null && fail "front достаёт до store — сети не изолированы"
+ok "front ⟂ store, api видит обоих"
+```
+
+```text hint
+1. Создать две сети.
+2. Каждый контейнер запустить в своей сети. Контейнер можно подключить к ещё одной сети уже после запуска отдельной командой сети.
+3. Проверить связность изнутри контейнеров.
+```
+
+```bash solution
+docker network create frontnet
+docker network create backnet
+docker run -d --name front --network frontnet nginx:1.27-alpine
+docker run -d --name store --network backnet redis:7-alpine
+docker run -d --name api --network frontnet alpine:3.20 sleep 100000
+docker network connect backnet api
+sleep 1
+docker exec api nc -zv front 80; docker exec api nc -zv store 6379
+```
+
+```text review
+Эталон: две сети, `docker network connect backnet api`.
+
+- Классическая схема: прокси/фронт в публичной сети, база — во внутренней, приложение — в обеих. Взломанный nginx не получит прямого доступа к базе.
+- В Compose то же самое — раздел `networks:` у сервисов; сеть можно пометить `internal: true` — без выхода наружу вообще.
+- В Kubernetes изоляцию между подами делают NetworkPolicy — по умолчанию там все поды видят всех.
+```
+
 ## Тест
 
 ### Какой сетевой драйвер Docker используется по умолчанию?

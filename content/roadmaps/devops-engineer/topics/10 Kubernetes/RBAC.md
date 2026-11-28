@@ -144,6 +144,96 @@ kubectl get rolebindings,clusterrolebindings -A -o wide | grep gitlab-deployer
 - [ ] Из пода с ServiceAccount по умолчанию попробовать обратиться к API (`curl` с токеном) и получить 403; затем отключить automountServiceAccountToken
 - [ ] Включить Pod Security Admission `restricted` на namespace и попробовать создать привилегированный под
 
+## Лаборатория
+
+Кластер — k3s на стенде. Проверить права от чужого имени: `kubectl auth can-i <действие> <ресурс> -n <ns> --as=<кто>`.
+
+```bash lib
+# Kubernetes на стенде — k3s (один узел). root работает с /etc/rancher/k3s/k3s.yaml, ученик — со своим ~/.kube/config
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# lab_kns имя — чистый namespace задачи (старый удаляется вместе со всем содержимым)
+lab_kns() {
+  kubectl delete ns "$1" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1
+  kubectl create ns "$1" >/dev/null
+}
+# убрать с узла метки и taint-ы, которые оставляют задачи про размещение подов
+lab_knode() {
+  kubectl taint nodes --all lab-dedicated- >/dev/null 2>&1
+  kubectl label nodes --all disktype- zone- >/dev/null 2>&1
+  true
+}
+# lab_kready ns селектор [секунд] — дождаться готовности подов
+lab_kready() { kubectl -n "$1" wait --for=condition=Ready pod -l "$2" --timeout="${3:-90}s" >/dev/null 2>&1; }
+# lab_kfiles каталог — каталог манифестов ученика (пустой)
+lab_kfiles() { rm -rf "$1"; mkdir -p "$1"; chown -R student:student "$1"; }
+lab_kj() { kubectl "$@" -o json 2>/dev/null; }
+lab_traefik() { kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'; }
+```
+
+```bash setup
+lab_knode
+```
+
+### Учётная запись для деплоя
+
+CI-системе нужен доступ к namespace **`lab-rbac`**, но не ко всему кластеру. Создайте:
+
+- ServiceAccount **`ci-deployer`** в `lab-rbac`;
+- Role **`deployer`**: читать (`get`, `list`, `watch`) **поды** и **логи подов**; создавать и обновлять (`get`, `list`, `create`, `update`, `patch`) **Deployment**;
+- RoleBinding **`ci-deployer`**, связывающую их.
+
+Ни удалять Deployment, ни читать Secret, ни что-либо делать в других namespace учётная запись не должна.
+
+```bash setup
+lab_kns lab-rbac
+lab_kns lab-other
+```
+
+```bash check
+sa=system:serviceaccount:lab-rbac:ci-deployer
+kubectl -n lab-rbac get sa ci-deployer >/dev/null 2>&1 || fail "ServiceAccount ci-deployer нет"
+can() { kubectl auth can-i "$1" "$2" -n "$3" --as=$sa 2>/dev/null; }
+for a in "get pods" "list pods" "watch pods" "get pods/log" "create deployments.apps" "patch deployments.apps" "update deployments.apps"; do
+  [ "$(can $a lab-rbac)" = yes ] || fail "ci-deployer не может: $a в lab-rbac"
+done
+[ "$(can delete deployments.apps lab-rbac)" = no ] || fail "ci-deployer может удалять Deployment"
+[ "$(can get secrets lab-rbac)" = no ] || fail "ci-deployer может читать Secret"
+[ "$(can create pods lab-rbac)" = no ] || fail "ci-deployer может создавать поды напрямую"
+[ "$(can list pods lab-other)" = no ] || fail "ci-deployer видит поды в другом namespace"
+kubectl get clusterrolebinding -o json | jq -e --arg s ci-deployer '.items[] | select(.subjects[]? | .name == $s)' >/dev/null && fail "Права выданы на весь кластер (ClusterRoleBinding)"
+ok "ci-deployer: только нужное и только в lab-rbac"
+```
+
+```text hint
+1. Учётная запись сервиса, роль и привязка — три объекта в одном namespace. Роль и привязку можно создать командами kubectl create с ключами глаголов, ресурсов и субъекта.
+2. Логи пода — отдельный подресурс (через косую черту). Deployment — ресурс группы apps.
+3. Проверить каждое действие от имени учётной записи: её полное имя начинается с system:serviceaccount.
+```
+
+```bash solution
+kubectl -n lab-rbac create serviceaccount ci-deployer
+kubectl -n lab-rbac create role deployer \
+  --verb=get,list,watch --resource=pods,pods/log
+kubectl -n lab-rbac get role deployer -o json \
+  | jq '.rules += [{"apiGroups": ["apps"], "resources": ["deployments"], "verbs": ["get", "list", "create", "update", "patch"]}]' \
+  | kubectl apply -f -
+kubectl -n lab-rbac create rolebinding ci-deployer --role=deployer --serviceaccount=lab-rbac:ci-deployer
+kubectl auth can-i --list -n lab-rbac --as=system:serviceaccount:lab-rbac:ci-deployer
+```
+
+```text review
+Эталон: ServiceAccount + Role (правила по `apiGroups`/`resources`/`verbs`) + RoleBinding.
+
+- **Role/RoleBinding** — права в одном namespace; **ClusterRole/ClusterRoleBinding** — на весь кластер (или ClusterRole + RoleBinding — один набор правил, выданный в нескольких namespace).
+- Принцип наименьших прав: CI не нужно удалять Deployment и читать Secret. `kubectl auth can-i --list --as=...` — проверить, что именно разрешено.
+- Права **только добавляются**, запрещающих правил нет. Осторожно с `*` в verbs и resources и с правами на `secrets`, `pods/exec`, `rolebindings` — через них можно повысить себе права.
+- Токен ServiceAccount для CI: `kubectl create token ci-deployer --duration=1h` (короткоживущий). Ещё лучше — OIDC из GitLab/GitHub в облачный кластер без хранимых токенов.
+```
+
+```text notes
+clusterrolebinding|cluster-admin => Использовались кластерные права — для доступа к одному namespace хватает Role и RoleBinding.
+```
+
 ## Тест
 
 ### Чем Role отличается от ClusterRole?

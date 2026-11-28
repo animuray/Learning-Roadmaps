@@ -134,6 +134,184 @@ docker system prune                   # контейнеры, сети, вися
 - [ ] Посмотреть `docker history` любого официального образа и разобраться, какие слои самые большие
 - [ ] Посмотреть `docker system df` и почистить ненужное через prune
 
+## Лаборатория
+
+```bash setup
+lab_drm() { docker rm -f "$@" >/dev/null 2>&1; true; }
+# образ есть локально или скачивается (если ученик почистил образы через prune)
+lab_img() { for i in "$@"; do docker image inspect "$i" >/dev/null 2>&1 || docker pull -q "$i" >/dev/null; done; }
+# lab_wait_http URL [строка] — дождаться ответа
+lab_wait_http() { for i in $(seq 60); do curl -s --max-time 1 "$1" 2>/dev/null | grep -q "${2:-.}" && return 0; sleep 0.25; done; return 1; }
+lab_img nginx:1.27-alpine python:3.12-slim alpine:3.20
+```
+
+### Запустить веб-сервер
+
+Запустите контейнер с именем **`web`** из образа `nginx:1.27-alpine`:
+
+- в фоне;
+- порт **8181** хоста ведёт на порт 80 контейнера;
+- контейнер сам поднимается после перезапуска Docker или сервера, **если его не остановили вручную**.
+
+```bash setup
+lab_drm web
+```
+
+```bash check
+[ "$(docker inspect -f '{{.State.Running}}' web 2>/dev/null)" = true ] || fail "Контейнер web не запущен"
+[ "$(docker inspect -f '{{.Config.Image}}' web)" = nginx:1.27-alpine ] || fail "web запущен из образа $(docker inspect -f '{{.Config.Image}}' web)"
+p=$(docker port web 80/tcp 2>/dev/null | head -1)
+[ "${p##*:}" = 8181 ] || fail "Порт 80 контейнера опубликован как «${p:-никак}»"
+[ "$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' web)" = unless-stopped ] || fail "Политика перезапуска — «$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' web)»"
+curl -s --max-time 3 http://127.0.0.1:8181/ | grep -q 'Welcome to nginx' || fail "localhost:8181 не отдаёт страницу nginx"
+ok "web: 8181 → 80, restart=unless-stopped"
+```
+
+```text hint
+1. Запуск контейнера: ключи «в фоне», «имя», «опубликовать порт хост:контейнер» и «политика перезапуска».
+2. Из политик нужна та, что перезапускает всегда, кроме случая ручной остановки.
+3. Проверить страницу через curl, посмотреть журнал контейнера.
+```
+
+```bash solution
+docker run -d --name web -p 8181:80 --restart unless-stopped nginx:1.27-alpine
+sleep 1
+curl -s localhost:8181 | head -5
+docker logs web | tail -3
+```
+
+```text review
+Эталон: `docker run -d --name web -p 8181:80 --restart unless-stopped nginx:1.27-alpine`.
+
+- Политики: `no` (по умолчанию), `on-failure[:N]` — при ненулевом коде, `always` — всегда (даже остановленный вручную поднимется после перезапуска демона), `unless-stopped` — всегда, кроме ручного `docker stop`.
+- `-p 8181:80` слушает на **всех** интерфейсах хоста и обходит ufw. Только для себя — `-p 127.0.0.1:8181:80`.
+- Повседневные команды: `docker ps -a`, `docker logs -f web`, `docker exec -it web sh`, `docker stats`, `docker stop/start/rm web`.
+```
+
+### Поправить страницу внутри контейнера
+
+Работает контейнер **`web2`** (nginx, порт 8183). Не пересоздавая его, замените главную страницу (`/usr/share/nginx/html/index.html` внутри контейнера) на текст `Hello from container`.
+
+```bash setup
+lab_drm web2
+docker run -d --name web2 -p 8183:80 nginx:1.27-alpine >/dev/null
+docker inspect -f '{{.Id}}' web2 > /var/lib/lab/web2-id
+lab_wait_http http://127.0.0.1:8183/ nginx
+```
+
+```bash check
+[ "$(docker inspect -f '{{.Id}}' web2 2>/dev/null)" = "$(cat /var/lib/lab/web2-id)" ] || fail "Контейнер web2 пересоздан — по условию нужно было менять работающий"
+r=$(curl -s --max-time 3 http://127.0.0.1:8183/)
+[ "$(echo "$r" | tr -d '\r' | sed '/^$/d')" = "Hello from container" ] || fail "localhost:8183 отдаёт: «$(echo "$r" | head -c 60)»"
+ok "web2 отдаёт новую страницу"
+```
+
+```text hint
+1. Выполнить команду внутри работающего контейнера можно отдельной командой docker — без входа по SSH и без пересоздания.
+2. Записать текст в файл внутри контейнера (оболочка там есть — sh). Либо скопировать файл с хоста в контейнер командой копирования.
+```
+
+```bash solution
+docker exec web2 sh -c 'echo "Hello from container" > /usr/share/nginx/html/index.html'
+curl -s localhost:8183
+```
+
+```text review
+Эталон: `docker exec web2 sh -c 'echo ... > /usr/share/nginx/html/index.html'` (или `docker cp index.html web2:/usr/share/nginx/html/`).
+
+- Изменения живут в верхнем слое **этого** контейнера: `docker rm web2` — и правка исчезла, а новый контейнер из образа будет с исходной страницей. Так чинят только для отладки.
+- Правильно: менять образ (Dockerfile) или подключать файлы томом/bind mount.
+- `docker exec -it web2 sh` — интерактивная оболочка; `docker diff web2` — какие файлы контейнер изменил относительно образа.
+```
+
+### Почему упал контейнер
+
+Контейнер **`lab-hog`** завершился сам. Выясните **код выхода** и **был ли он убит из-за нехватки памяти**. Запишите в `~/hog.txt` одну строку: `код true|false` (например, `1 false`).
+
+```bash setup
+lab_drm lab-hog
+rm -f /home/student/hog.txt
+docker run --name lab-hog --memory 50m --memory-swap 50m python:3.12-slim python -c "a = b'x' * 300_000_000" >/dev/null 2>&1; true
+```
+
+```bash check
+want="$(docker inspect -f '{{.State.ExitCode}} {{.State.OOMKilled}}' lab-hog)"
+[ -f /home/student/hog.txt ] || fail "Нет ~/hog.txt"
+got=$(tr -s ' \t' ' ' < /home/student/hog.txt | head -1 | sed 's/^ //; s/ $//' | tr 'A-Z' 'a-z')
+[ "$got" = "$want" ] || fail "В ~/hog.txt «$got» — не совпадает с состоянием контейнера"
+ok "lab-hog: код $want — убит OOM killer из-за лимита --memory"
+```
+
+```text hint
+1. В списке всех контейнеров (включая остановленные) видно состояние и код выхода.
+2. Подробная информация о контейнере содержит раздел состояния: код выхода и признак убийства из-за памяти. Попросите эти поля шаблоном формата.
+```
+
+```bash solution
+docker ps -a --filter name=lab-hog
+docker inspect -f '{{.State.ExitCode}} {{.State.OOMKilled}}' lab-hog > ~/hog.txt
+cat ~/hog.txt
+```
+
+```text review
+Эталон: `docker inspect -f '{{.State.ExitCode}} {{.State.OOMKilled}}' lab-hog` → `137 true`.
+
+- Код 137 = 128 + 9: процесс убит SIGKILL. В паре с `OOMKilled: true` — превышен лимит памяти контейнера (`--memory`, `limits.memory` в Kubernetes). 143 = 128 + 15 — завершён SIGTERM (обычная остановка).
+- Логов от убитого процесса не будет — он не успевает ничего записать. В Kubernetes то же самое видно как `Last State: Terminated, Reason: OOMKilled`.
+- Что делать: смотреть реальное потребление (`docker stats`), поднимать лимит или чинить утечку. JVM и Node.js нужно явно говорить про лимит (`-XX:MaxRAMPercentage`, `--max-old-space-size`).
+```
+
+### Уборка без последствий
+
+На сервере кончается место: накопились **остановленные контейнеры** и **кэш сборки** образов. Удалите и то, и другое. Образы и **работающие** контейнеры должны остаться — они нужны.
+
+```bash setup
+for n in 1 2 3; do lab_drm lab-old$n; docker run --name lab-old$n alpine:3.20 true >/dev/null; done
+for v in 1 2; do printf 'FROM alpine:3.20
+RUN echo build-%s-%s > /build.txt
+' "$v" "$RANDOM" | docker build -q -t lab-cache-demo:$v - >/dev/null; done
+docker images --format '{{.Repository}}:{{.Tag}}' | sort > /var/lib/lab/images-before
+docker ps -q --no-trunc | sort > /var/lib/lab/running-before
+```
+
+```bash check
+n=$(docker ps -aq --filter status=exited --filter status=created | wc -l)
+[ "$n" = 0 ] || fail "Остановленных контейнеров осталось: $n"
+bc=$(docker system df --format '{{.Type}} {{.Size}}' | awk '$1 == "Build" {print $3}')
+[ "$bc" = 0B ] || fail "Кэш сборки занимает $bc"
+missing=$(comm -23 /var/lib/lab/images-before <(docker images --format '{{.Repository}}:{{.Tag}}' | sort) | tr '
+' ' ')
+[ -z "$missing" ] || fail "Вместе с мусором удалены образы: $missing"
+gone=$(comm -23 /var/lib/lab/running-before <(docker ps -q --no-trunc | sort) | wc -l)
+[ "$gone" = 0 ] || fail "Остановлены или удалены работающие контейнеры: $gone"
+ok "остановленных контейнеров и кэша сборки нет; образы и работающие контейнеры на месте"
+```
+
+```text hint
+1. Посмотреть, сколько места занимают образы, контейнеры, тома и кэш сборки, — команда «система» у docker.
+2. Для контейнеров и для кэша сборщика есть отдельные команды очистки. Кэш по умолчанию чистится не весь — у команды есть ключ «всё».
+3. Общая команда очистки системы с ключом «всё» удалит и неиспользуемые образы — она здесь не подходит.
+```
+
+```bash solution
+docker system df
+docker container prune -f
+docker builder prune -af
+docker system df
+```
+
+```text review
+Эталон: `docker container prune` + `docker builder prune -a`.
+
+- `docker system prune` удаляет остановленные контейнеры, неиспользуемые сети, висячие образы и кэш; с `-a` — **все** образы без контейнеров (на сервере это скачивание заново при следующем деплое или откате), с `--volumes` — ещё и тома с данными баз.
+- Кэш сборки быстро растёт на CI-раннерах: чистят по расписанию с фильтром — `docker builder prune -af --filter "until=168h"`.
+- Ещё одно место, которое съедает диск, — логи контейнеров. Лимит в `/etc/docker/daemon.json`: `"log-opts": {"max-size": "10m", "max-file": "3"}`.
+```
+
+```text notes
+system\s+prune\b.*\s(-a|--all)\b => Использовался system prune -a — он удаляет и все неиспользуемые образы.
+```
+
 ## Тест
 
 ### Как запустить nginx в фоне с именем web и пробросить порт 8080 хоста на порт 80 контейнера?

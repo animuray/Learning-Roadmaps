@@ -100,6 +100,82 @@ efibootmgr -v                    # загрузочные записи UEFI
 - [ ] На тестовой ВМ прервать загрузку в GRUB, загрузиться в `rescue.target` и вернуться к обычной загрузке
 - [ ] На тестовой ВМ специально испортить строку в `/etc/fstab`, перезагрузиться, попасть в emergency mode и починить
 
+## Лаборатория
+
+Стенд — Ubuntu в WSL: загрузчика GRUB здесь нет, но после ядра всё как на сервере — загрузку ведёт systemd.
+
+### Что тормозит загрузку
+
+Сервер долго загружается. Найдите юнит, который **дольше всех** инициализировался при последней загрузке, и запишите его имя (например, `something.service`) в `~/slowest.txt`.
+
+```bash setup
+rm -f /home/student/slowest.txt
+```
+
+```bash check
+want=$(systemd-analyze blame --no-pager 2>/dev/null | head -1 | awk '{print $NF}')
+[ -n "$want" ] || fail "systemd-analyze не отвечает"
+[ -f /home/student/slowest.txt ] || fail "Нет ~/slowest.txt"
+got=$(tr -d '[:space:]' < /home/student/slowest.txt)
+[ "$got" = "$want" ] || fail "В ~/slowest.txt «$got» — это не самый долгий юнит загрузки"
+ok "дольше всех: $(systemd-analyze blame --no-pager | head -1 | sed 's/^ *//')"
+```
+
+```text hint
+У systemd есть утилита анализа загрузки: общее время, список юнитов по времени инициализации и цепочка, которая определила общее время. Нужен список — самый долгий в нём первый.
+```
+
+```bash solution
+systemd-analyze
+systemd-analyze blame --no-pager | head -5
+systemd-analyze blame --no-pager | head -1 | awk '{print $NF}' > ~/slowest.txt
+```
+
+```text review
+Эталон: `systemd-analyze blame | head`.
+
+- `systemd-analyze` — сколько заняли прошивка, загрузчик, ядро и пространство пользователя. `blame` — время каждого юнита. `critical-chain` — цепочка, которая реально задержала загрузку: юниты стартуют параллельно, и самый долгий в blame не всегда виноват.
+- Частые виновники на серверах: `systemd-networkd-wait-online` / `NetworkManager-wait-online` (ждёт сеть), cloud-init, монтирование отсутствующего диска из fstab без `nofail` (ждёт 90 секунд).
+- Этапы загрузки для собеседования: UEFI/BIOS → загрузчик (GRUB) → ядро + initramfs → PID 1 (systemd) → `default.target`.
+```
+
+### Сервер без графики
+
+На сервере по умолчанию выбрана цель загрузки с графическим окружением — серверу она не нужна. Сделайте так, чтобы система **по умолчанию** загружалась в многопользовательский режим без графики.
+
+```bash setup
+systemctl set-default graphical.target >/dev/null 2>&1
+```
+
+```bash check
+d=$(systemctl get-default)
+[ "$d" = multi-user.target ] || fail "Цель загрузки по умолчанию — $d"
+ok "по умолчанию: $d"
+```
+
+```text hint
+1. Посмотреть текущую цель загрузки по умолчанию — у systemctl есть пара команд «получить» и «установить» её.
+2. Нужная цель — многопользовательский режим без графики.
+```
+
+```bash solution
+systemctl get-default
+sudo systemctl set-default multi-user.target
+```
+
+```text review
+Эталон: `sudo systemctl set-default multi-user.target`.
+
+- target — набор юнитов, «уровень» системы. `multi-user.target` — обычный сервер (сеть, службы, вход по SSH), `graphical.target` — плюс графика, `rescue.target` — минимум для починки от root, `emergency.target` — только корень в режиме чтения.
+- `set-default` просто меняет ссылку `/etc/systemd/system/default.target`. Переключиться сейчас, без перезагрузки: `systemctl isolate multi-user.target`.
+- Разовая загрузка в другой режим: в GRUB дописать к строке ядра `systemd.unit=rescue.target` (раньше — `single` или `1`).
+- Старые runlevel: 3 ≈ multi-user, 5 ≈ graphical, 1 ≈ rescue.
+```
+
+```text notes
+ln\s+-s[^\n]*default\.target => Ссылка default.target менялась вручную. Работает, но systemctl set-default делает то же самое без риска ошибиться в пути.
+```
+
 ## Тест
 
 ### В каком порядке проходят этапы загрузки Linux?

@@ -112,6 +112,190 @@ sudo lvcreate -s -L 5G -n lv_db_snap /dev/vg_data/lv_db
 - [ ] Расширить LV на лету с `-r`, затем добавить в группу ещё один диск и снова расширить
 - [ ] Создать снапшот тома, изменить файлы, смонтировать снапшот и убедиться, что в нём старые версии
 
+## Лаборатория
+
+Диски — файлы-образы на loop-устройствах, ссылки `/dev/lab-*`. Все команды LVM и mdadm — через `sudo`.
+
+```bash setup
+export LVM_SUPPRESS_FD_WARNINGS=1
+DISKS=/var/lib/lab-disks
+# Убрать всё, что могли оставить прошлые задачи с дисками: монтирования, массивы, тома, loop-устройства
+lab_disks_reset() {
+  for m in $(findmnt -rn -o TARGET | grep -E '^/mnt/(data|app|busy|raid|xfs-lab|ramcache|lab-[a-z]+)$|^/srv/overlay/merged$' | sort -r); do umount -l "$m"; done
+  mdadm --stop --scan >/dev/null 2>&1
+  for vg in data labvg; do vgremove -qq -ff "$vg" >/dev/null 2>&1; done
+  for l in $(losetup -nO NAME,BACK-FILE 2>/dev/null | awk -v d="$DISKS" 'index($2, d) == 1 {print $1}'); do
+    pvremove -qq -ff "$l" >/dev/null 2>&1; wipefs -qa "$l" >/dev/null 2>&1; losetup -d "$l"
+  done
+  rm -f /dev/lab-*; rm -rf "$DISKS"; mkdir -p "$DISKS"
+  sed -i -E '\#[[:space:]]/mnt/(data|app|raid|xfs-lab|ramcache)[[:space:]]#d' /etc/fstab
+  true
+}
+# lab_disk имя размер → пустой «диск» /dev/lab-имя (ссылка на loop-устройство)
+lab_disk() {
+  truncate -s "$2" "$DISKS/$1.img"
+  ln -sf "$(losetup -f --show "$DISKS/$1.img")" "/dev/lab-$1"
+}
+```
+
+### Том LVM на двух дисках
+
+Подключены два пустых диска: `/dev/lab-sdb` и `/dev/lab-sdc` (по 200 МБ). Объедините их в группу томов **`data`**, создайте в ней логический том **`app`** размером **300 МБ** — больше, чем любой из дисков, — с файловой системой ext4 и смонтируйте в `/mnt/app`.
+
+```bash setup
+lab_disks_reset
+lab_disk sdb 200M
+lab_disk sdc 200M
+```
+
+```bash check
+vgs data >/dev/null 2>&1 || fail "Группы томов data нет"
+n=$(vgs --noheadings -o pv_count data | tr -d ' ')
+[ "$n" = 2 ] || fail "В группе data физических томов: $n"
+lvs data/app >/dev/null 2>&1 || fail "Логического тома app в группе data нет"
+sz=$(lvs --noheadings --units m --nosuffix -o lv_size data/app | tr -d ' ' | cut -d. -f1)
+[ "$sz" -ge 296 ] || fail "Размер тома app — $sz МБ"
+[ "$(findmnt -no FSTYPE /mnt/app 2>/dev/null)" = ext4 ] || fail "В /mnt/app не смонтирована ext4 с тома app"
+[ "$(readlink -f "$(findmnt -no SOURCE /mnt/app)")" = "$(readlink -f /dev/data/app)" ] || fail "В /mnt/app смонтирован не том data/app"
+ok "$(lvs --noheadings -o vg_name,lv_name,lv_size,devices data | tr -s ' ' | tr '\n' ';')"
+```
+
+```text hint
+1. Каждый диск пометить как физический том LVM.
+2. Создать группу томов с нужным именем из обоих физических томов — её объём будет суммой дисков.
+3. Создать в группе логический том нужного размера и имени, отформатировать его (путь вида /dev/группа/том) и смонтировать.
+4. Посмотреть результат короткими командами отчёта по физическим томам, группам и логическим томам.
+```
+
+```bash solution
+sudo pvcreate /dev/lab-sdb /dev/lab-sdc
+sudo vgcreate data /dev/lab-sdb /dev/lab-sdc
+sudo lvcreate -y -L 300M -n app data
+sudo mkfs.ext4 -q /dev/data/app
+sudo mkdir -p /mnt/app
+sudo mount /dev/data/app /mnt/app
+sudo pvs; sudo vgs; sudo lvs
+```
+
+```text review
+Эталон: `pvcreate` → `vgcreate data` → `lvcreate -L 300M -n app data` → `mkfs.ext4 /dev/data/app` → `mount`.
+
+- Слои LVM: **PV** (диск или раздел) → **VG** (общий пул) → **LV** (том нужного размера). Том может быть больше любого из дисков и растёт на лету.
+- Обзор: `pvs`, `vgs`, `lvs` (кратко) и `pvdisplay`, `vgdisplay`, `lvdisplay` (подробно); `lsblk` — как тома легли на диски.
+- Важно: такой том **без избыточности** — умрёт любой диск, пропадут данные всего тома. Для надёжности LVM ставят поверх RAID или используют `lvcreate --type raid1`.
+- `-l 100%FREE` — занять всё свободное место группы.
+```
+
+### Расширить том на лету
+
+Раздел `/mnt/app` (том `data/app`, 100 МБ) почти заполнен. В группе `data` места больше нет, но к серверу подключили ещё один диск `/dev/lab-sdc` (200 МБ). Расширьте `/mnt/app` так, чтобы файловая система была **не меньше 260 МБ**, **не отмонтируя** раздел и не теряя данные.
+
+```bash setup
+lab_disks_reset
+lab_disk sdb 104M
+lab_disk sdc 200M
+pvcreate -qq /dev/lab-sdb
+vgcreate -qq data /dev/lab-sdb
+lvcreate -qq -y -l 100%FREE -n app data
+mkfs.ext4 -q /dev/data/app
+mkdir -p /mnt/app
+mount /dev/data/app /mnt/app
+head -c 60000000 /dev/urandom > /mnt/app/data.bin
+md5sum /mnt/app/data.bin > /var/lib/lab/app-data.md5
+```
+
+```bash check
+findmnt /mnt/app >/dev/null || fail "/mnt/app не смонтирован"
+md5sum -c --quiet /var/lib/lab/app-data.md5 >/dev/null 2>&1 || fail "Данные на /mnt/app повреждены или пропали"
+fs=$(df -BM --output=size /mnt/app | tail -1 | tr -dc 0-9)
+[ "$fs" -ge 260 ] || fail "Файловая система в /mnt/app — $fs МБ (сам том: $(lvs --noheadings --units m -o lv_size data/app | tr -d ' '))"
+ok "/mnt/app: $fs МБ, данные целы; PV в группе: $(vgs --noheadings -o pv_count data | tr -d ' ')"
+```
+
+```text hint
+1. Новый диск пометить как физический том и добавить в существующую группу томов.
+2. Увеличить логический том на всё свободное место группы. У команды расширения есть ключ, который сразу расширит и файловую систему на нём — иначе том вырастет, а df покажет старый размер.
+3. Проверить df.
+```
+
+```bash solution
+sudo pvcreate /dev/lab-sdc
+sudo vgextend data /dev/lab-sdc
+sudo lvextend -r -l +100%FREE data/app
+df -h /mnt/app
+```
+
+```text review
+Эталон: `pvcreate /dev/lab-sdc` → `vgextend data /dev/lab-sdc` → `lvextend -r -l +100%FREE data/app`.
+
+- `-r` (`--resizefs`) после расширения тома вызывает `resize2fs` (ext4) или `xfs_growfs` (xfs). Забыли — расширьте ФС отдельно, том уже большой.
+- ext4 и xfs растут **на лету**, без отмонтирования. Уменьшение ext4 — только отмонтированной, xfs — никогда.
+- В облаке обычно наоборот: увеличивают сам диск в консоли, затем `growpart` (раздел) → `pvresize` → `lvextend -r`.
+```
+
+```text notes
+umount\s+/mnt/app => Раздел отмонтировали — по условию это не нужно: ext4 растёт на смонтированном разделе.
+lvextend(?![^\n]*(-r|--resizefs)) => Том расширяли без -r — файловую систему пришлось растягивать отдельной командой. lvextend -r делает обе операции разом.
+```
+
+### Заменить диск в RAID 1
+
+Зеркало `/dev/md/labraid` (RAID 1, смонтировано в `/mnt/raid`) работает в аварийном режиме: один из дисков помечен как неисправный. Уберите сломанный диск из массива и добавьте вместо него новый — `/dev/lab-r3`. Массив должен **восстановиться** до двух рабочих дисков, данные — сохраниться.
+
+```bash setup
+lab_disks_reset
+lab_disk r1 80M
+lab_disk r2 80M
+lab_disk r3 80M
+mdadm --create /dev/md/labraid --run --quiet --level=1 --raid-devices=2 --metadata=1.2 /dev/lab-r1 /dev/lab-r2 2>/dev/null
+mdadm --wait /dev/md/labraid 2>/dev/null; true
+mkfs.ext4 -q -F /dev/md/labraid
+mkdir -p /mnt/raid
+mount /dev/md/labraid /mnt/raid
+echo "клиентская база" > /mnt/raid/clients.txt
+sync
+mdadm --manage /dev/md/labraid --fail /dev/lab-r2 >/dev/null 2>&1
+readlink -f /dev/lab-r2 > /var/lib/lab/raid-failed
+```
+
+```bash check
+md=/dev/md/labraid
+mdadm --detail $md >/dev/null 2>&1 || fail "Массива $md нет"
+d=$(mdadm --detail $md)
+echo "$d" | grep -qE 'State : .*degraded' && fail "Массив всё ещё в аварийном режиме (degraded)"
+echo "$d" | grep -qE 'State : .*(recovering|resyncing)' && fail "Массив ещё восстанавливается — подождите и проверьте снова"
+[ "$(echo "$d" | awk -F: '/Active Devices/ {gsub(/ /,"",$2); print $2}')" = 2 ] || fail "Рабочих дисков в массиве: $(echo "$d" | awk -F: '/Active Devices/ {print $2}')"
+echo "$d" | grep -q "$(readlink -f /dev/lab-r3)" || fail "Нового диска /dev/lab-r3 в массиве нет"
+echo "$d" | grep -q "$(cat /var/lib/lab/raid-failed)" && fail "Неисправный диск всё ещё числится в массиве"
+grep -q "клиентская база" /mnt/raid/clients.txt 2>/dev/null || fail "Данные на /mnt/raid пропали"
+ok "$(grep -A1 '^md' /proc/mdstat | tr -s ' ' | tr '\n' ' ')"
+```
+
+```text hint
+1. Посмотреть состояние массивов в файле ядра и подробности конкретного массива — там видно, какой диск неисправен.
+2. Управляющая утилита RAID умеет удалить диск из массива и добавить новый (режим управления массивом).
+3. После добавления начнётся восстановление — дождаться окончания (у утилиты есть ключ ожидания) и проверить состояние.
+```
+
+```bash solution
+cat /proc/mdstat
+sudo mdadm --detail /dev/md/labraid
+sudo mdadm --manage /dev/md/labraid --remove /dev/lab-r2
+sudo mdadm --manage /dev/md/labraid --add /dev/lab-r3
+sudo mdadm --wait /dev/md/labraid || true
+cat /proc/mdstat
+```
+
+```text review
+Эталон: `mdadm --detail` → `mdadm --manage /dev/md/labraid --remove <старый>` → `--add /dev/lab-r3` → дождаться rebuild (`watch cat /proc/mdstat`).
+
+- В `/proc/mdstat`: `[2/1] [U_]` — нужно 2 диска, работает 1. После восстановления — `[2/2] [UU]`.
+- Порядок замены на живом сервере: `--fail` (если ядро ещё не пометило) → `--remove` → физически заменить → разметить новый диск так же → `--add`.
+- RAID — **не бэкап**: удалённый по ошибке файл исчезнет с обоих дисков. Защищает только от отказа диска.
+- Уровни: 0 — скорость без защиты, 1 — зеркало, 5/6 — чётность (переживает 1/2 диска), 10 — зеркала + чередование, для баз.
+- Мониторинг: `mdadm --monitor` с почтой или алерт по `node_md_disks{state="failed"}` в Prometheus.
+```
+
 ## Тест
 
 ### Какой уровень RAID не переживает отказ ни одного диска?

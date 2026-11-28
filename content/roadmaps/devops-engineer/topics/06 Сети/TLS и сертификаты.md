@@ -118,6 +118,101 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 30
 - [ ] Если есть домен и сервер — получить сертификат Let's Encrypt через certbot и проверить `renew --dry-run`
 - [ ] Написать однострочник, который выводит, сколько дней осталось до истечения сертификата сайта
 
+## Лаборатория
+
+### Самоподписанный сертификат
+
+Для тестового стенда нужен сертификат для `app.lab`. Создайте **закрытый ключ** `/etc/ssl/lab/app.lab.key` и **самоподписанный сертификат** `/etc/ssl/lab/app.lab.crt`:
+
+- в сертификате должно быть имя `app.lab` в расширении **Subject Alternative Name** (без него браузеры имя не признают);
+- срок действия — не меньше года;
+- ключ не должен быть доступен на чтение обычным пользователям.
+
+```bash setup
+rm -f /etc/ssl/lab/app.lab.*
+mkdir -p /etc/ssl/lab
+```
+
+```bash check
+k=/etc/ssl/lab/app.lab.key; c=/etc/ssl/lab/app.lab.crt
+[ -f $k ] || fail "Нет ключа $k"
+[ -f $c ] || fail "Нет сертификата $c"
+openssl x509 -in $c -noout 2>/dev/null || fail "$c — не сертификат в формате PEM"
+openssl x509 -in $c -noout -ext subjectAltName 2>/dev/null | grep -q 'DNS:app.lab' || fail "В сертификате нет app.lab в Subject Alternative Name"
+openssl x509 -in $c -noout -checkend $((364 * 86400)) >/dev/null || fail "Сертификат действует меньше года: до $(openssl x509 -in $c -noout -enddate | cut -d= -f2)"
+[ "$(openssl x509 -in $c -noout -pubkey | sha256sum)" = "$(openssl pkey -in $k -pubout 2>/dev/null | sha256sum)" ] || fail "Ключ и сертификат не соответствуют друг другу"
+perm=$(stat -c %a $k)
+[ $(( 0$perm & 4 )) = 0 ] || fail "Ключ доступен на чтение всем (права $perm)"
+ok "$(openssl x509 -in $c -noout -subject -enddate | tr '\n' ' ')"
+```
+
+```text hint
+1. Утилита openssl в одной команде может создать новый ключ и самоподписанный сертификат: режим «запрос сертификата» с ключом «сразу выпустить сертификат», без шифрования ключа паролем, со сроком в днях.
+2. Имя для браузеров задаётся дополнительным расширением с альтернативными именами — для него есть отдельный ключ.
+3. Закрыть ключ от чтения всем, кроме владельца.
+4. Посмотреть получившийся сертификат текстом.
+```
+
+```bash solution
+sudo openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout /etc/ssl/lab/app.lab.key -out /etc/ssl/lab/app.lab.crt \
+  -subj "/CN=app.lab" -addext "subjectAltName=DNS:app.lab"
+sudo chmod 600 /etc/ssl/lab/app.lab.key
+openssl x509 -in /etc/ssl/lab/app.lab.crt -noout -subject -ext subjectAltName -dates
+```
+
+```text review
+Эталон: `openssl req -x509 -newkey rsa:2048 -nodes -days 365 -keyout ... -out ... -subj "/CN=app.lab" -addext "subjectAltName=DNS:app.lab"`.
+
+- Браузеры и curl давно смотрят только на **SAN**, а не на CN. Сертификат без SAN = ошибка имени даже при правильном CN.
+- Самоподписанный годится для тестов и внутренних сервисов с явным доверием (`curl --cacert app.lab.crt`). Для публичного сайта — Let's Encrypt (`certbot`), для внутренней инфраструктуры — своя CA (step-ca, Vault PKI) или cert-manager в Kubernetes.
+- Посмотреть любой сертификат: `openssl x509 -in файл -noout -text`; сертификат сайта: `openssl s_client -connect host:443 -servername host </dev/null | openssl x509 -noout -dates -ext subjectAltName`.
+- Ключ — самое ценное: 600 и владелец root (или группа `ssl-cert` с 640 — для nginx в Debian).
+```
+
+### Сколько дней до истечения
+
+На `127.0.0.1:8443` работает TLS-сервис. Узнайте, **через сколько полных дней** истекает его сертификат, и запишите число в `~/days.txt`.
+
+```bash setup
+systemctl stop lab-tls-srv 2>/dev/null; systemctl reset-failed lab-tls-srv 2>/dev/null
+rm -f /home/student/days.txt
+d=$(( RANDOM % 80 + 10 ))
+openssl req -x509 -newkey rsa:2048 -nodes -days $d -keyout /var/lib/lab/tls-srv.key -out /var/lib/lab/tls-srv.crt -subj "/CN=billing.lab" -addext "subjectAltName=DNS:billing.lab" 2>/dev/null
+systemd-run -q --unit=lab-tls-srv openssl s_server -quiet -accept 127.0.0.1:8443 -cert /var/lib/lab/tls-srv.crt -key /var/lib/lab/tls-srv.key -www
+for i in $(seq 40); do ss -ltnH 'sport = :8443' | grep -q . && break; sleep 0.25; done
+```
+
+```bash check
+end=$(openssl x509 -in /var/lib/lab/tls-srv.crt -noout -enddate | cut -d= -f2)
+want=$(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 ))
+[ -f /home/student/days.txt ] || fail "Нет ~/days.txt"
+got=$(tr -d '[:space:]' < /home/student/days.txt)
+[[ "$got" =~ ^[0-9]+$ ]] || fail "В ~/days.txt должно быть только число дней"
+[ $(( got - want )) -ge -1 ] && [ $(( got - want )) -le 1 ] || fail "В ~/days.txt $got — сертификат истекает через другое число дней"
+ok "сертификат истекает $end — через $want дн."
+```
+
+```text hint
+1. Подключиться к сервису как TLS-клиент утилитой openssl и передать полученный сертификат на разбор другой подкоманде openssl, попросив дату окончания.
+2. Перевести дату в секунды (date умеет разбирать строку даты), вычесть текущее время и разделить на число секунд в сутках.
+```
+
+```bash solution
+end=$(openssl s_client -connect 127.0.0.1:8443 -servername billing.lab </dev/null 2>/dev/null | openssl x509 -noout -enddate | cut -d= -f2)
+echo "истекает: $end"
+echo $(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 )) > ~/days.txt
+```
+
+```text review
+Эталон: `openssl s_client -connect host:port </dev/null | openssl x509 -noout -enddate` → разность дат в днях.
+
+- Истёкший сертификат — одна из самых частых причин аварий «всё легло в одно утро». Мониторят его заранее: Prometheus blackbox_exporter (`probe_ssl_earliest_cert_expiry`), алерт за 14–21 день.
+- `-servername` (SNI) обязателен, когда на одном IP несколько сайтов: без него сервер может отдать сертификат по умолчанию — не тот.
+- Только проверка «истекает ли в ближайшие N секунд»: `openssl x509 -checkend 1209600` (код возврата 1 — истечёт в течение 14 дней).
+- Let's Encrypt выдаёт на 90 дней; `certbot renew` по таймеру продлевает за 30 дней до конца. Проверить, что продление сработает: `certbot renew --dry-run`.
+```
+
 ## Тест
 
 ### Какие задачи решает TLS?

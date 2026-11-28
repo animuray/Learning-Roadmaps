@@ -107,6 +107,133 @@ dig -x 203.0.113.10                 # обратный запрос (PTR)
 - [ ] Посмотреть, какие DNS-серверы реально используются: `cat /etc/resolv.conf` и `resolvectl status`
 - [ ] Если есть свой домен — создать A-запись для сервера из практики Linux
 
+## Лаборатория
+
+В сети работает DNS-сервер компании `lab-dns` (адрес **10.53.0.53**), он обслуживает внутреннюю зону `.lab`. Со стенда до него можно достучаться напрямую.
+
+```bash setup
+# «Машины» задачи — network namespace lab-*, «кабели» — пары veth. Всё лабораторное начинается с lab.
+lab_net_reset() {
+  for u in $(systemctl list-units --all --plain --no-legend 'lab-net-*' | awk '{print $1}'); do
+    systemctl stop "$u" 2>/dev/null; systemctl reset-failed "$u" 2>/dev/null
+  done
+  for ns in $(ip netns list | awk '$1 ~ /^lab-/ {print $1}'); do
+    ip netns pids "$ns" | xargs -r kill -9 2>/dev/null; ip netns del "$ns"
+  done
+  for l in $(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1 | grep '^lab'); do ip link del "$l" 2>/dev/null; done
+  rm -rf /etc/netns/lab-*
+  true
+}
+# lab_ns имя — пустая «машина» lab-имя с поднятым loopback
+lab_ns() { ip netns add "lab-$1"; ip -n "lab-$1" link set lo up; }
+# lab_link ns1 if1 addr1 ns2 if2 addr2 — кабель между двумя машинами; ns «-» — сам стенд, addr «-» — без адреса
+lab_link() {
+  local t1=labt$RANDOM t2=labu$RANDOM
+  ip link add "$t1" type veth peer name "$t2"
+  _lab_end "$1" "$t1" "$2" "$3"; _lab_end "$4" "$t2" "$5" "$6"
+}
+_lab_end() {
+  if [ "$1" = - ]; then
+    ip link set "$2" name "$3"; ip link set "$3" up; [ "$4" = - ] || ip addr add "$4" dev "$3"
+  else
+    ip link set "$2" netns "lab-$1"; ip -n "lab-$1" link set "$2" name "$3"; ip -n "lab-$1" link set "$3" up
+    [ "$4" = - ] || ip -n "lab-$1" addr add "$4" dev "$3"
+  fi
+}
+# lab_bg имя ns команда... — фоновый процесс внутри машины (служба lab-net-имя)
+lab_bg() { local u=$1 ns=$2; shift 2; systemd-run -q --unit="lab-net-$u" ip netns exec "lab-$ns" "$@"; }
+# lab_wait_port ns адрес порт — дождаться, пока сервис начнёт слушать
+lab_wait_port() { for i in $(seq 40); do ip netns exec "lab-$1" ss -ltnH "src $2 and sport = :$3" | grep -q . && return 0; sleep 0.25; done; return 1; }
+lab_net_reset
+lab_ns dns; lab_ns dnsc
+lab_link - labdns0 10.53.0.1/24 dns eth0 10.53.0.53/24
+lab_link dns eth1 10.54.0.53/24 dnsc eth0 10.54.0.10/24
+tok="lab-verify=$(tr -dc a-z0-9 </dev/urandom | head -c 10)"
+echo "$tok" > /var/lib/lab/dns-txt
+lab_bg dnsmasq dns dnsmasq --keep-in-foreground --no-resolv --no-hosts --bind-interfaces \
+  --listen-address=10.53.0.53 --listen-address=10.54.0.53 \
+  --address=/app.lab/10.53.0.10 --address=/db.lab/10.53.0.20 \
+  --mx-host=lab,mail.lab,10 --address=/mail.lab/10.53.0.25 \
+  --txt-record=verify.lab,"$tok"
+for i in $(seq 40); do dig +short +time=1 +tries=1 @10.53.0.53 app.lab 2>/dev/null | grep -q . && break; sleep 0.25; done
+```
+
+### Запись у конкретного сервера
+
+Для подтверждения домена в зоне `.lab` есть TXT-запись у имени `verify.lab`. Запросите её **у сервера 10.53.0.53** и запишите значение (без кавычек) в `~/txt.txt`.
+
+```bash setup
+rm -f /home/student/txt.txt
+```
+
+```bash check
+want=$(cat /var/lib/lab/dns-txt)
+[ -f /home/student/txt.txt ] || fail "Нет ~/txt.txt"
+got=$(tr -d '"[:space:]' < /home/student/txt.txt)
+[ "$got" = "$want" ] || fail "В ~/txt.txt «$got» — это не значение TXT-записи verify.lab"
+ok "verify.lab TXT: $want"
+```
+
+```text hint
+1. У утилиты запросов DNS сервер указывают через «собаку», а тип записи — отдельным словом.
+2. Короткий режим вывода оставит только значение.
+3. Системный резолвер стенда о зоне .lab ничего не знает — спрашивать нужно именно этот сервер.
+```
+
+```bash solution
+dig @10.53.0.53 verify.lab TXT +short
+dig @10.53.0.53 verify.lab TXT +short | tr -d '"' > ~/txt.txt
+```
+
+```text review
+Эталон: `dig @10.53.0.53 verify.lab TXT +short`.
+
+- `dig` без `@` спрашивает серверы из `/etc/resolv.conf`; с `@сервер` — конкретный. Так сравнивают ответы внутреннего DNS, `@8.8.8.8` и авторитативного сервера домена.
+- Типы: `A`/`AAAA` — адреса, `CNAME` — псевдоним, `MX` — почта, `TXT` — проверки владения доменом, SPF, DKIM, `NS` — кто обслуживает зону, `SOA` — параметры зоны.
+- Полезное: `+trace` — пройти от корня до ответа, `+noall +answer` — только ответ с TTL, `-x 1.2.3.4` — обратный запрос (PTR).
+- После изменения записи старый ответ живёт в кэшах до истечения **TTL** — поэтому перед переездом TTL заранее уменьшают.
+```
+
+### Не резолвится имя
+
+Приложение в машине `lab-dnsc` не может обратиться к `app.lab`: «Temporary failure in name resolution». DNS-сервер компании для этой машины доступен по адресу **10.54.0.53**. Почините разрешение имён в `lab-dnsc`, чтобы `sudo ip netns exec lab-dnsc getent hosts app.lab` возвращал адрес из DNS. Прописывать адрес вручную в `hosts` нельзя.
+
+```bash setup
+mkdir -p /etc/netns/lab-dnsc
+printf '# DNS этой машины\nnameserver 10.54.0.99\n' > /etc/netns/lab-dnsc/resolv.conf
+sed -i '/app\.lab/d' /etc/hosts
+```
+
+```bash check
+[ -e /etc/netns/lab-dnsc/hosts ] && grep -q app.lab /etc/netns/lab-dnsc/hosts && fail "Имя прописано вручную в hosts — так при смене адреса приложение сломается снова"
+grep -q 'app\.lab' /etc/hosts && fail "Имя прописано вручную в /etc/hosts"
+r=$(ip netns exec lab-dnsc getent hosts app.lab | awk '{print $1}')
+[ "$r" = 10.53.0.10 ] || fail "В lab-dnsc app.lab не разрешается (ответ: «${r:-пусто}»)"
+ok "lab-dnsc: app.lab → $r"
+```
+
+```text hint
+1. Проверить, отвечает ли DNS-сервер компании на запрос из этой машины, указав его адрес явно.
+2. Посмотреть, какой DNS-сервер машина использует на самом деле. Команда ip netns exec подменяет файл с настройками резолвера для пространства имён — его копия лежит в каталоге /etc/netns/<имя>/.
+3. Исправить адрес сервера в этом файле и повторить проверку.
+```
+
+```bash solution
+sudo ip netns exec lab-dnsc cat /etc/resolv.conf
+sudo ip netns exec lab-dnsc dig +short @10.54.0.53 app.lab
+echo 'nameserver 10.54.0.53' | sudo tee /etc/netns/lab-dnsc/resolv.conf >/dev/null
+sudo ip netns exec lab-dnsc getent hosts app.lab
+```
+
+```text review
+Эталон: `dig @10.54.0.53 app.lab` (сервер отвечает) → в `resolv.conf` машины стоит неверный `nameserver` → исправить.
+
+- Порядок диагностики DNS: `getent hosts имя` (как видит система, с учётом `/etc/hosts`) → `cat /etc/resolv.conf` (какой сервер) → `dig имя` (через него) → `dig @другой_сервер имя` (проблема в сервере или в настройке клиента).
+- В Ubuntu `/etc/resolv.conf` — ссылка на `systemd-resolved` (`nameserver 127.0.0.53`); реальные серверы — в `resolvectl status`. Править `resolv.conf` руками там бесполезно — перезапишется; DNS задают в netplan.
+- Порядок источников (файлы, DNS, mDNS) — в `/etc/nsswitch.conf`, строка `hosts:`.
+- `/etc/hosts` годится для локальной разработки, но не как «починка» DNS: адрес поменяется — и все забудут, откуда берётся старый.
+```
+
 ## Тест
 
 ### Для чего нужен DNS?

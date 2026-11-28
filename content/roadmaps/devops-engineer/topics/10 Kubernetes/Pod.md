@@ -144,6 +144,176 @@ spec:
 - [ ] Добавить init-контейнер, который ждёт DNS-имя несуществующего сервиса, и посмотреть статус `Init:0/1`
 - [ ] Специально вызвать `CrashLoopBackOff` (команда `exit 1`) и `ImagePullBackOff` (несуществующий тег), разобрать оба через `describe` и `logs --previous`
 
+## Лаборатория
+
+Кластер — k3s на стенде, `kubectl` настроен. Манифесты храните в `~/k8s/` — их проверяет и сам кластер, и проверка.
+
+```bash lib
+# Kubernetes на стенде — k3s (один узел). root работает с /etc/rancher/k3s/k3s.yaml, ученик — со своим ~/.kube/config
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# lab_kns имя — чистый namespace задачи (старый удаляется вместе со всем содержимым)
+lab_kns() {
+  kubectl delete ns "$1" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1
+  kubectl create ns "$1" >/dev/null
+}
+# убрать с узла метки и taint-ы, которые оставляют задачи про размещение подов
+lab_knode() {
+  kubectl taint nodes --all lab-dedicated- >/dev/null 2>&1
+  kubectl label nodes --all disktype- zone- >/dev/null 2>&1
+  true
+}
+# lab_kready ns селектор [секунд] — дождаться готовности подов
+lab_kready() { kubectl -n "$1" wait --for=condition=Ready pod -l "$2" --timeout="${3:-90}s" >/dev/null 2>&1; }
+# lab_kfiles каталог — каталог манифестов ученика (пустой)
+lab_kfiles() { rm -rf "$1"; mkdir -p "$1"; chown -R student:student "$1"; }
+lab_kj() { kubectl "$@" -o json 2>/dev/null; }
+lab_traefik() { kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'; }
+```
+
+```bash setup
+lab_knode
+```
+
+### Под из манифеста
+
+Опишите в **`~/k8s/pod.yaml`** под **`web`** в namespace **`lab-pod`**:
+
+- образ `nginx:1.27-alpine`, порт контейнера 80;
+- метки `app=web` и `tier=frontend`;
+- запросы ресурсов: **50m** CPU и **64Mi** памяти; лимит памяти **128Mi**.
+
+Создайте его **из файла** (`kubectl apply -f`). Под должен быть в состоянии Running.
+
+```bash setup
+lab_kns lab-pod
+lab_kfiles /home/student/k8s
+```
+
+```bash check
+[ -f /home/student/k8s/pod.yaml ] || fail "Нет ~/k8s/pod.yaml"
+p=$(lab_kj -n lab-pod get pod web) || fail "Пода web в namespace lab-pod нет"
+[ "$(echo "$p" | jq -r '.metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"] // empty')" != "" ] || fail "Под создан не через kubectl apply -f"
+[ "$(echo "$p" | jq -r '.spec.containers[0].image')" = nginx:1.27-alpine ] || fail "Образ — $(echo "$p" | jq -r '.spec.containers[0].image')"
+[ "$(echo "$p" | jq -r '.metadata.labels.app + "," + .metadata.labels.tier')" = web,frontend ] || fail "Метки: $(echo "$p" | jq -c .metadata.labels)"
+r=$(echo "$p" | jq -c '.spec.containers[0].resources')
+[ "$(echo "$r" | jq -r '.requests.cpu')" = 50m ] && [ "$(echo "$r" | jq -r '.requests.memory')" = 64Mi ] && [ "$(echo "$r" | jq -r '.limits.memory')" = 128Mi ] || fail "Ресурсы не те: $r"
+lab_kready lab-pod app=web 60 || fail "Под web не стал Ready: $(kubectl -n lab-pod get pod web --no-headers | awk '{print $3}')"
+ok "web: Running, $(echo "$r")"
+```
+
+```text hint
+1. Каркас манифеста можно получить у kubectl, запустив создание пода в режиме «только показать на клиенте» с выводом в YAML.
+2. Обязательные поля: версия API, вид объекта, метаданные (имя, namespace, метки) и спецификация со списком контейнеров.
+3. Ресурсы — у контейнера: раздел запросов и раздел лимитов.
+```
+
+```bash solution
+mkdir -p ~/k8s
+cat > ~/k8s/pod.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  namespace: lab-pod
+  labels:
+    app: web
+    tier: frontend
+spec:
+  containers:
+    - name: nginx
+      image: nginx:1.27-alpine
+      ports:
+        - containerPort: 80
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          memory: 128Mi
+EOF
+kubectl apply -f ~/k8s/pod.yaml
+kubectl -n lab-pod wait --for=condition=Ready pod/web --timeout=60s
+```
+
+```text review
+Эталон — в «Решении».
+
+- Декларативно (`apply -f` из файла в Git) — а не `kubectl run`: манифест — документация и история изменений. Каркас: `kubectl run web --image=nginx --dry-run=client -o yaml > pod.yaml`.
+- `requests` — сколько гарантированно резервирует планировщик (по ним выбирается узел), `limits` — потолок: память выше лимита → OOMKilled, CPU выше лимита → троттлинг. Лимит CPU многие не ставят именно из-за троттлинга.
+- «Голый» под никто не перезапустит при падении узла — в работе поды создают Deployment, StatefulSet, Job.
+```
+
+### Сайдкар с общим томом
+
+Создайте под **`site`** в namespace **`lab-pod`** (манифест — `~/k8s/sidecar.yaml`) из **двух контейнеров** с общим томом `emptyDir`:
+
+- **`writer`** (`busybox:1.36`) — раз в 5 секунд пишет текущую дату в `/data/index.html`;
+- **`web`** (`nginx:1.27-alpine`) — раздаёт этот каталог: том подключён в `/usr/share/nginx/html`.
+
+Запрос к nginx внутри пода должен возвращать дату, записанную writer-ом.
+
+```bash setup
+lab_kns lab-pod
+mkdir -p /home/student/k8s && chown student:student /home/student/k8s
+rm -f /home/student/k8s/sidecar.yaml
+```
+
+```bash check
+p=$(lab_kj -n lab-pod get pod site) || fail "Пода site нет"
+[ "$(echo "$p" | jq '.spec.containers | length')" = 2 ] || fail "В поде site не два контейнера"
+echo "$p" | jq -e '.spec.volumes[] | select(.emptyDir != null)' >/dev/null || fail "В поде нет тома emptyDir"
+kubectl -n lab-pod wait --for=condition=Ready pod/site --timeout=60s >/dev/null 2>&1 || fail "Под site не стал Ready"
+sleep 6
+r=$(kubectl -n lab-pod exec site -c web -- wget -qO- http://localhost/ 2>/dev/null)
+echo "$r" | grep -qE '20[0-9]{2}|[0-9]{2}:[0-9]{2}:[0-9]{2}' || fail "nginx в поде site отдаёт не дату от writer: «$(echo "$r" | head -c 80)»"
+ok "nginx отдаёт: $r"
+```
+
+```text hint
+1. Том объявляется в спецификации пода один раз, а подключается в каждый контейнер своим путём.
+2. Команда первого контейнера — бесконечный цикл оболочки: записать дату в файл и подождать.
+3. Проверить: выполнить запрос к localhost изнутри контейнера с nginx (в alpine есть wget).
+```
+
+```bash solution
+cat > ~/k8s/sidecar.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: site
+  namespace: lab-pod
+spec:
+  volumes:
+    - name: html
+      emptyDir: {}
+  containers:
+    - name: writer
+      image: busybox:1.36
+      command: ["sh", "-c", "while true; do date > /data/index.html; sleep 5; done"]
+      volumeMounts:
+        - name: html
+          mountPath: /data
+    - name: web
+      image: nginx:1.27-alpine
+      volumeMounts:
+        - name: html
+          mountPath: /usr/share/nginx/html
+EOF
+kubectl apply -f ~/k8s/sidecar.yaml
+kubectl -n lab-pod wait --for=condition=Ready pod/site --timeout=60s
+sleep 6
+kubectl -n lab-pod exec site -c web -- wget -qO- http://localhost/
+```
+
+```text review
+Эталон — в «Решении».
+
+- Контейнеры одного пода делят сеть (общий localhost и порты) и могут делить тома. `emptyDir` живёт, пока жив под.
+- Паттерны: **sidecar** (сборщик логов, прокси Envoy/Istio, обновление конфигов из Git), **init-контейнер** (миграции, ожидание базы — выполняется до основных), **ambassador**.
+- С Kubernetes 1.29 sidecar делают как init-контейнер с `restartPolicy: Always` — он стартует раньше основных и завершается после них.
+- `kubectl logs site -c writer`, `kubectl exec -it site -c web -- sh` — при нескольких контейнерах `-c` обязателен.
+```
+
 ## Тест
 
 ### Что такое Pod?

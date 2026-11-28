@@ -121,6 +121,112 @@ top -p 1234          # следить за одним процессом
 - [ ] Выполнить `top -o %MEM` и найти три самых «прожорливых» по памяти процесса
 - [ ] В htop включить дерево процессов (F5) и найти родителя своего терминала
 
+## Лаборатория
+
+```bash setup
+lab_unit() { systemctl stop "$1" 2>/dev/null; systemctl reset-failed "$1" 2>/dev/null; true; }
+mkdir -p /opt/lab
+cat > /opt/lab/worker <<'EOF'
+#!/usr/bin/env python3
+# Обработчик задач. Режим busy — грузит процессор (не дольше 10 минут), иначе спит.
+import sys, time
+if len(sys.argv) > 2 and sys.argv[2] == "busy":
+    end = time.time() + 600
+    while time.time() < end:
+        pass
+else:
+    time.sleep(10**6)
+EOF
+chmod 755 /opt/lab/worker
+```
+
+### Кто грузит процессор
+
+На сервере работают шесть одинаковых обработчиков `worker` (в списке процессов они видны как `python3`). Один из них ушёл в бесконечный цикл и съедает целое ядро процессора. Найдите **именно его** и завершите. Остальные обработчики должны продолжать работать.
+
+```bash setup
+for i in 1 2 3 4 5 6; do lab_unit lab-worker$i; done
+hot=$(( RANDOM % 6 + 1 ))
+echo $hot > /var/lib/lab/hot-worker
+for i in 1 2 3 4 5 6; do
+  mode=idle; [ $i = $hot ] && mode=busy
+  systemd-run -q --unit=lab-worker$i -p User=student /opt/lab/worker $i $mode
+done
+sleep 2
+```
+
+```bash check
+hot=$(cat /var/lib/lab/hot-worker)
+[ "$(systemctl is-active lab-worker$hot)" = active ] && fail "Процесс, который грузит процессор, всё ещё работает"
+for i in 1 2 3 4 5 6; do
+  [ $i = $hot ] && continue
+  [ "$(systemctl is-active lab-worker$i)" = active ] || fail "Остановлен лишний обработчик — worker $i работал нормально"
+done
+ok "остановлен worker $hot, остальные пять работают"
+```
+
+```text hint
+1. Открыть интерактивный монитор процессов: по умолчанию он сортирует по загрузке процессора — виновник будет наверху.
+2. Все процессы называются одинаково: включите показ полной командной строки (одна клавиша), чтобы различать их.
+3. Завершить процесс можно прямо из монитора (клавиша «убить», затем PID и сигнал) или отдельной командой по PID.
+```
+
+```bash solution
+top -b -n 2 -d 1 -o %CPU -c | grep -A 3 '^ *PID' | tail -3
+pid=$(ps -eo pid=,pcpu=,args= --sort=-pcpu | grep '/opt/lab/worker' | head -1 | awk '{print $1}')
+kill "$pid"
+```
+
+```text review
+Эталон: `top` (сортировка по %CPU по умолчанию) → `c` (полная команда) → `k` → PID → Enter (SIGTERM).
+
+- В шапке top: `load average` за 1/5/15 минут, строка `%Cpu(s)` — `us` (программы), `sy` (ядро), `wa` (ожидание диска), `st` (у вас отняла гипервизор-соседка), `id` — простой.
+- Полезные клавиши: `P`/`M` — сортировка по CPU/памяти, `1` — по ядрам, `H` — потоки, `u` — процессы пользователя, `c` — полная команда.
+- 100% у процесса в top — это **одно ядро**. На 4-ядерной машине процесс может показать и 400%.
+- htop удобнее: дерево (`F5`), поиск (`F3`), фильтр (`F4`), сигнал выбранному процессу (`F9`).
+```
+
+### Отчёт для скрипта
+
+Интерактивный top не годится для cron и отчётов. Сохраните в `~/top-report.txt` снимок top в **пакетном режиме**: шапку и процессы, **отсортированные по загрузке CPU**, — первые 20 строк вывода. Сейчас на сервере работает тяжёлый процесс `encoder` — в отчёте он должен оказаться вверху списка.
+
+```bash setup
+lab_unit lab-encoder-cpu
+rm -f /home/student/top-report.txt
+systemd-run -q --unit=lab-encoder-cpu -p User=student /opt/lab/worker encoder busy
+sleep 2
+```
+
+```bash check
+f=/home/student/top-report.txt
+[ -s $f ] || fail "~/top-report.txt пуст или не создан"
+grep -q 'load average' $f || fail "В отчёте нет шапки top (строки с load average)"
+grep -qE '^\s*PID ' $f || fail "В отчёте нет списка процессов"
+pid=$(systemctl show -p MainPID --value lab-encoder-cpu)
+grep -A3 -E '^\s*PID ' $f | awk 'NR>1 {print $1}' | grep -qx "$pid" || fail "encoder (PID $pid) не среди первых процессов отчёта — список отсортирован не по CPU"
+[ "$(wc -l < $f)" -le 25 ] || fail "В отчёте $(wc -l < $f) строк, нужны первые 20"
+ok "отчёт: $(wc -l < $f) строк, encoder вверху"
+```
+
+```text hint
+1. У top есть ключи: «пакетный режим» (вывод текстом, без управления клавишами), «число обновлений» и «поле для сортировки».
+2. Первое обновление считает загрузку от старта процесса — надёжнее взять второе с интервалом в секунду.
+3. Обрезать вывод до первых строк и сохранить в файл.
+```
+
+```bash solution
+top -b -n 1 -o %CPU | head -20 > ~/top-report.txt
+cat ~/top-report.txt
+```
+
+```text review
+Эталон: `top -b -n 1 -o %CPU | head -20 > ~/top-report.txt`.
+
+- `-b` — пакетный режим (без экрана и клавиш), `-n` — сколько снимков, `-d` — интервал, `-o` — поле сортировки, `-u` — пользователь, `-p` — конкретные PID.
+- Так собирают «снимок при инциденте»: cron или алерт запускает `top -b -n 1`, `ps aux --sort=-%cpu`, `free -m`, `df -h` и сохраняет в файл — потом видно, что происходило в момент проблемы.
+- Для истории нагрузки за сутки лучше `sar` (пакет sysstat) или мониторинг — Prometheus и node_exporter.
+```
+
 ## Тест
 
 ### Что показывают три числа load average?

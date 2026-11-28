@@ -120,6 +120,84 @@ kubectl describe hpa web
 - [ ] Настроить `behavior` с быстрым масштабированием вверх и медленным вниз
 - [ ] Прочитать документацию KEDA и описать, как масштабировать воркер по длине очереди
 
+## Лаборатория
+
+Кластер — k3s на стенде, metrics-server работает: `kubectl top pods -A`.
+
+```bash lib
+# Kubernetes на стенде — k3s (один узел). root работает с /etc/rancher/k3s/k3s.yaml, ученик — со своим ~/.kube/config
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# lab_kns имя — чистый namespace задачи (старый удаляется вместе со всем содержимым)
+lab_kns() {
+  kubectl delete ns "$1" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1
+  kubectl create ns "$1" >/dev/null
+}
+# убрать с узла метки и taint-ы, которые оставляют задачи про размещение подов
+lab_knode() {
+  kubectl taint nodes --all lab-dedicated- >/dev/null 2>&1
+  kubectl label nodes --all disktype- zone- >/dev/null 2>&1
+  true
+}
+# lab_kready ns селектор [секунд] — дождаться готовности подов
+lab_kready() { kubectl -n "$1" wait --for=condition=Ready pod -l "$2" --timeout="${3:-90}s" >/dev/null 2>&1; }
+# lab_kfiles каталог — каталог манифестов ученика (пустой)
+lab_kfiles() { rm -rf "$1"; mkdir -p "$1"; chown -R student:student "$1"; }
+lab_kj() { kubectl "$@" -o json 2>/dev/null; }
+lab_traefik() { kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'; }
+```
+
+```bash setup
+lab_knode
+```
+
+### Автомасштабирование по CPU
+
+В namespace **`lab-hpa`** работает Deployment **`api`** (1 реплика, без запросов ресурсов). Настройте **HorizontalPodAutoscaler** `api`: от **1** до **4** реплик, цель — **60%** загрузки CPU. HPA должен **получать метрики** — значение текущей загрузки в `kubectl get hpa` не должно быть `<unknown>`.
+
+```bash setup
+lab_kns lab-hpa
+kubectl -n lab-hpa create deployment api --image=hashicorp/http-echo:1.0 --port=5678 -- /http-echo "-text=ok" >/dev/null
+kubectl -n lab-hpa rollout status deploy/api --timeout=90s >/dev/null
+```
+
+```bash check
+h=$(lab_kj -n lab-hpa get hpa api) || fail "HPA api нет"
+[ "$(echo "$h" | jq -r .spec.minReplicas)" = 1 ] && [ "$(echo "$h" | jq -r .spec.maxReplicas)" = 4 ] || fail "Реплики HPA: $(echo "$h" | jq -r '"\(.spec.minReplicas)–\(.spec.maxReplicas)"')"
+t=$(echo "$h" | jq -r '[.spec.metrics[]? | select(.resource.name == "cpu") | .resource.target.averageUtilization][0]')
+[ "$t" = 60 ] || fail "Цель по CPU — ${t}%"
+cpu=$(lab_kj -n lab-hpa get deploy api | jq -r '.spec.template.spec.containers[0].resources.requests.cpu // empty')
+[ -n "$cpu" ] || fail "У контейнеров api нет requests.cpu — HPA не от чего считать проценты"
+for i in $(seq 45); do
+  a=$(kubectl -n lab-hpa get hpa api -o jsonpath='{.status.conditions[?(@.type=="ScalingActive")].status}')
+  [ "$a" = True ] && break; sleep 1
+done
+[ "$a" = True ] || fail "HPA не получает метрики: $(kubectl -n lab-hpa get hpa api -o jsonpath='{.status.conditions[?(@.type=="ScalingActive")].message}')"
+ok "HPA api: 1–4 реплики, цель 60% от requests.cpu=$cpu"
+```
+
+```text hint
+1. Создать HPA можно одной командой для Deployment: минимум, максимум и процент загрузки CPU.
+2. Процент считается от запрошенного CPU — без запросов ресурсов HPA не знает, от чего считать, и показывает «unknown». Добавьте Deployment запрос CPU (тогда поды перезапустятся).
+3. Посмотреть состояние HPA и его условия в подробном описании.
+```
+
+```bash solution
+kubectl -n lab-hpa set resources deployment api --requests=cpu=50m,memory=32Mi
+kubectl -n lab-hpa rollout status deploy/api
+kubectl -n lab-hpa autoscale deployment api --min=1 --max=4 --cpu-percent=60
+sleep 30
+kubectl -n lab-hpa get hpa api
+```
+
+```text review
+Эталон: `requests.cpu` у Deployment + `kubectl autoscale deployment api --min=1 --max=4 --cpu-percent=60`.
+
+- HPA раз в 15 секунд берёт метрики у metrics-server и считает `нужно реплик = текущие × текущая загрузка / цель`. Загрузка — в процентах **от requests**, поэтому без requests HPA не работает (`<unknown>`).
+- Масштабирование вниз осторожное: окно стабилизации 5 минут, чтобы не «дёргать» реплики. Настраивается в `behavior`.
+- Кроме CPU и памяти — свои метрики (RPS, длина очереди) через Prometheus Adapter или KEDA (масштабирование по Kafka, RabbitMQ, вплоть до нуля реплик).
+- С HPA уберите `replicas` из манифеста Deployment (или GitOps будет каждый раз возвращать его значение).
+```
+
 ## Тест
 
 ### Что делает HPA?

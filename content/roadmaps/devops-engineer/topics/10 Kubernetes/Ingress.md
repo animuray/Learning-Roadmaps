@@ -132,6 +132,145 @@ spec:
 - [ ] Повторить маршрутизацию через Gateway API с Envoy Gateway или другим контроллером и сравнить с Ingress
 - [ ] Найти в своём (или учебном) кластере, используется ли ingress-nginx, и составить список его аннотаций, которые придётся переносить
 
+## Лаборатория
+
+В кластере k3s работает Ingress-контроллер **Traefik** (IngressClass `traefik`). На стенде у него нет внешнего IP — запросы отправляйте на его ClusterIP: `kubectl -n kube-system get svc traefik`, затем `curl -H 'Host: <имя>' http://<ClusterIP>/...`.
+
+```bash lib
+# Kubernetes на стенде — k3s (один узел). root работает с /etc/rancher/k3s/k3s.yaml, ученик — со своим ~/.kube/config
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# lab_kns имя — чистый namespace задачи (старый удаляется вместе со всем содержимым)
+lab_kns() {
+  kubectl delete ns "$1" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1
+  kubectl create ns "$1" >/dev/null
+}
+# убрать с узла метки и taint-ы, которые оставляют задачи про размещение подов
+lab_knode() {
+  kubectl taint nodes --all lab-dedicated- >/dev/null 2>&1
+  kubectl label nodes --all disktype- zone- >/dev/null 2>&1
+  true
+}
+# lab_kready ns селектор [секунд] — дождаться готовности подов
+lab_kready() { kubectl -n "$1" wait --for=condition=Ready pod -l "$2" --timeout="${3:-90}s" >/dev/null 2>&1; }
+# lab_kfiles каталог — каталог манифестов ученика (пустой)
+lab_kfiles() { rm -rf "$1"; mkdir -p "$1"; chown -R student:student "$1"; }
+lab_kj() { kubectl "$@" -o json 2>/dev/null; }
+lab_traefik() { kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'; }
+```
+
+```bash setup
+lab_knode
+lab_kns lab-ing
+for app in web api; do
+  kubectl -n lab-ing create deployment $app --image=hashicorp/http-echo:1.0 --port=5678 -- /http-echo "-text=$app page" >/dev/null
+  kubectl -n lab-ing expose deployment $app --port=80 --target-port=5678 >/dev/null
+done
+kubectl -n lab-ing rollout status deploy/web --timeout=90s >/dev/null
+kubectl -n lab-ing rollout status deploy/api --timeout=90s >/dev/null
+```
+
+### Сайт по имени хоста
+
+В namespace **`lab-ing`** есть сервисы **`web`** и **`api`** (порт 80). Создайте Ingress **`shop`**, по которому запросы к хосту **`shop.lab`** идут на сервис `web`.
+
+```bash check
+i=$(lab_kj -n lab-ing get ingress shop) || fail "Ingress shop нет"
+echo "$i" | jq -e '.spec.rules[] | select(.host == "shop.lab")' >/dev/null || fail "В Ingress нет правила для хоста shop.lab"
+t=$(lab_traefik)
+for k in $(seq 15); do r=$(curl -s --max-time 3 -H 'Host: shop.lab' http://$t/); [ "$r" = "web page" ] && break; sleep 1; done
+[ "$r" = "web page" ] || fail "Запрос к shop.lab через Traefik отвечает «$(echo "$r" | head -c 60)»"
+ok "shop.lab → web"
+```
+
+```text hint
+1. Каркас Ingress даёт kubectl create ingress с ключом правила «хост/путь=сервис:порт».
+2. Класс Ingress — traefik.
+3. Проверить curl на адрес Traefik с нужным заголовком Host.
+```
+
+```bash solution
+kubectl -n lab-ing create ingress shop --class=traefik --rule="shop.lab/*=web:80"
+t=$(kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}')
+sleep 2
+curl -s -H 'Host: shop.lab' http://$t/
+```
+
+```text review
+Эталон: `kubectl create ingress shop --class=traefik --rule="shop.lab/*=web:80"`.
+
+- Ingress — правила HTTP-маршрутизации (хост, путь → сервис), а работу делает **контроллер**: Traefik (в k3s), ingress-nginx, HAProxy, облачные. Без контроллера Ingress — просто запись в API.
+- Один внешний адрес (LoadBalancer контроллера) обслуживает все сайты кластера; DNS всех имён указывает на него.
+- HTTPS: секция `tls` с Secret-сертификатом; сертификаты Let's Encrypt выписывает cert-manager по аннотации.
+- Новый стандарт — Gateway API (`Gateway`, `HTTPRoute`): гибче и с разделением ролей; Ingress остаётся самым распространённым.
+```
+
+### Маршруты по путям
+
+Расширьте Ingress **`shop`** (хост **`shop.lab`**): запросы с путём, начинающимся на **`/api`**, — на сервис **`api`**, всё остальное — на **`web`**.
+
+```bash setup
+kubectl -n lab-ing create ingress shop --class=traefik --rule="shop.lab/*=web:80" >/dev/null
+```
+
+```bash check
+i=$(lab_kj -n lab-ing get ingress shop) || fail "Ingress shop нет"
+t=$(lab_traefik)
+for k in $(seq 15); do a=$(curl -s --max-time 3 -H 'Host: shop.lab' http://$t/api/orders); [ "$a" = "api page" ] && break; sleep 1; done
+[ "$a" = "api page" ] || fail "shop.lab/api/orders отвечает «$(echo "$a" | head -c 60)» — не сервис api"
+w=$(curl -s --max-time 3 -H 'Host: shop.lab' http://$t/catalog)
+[ "$w" = "web page" ] || fail "shop.lab/catalog отвечает «$(echo "$w" | head -c 60)» — не сервис web"
+ok "shop.lab/api → api, остальное → web"
+```
+
+```text hint
+1. В правиле хоста — список путей. Тип пути «префикс» совпадает со всеми путями, которые начинаются с указанного.
+2. Более длинный (конкретный) префикс побеждает — порядок путей не важен.
+3. Изменить можно манифест и применить заново или отредактировать объект в кластере.
+```
+
+```bash solution
+mkdir -p ~/k8s
+cat > ~/k8s/shop-ingress.yaml <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  namespace: lab-ing
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: shop.lab
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 80
+EOF
+kubectl apply -f ~/k8s/shop-ingress.yaml
+t=$(kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}')
+sleep 2
+curl -s -H 'Host: shop.lab' http://$t/api/orders; echo; curl -s -H 'Host: shop.lab' http://$t/
+```
+
+```text review
+Эталон — в «Решении»: пути `/api` и `/` с `pathType: Prefix`.
+
+- `Prefix` совпадает по сегментам пути: `/api` ловит `/api` и `/api/orders`, но не `/apiv2`. `Exact` — только точное совпадение.
+- Путь передаётся бэкенду как есть (`/api/orders`). Если приложение ждёт `/orders`, нужна перезапись пути — у каждого контроллера своя аннотация или Middleware (Traefik `StripPrefix`).
+- Классическая схема: фронтенд на `/`, API на `/api` под одним доменом — нет CORS и проще с cookie.
+```
+
 ## Тест
 
 ### Чем Ingress отличается от Ingress Controller?

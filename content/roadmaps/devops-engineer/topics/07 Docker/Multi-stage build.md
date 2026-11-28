@@ -112,6 +112,161 @@ RUN go test ./...
 - [ ] Добавить этап `test` и собрать его отдельно через `--target test`
 - [ ] Посмотреть `docker history` итогового образа и убедиться, что слоёв этапа build там нет
 
+## Лаборатория
+
+В `~/goapp` — веб-сервер на Go (`main.go`, только стандартная библиотека): на порту 8080 отвечает `hello from go`. Образ для сборки — `golang:1.23-alpine` (уже скачан).
+
+```bash setup
+lab_drm() { docker rm -f "$@" >/dev/null 2>&1; true; }
+# образ есть локально или скачивается (если ученик почистил образы через prune)
+lab_img() { for i in "$@"; do docker image inspect "$i" >/dev/null 2>&1 || docker pull -q "$i" >/dev/null; done; }
+# lab_wait_http URL [строка] — дождаться ответа
+lab_wait_http() { for i in $(seq 60); do curl -s --max-time 1 "$1" 2>/dev/null | grep -q "${2:-.}" && return 0; sleep 0.25; done; return 1; }
+lab_img golang:1.23-alpine alpine:3.20
+rm -rf /home/student/goapp && mkdir -p /home/student/goapp
+cat > /home/student/goapp/main.go <<'EOF'
+package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+func hello() string { return "hello from go" }
+
+func main() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, hello()) })
+	http.ListenAndServe(":8080", nil)
+}
+EOF
+cat > /home/student/goapp/main_test.go <<'EOF'
+package main
+
+import "testing"
+
+func TestHello(t *testing.T) {
+	if hello() != "hello from go" {
+		t.Fatal("unexpected greeting")
+	}
+}
+EOF
+printf 'module goapp\n\ngo 1.23\n' > /home/student/goapp/go.mod
+chown -R student:student /home/student/goapp
+```
+
+### Маленький образ из двух этапов
+
+Одноэтапный образ на `golang:1.23-alpine` весит ~250 МБ — в нём весь компилятор. Напишите **multi-stage** `~/goapp/Dockerfile`: первый этап собирает бинарник, итоговый содержит **только** его. Соберите образ **`goapp:1.0`** размером **меньше 30 МБ** и запустите контейнер **`goapp`** с портом **8180** хоста → 8080.
+
+```bash setup
+lab_drm goapp
+docker rmi -f goapp:1.0 >/dev/null 2>&1
+rm -f /home/student/goapp/Dockerfile
+true
+```
+
+```bash check
+docker image inspect goapp:1.0 >/dev/null 2>&1 || fail "Образа goapp:1.0 нет"
+s=$(( $(docker image inspect -f '{{.Size}}' goapp:1.0) / 1024 / 1024 ))
+[ $s -lt 30 ] || fail "goapp:1.0 весит $s МБ"
+[ "$(grep -ciE '^\s*FROM\s' /home/student/goapp/Dockerfile)" -ge 2 ] || fail "В Dockerfile один этап"
+docker run --rm --entrypoint sh goapp:1.0 -c 'command -v go' >/dev/null 2>&1 && fail "В итоговом образе есть компилятор go"
+[ "$(docker inspect -f '{{.State.Running}}' goapp 2>/dev/null)" = true ] || fail "Контейнер goapp не запущен"
+r=$(curl -s --max-time 3 http://127.0.0.1:8180/)
+[ "$r" = "hello from go" ] || fail "localhost:8180 отвечает «$r»"
+ok "goapp:1.0 — $s МБ, отвечает: $r"
+```
+
+```text hint
+1. Первый этап — образ с компилятором, у этапа есть имя. В нём скопировать исходники и собрать статический бинарник (без зависимости от системной библиотеки C — переменная окружения для компилятора Go).
+2. Второй этап — минимальный образ (alpine или вообще пустой). В него скопировать готовый бинарник из первого этапа по его имени.
+3. Указать команду запуска, собрать, запустить, проверить.
+```
+
+```bash solution
+cat > ~/goapp/Dockerfile <<'EOF'
+FROM golang:1.23-alpine AS build
+WORKDIR /src
+COPY go.mod .
+COPY *.go .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/app .
+
+FROM alpine:3.20
+COPY --from=build /out/app /usr/local/bin/app
+USER 10001
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/app"]
+EOF
+docker build -q -t goapp:1.0 ~/goapp
+docker run -d --name goapp -p 8180:8080 goapp:1.0
+sleep 1
+curl -s localhost:8180; echo
+docker images goapp
+```
+
+```text review
+Эталон: `FROM golang AS build` → `go build` → `FROM alpine` + `COPY --from=build`.
+
+- В итоговый образ попадает только то, что скопировано явно. Компилятор, исходники, кэш модулей остаются в промежуточном этапе.
+- `CGO_ENABLED=0` — статический бинарник, работает хоть в `FROM scratch` (0 МБ сверху), но тогда нет оболочки, сертификатов (`/etc/ssl/certs` придётся копировать) и часовых поясов. Компромисс — `gcr.io/distroless/static`.
+- Меньше образ — быстрее скачивание при деплое и меньше уязвимостей у сканеров (trivy).
+- Так же для фронтенда: этап `node` собирает статику, итоговый `nginx` её раздаёт.
+```
+
+### Этап с тестами
+
+Добавьте в `~/goapp/Dockerfile` отдельный этап **`test`**, который запускает тесты (`go test ./...`), и соберите **только этот этап** в образ **`goapp:test`**. Итоговый образ при обычной сборке должен по-прежнему собираться.
+
+```bash setup
+docker rmi -f goapp:test >/dev/null 2>&1
+cat > /home/student/goapp/Dockerfile <<'EOF'
+FROM golang:1.23-alpine AS build
+WORKDIR /src
+COPY go.mod .
+COPY *.go .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/app .
+
+FROM alpine:3.20
+COPY --from=build /out/app /usr/local/bin/app
+USER 10001
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/app"]
+EOF
+chown student:student /home/student/goapp/Dockerfile
+```
+
+```bash check
+f=/home/student/goapp/Dockerfile
+grep -qiE '^\s*FROM\s+\S+\s+AS\s+test\s*$' $f || fail "В Dockerfile нет этапа с именем test"
+docker image inspect goapp:test >/dev/null 2>&1 || fail "Образа goapp:test нет"
+docker history --no-trunc goapp:test 2>/dev/null | grep -q 'go test' || fail "Образ goapp:test собран не из этапа с тестами"
+su - student -c 'docker build -q -t lab-goapp-final ~/goapp' >/dev/null 2>&1 || fail "Обычная сборка Dockerfile сломалась"
+docker run --rm --entrypoint sh lab-goapp-final -c 'command -v go' >/dev/null 2>&1 && fail "Итоговый образ теперь собирается из этапа с компилятором — этап test должен идти не последним"
+docker rmi -f lab-goapp-final >/dev/null 2>&1
+ok "goapp:test собран из этапа test"
+```
+
+```text hint
+1. Новый этап можно унаследовать от этапа сборки по его имени и выполнить в нём запуск тестов.
+2. Порядок этапов важен: обычная сборка без указания цели собирает последний этап — итоговый образ должен остаться последним.
+3. У команды сборки есть ключ «собрать до указанного этапа».
+```
+
+```bash solution
+cd ~/goapp
+awk '/^FROM alpine/ && !done {print "FROM build AS test\nRUN go test -v ./...\n"; done=1} {print}' Dockerfile > Dockerfile.new && mv Dockerfile.new Dockerfile
+cat Dockerfile
+docker build -q --target test -t goapp:test .
+```
+
+```text review
+Эталон: `FROM build AS test` + `RUN go test ./...`, сборка `docker build --target test -t goapp:test .`.
+
+- `--target` собирает этапы до указанного включительно — в CI так запускают линтеры и тесты в том же окружении, что и сборка, а потом собирают итоговый образ (BuildKit пропускает этапы, от которых итоговый не зависит).
+- Если этап test поставить последним, обычный `docker build` начнёт выпускать в прод образ с компилятором и тестами.
+- Ещё приёмы: этап `deps` с загрузкой зависимостей (кэшируется отдельно), `RUN --mount=type=cache,target=/root/.cache/go-build` — кэш компиляции между сборками.
+```
+
 ## Тест
 
 ### Зачем нужен multi-stage build?

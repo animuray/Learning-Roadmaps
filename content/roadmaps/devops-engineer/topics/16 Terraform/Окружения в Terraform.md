@@ -178,6 +178,108 @@ Workspaces удобны для **временных одинаковых коп�
 - [ ] Обновить версию модуля сначала в dev, проверить и только потом в prod
 - [ ] Настроить ночной plan по расписанию и сделать ручное изменение в консоли, чтобы увидеть обнаружение дрейфа
 
+## Лаборатория
+
+Ресурсы — контейнеры Docker (провайдер `kreuzwerker/docker`).
+
+```bash lib
+# Terraform 1.x на стенде; провайдеры скачиваются из registry.terraform.io (кэш — ~/.terraform.d/plugin-cache).
+# Инфраструктура в задачах — файлы (hashicorp/local) и контейнеры Docker (kreuzwerker/docker).
+lab_tf() { su - student -c "cd $1 && terraform $2" > /tmp/lab-tf.log 2>&1; }
+# план без изменений: 0 — ничего не меняется, 2 — есть изменения, 1 — ошибка
+lab_tfclean() { su - student -c "cd $1 && terraform plan -detailed-exitcode -input=false -lock=false" > /tmp/lab-tf.log 2>&1; echo $?; }
+lab_tflog() { sed 's/\x1b\[[0-9;]*m//g' /tmp/lab-tf.log | grep -E 'Error|will be|must be|#' | head -3 | tr '\n' ' ' | cut -c1-250; }
+lab_tfdir() { rm -rf "$1"; mkdir -p "$1"; chown -R student:student "$(dirname "$1")"; }
+lab_drm() { docker rm -f "$@" >/dev/null 2>&1; true; }
+# образ есть локально или скачивается (если ученик почистил образы через prune)
+lab_img() { for i in "$@"; do docker image inspect "$i" >/dev/null 2>&1 || docker pull -q "$i" >/dev/null; done; }
+# lab_wait_http URL [строка] — дождаться ответа
+lab_wait_http() { for i in $(seq 60); do curl -s --max-time 1 "$1" 2>/dev/null | grep -q "${2:-.}" && return 0; sleep 0.25; done; return 1; }
+```
+
+### Dev и prod из одного кода
+
+В `~/tf/envs` опишите **один** код для двух окружений на **workspaces** Terraform:
+
+- контейнер `env-<имя workspace>` (nginx);
+- внешний порт зависит от окружения: **dev — 8193**, **prod — 8194** (через карту по `terraform.workspace`).
+
+Создайте workspaces **`dev`** и **`prod`** и примените конфигурацию в каждом. У каждого окружения должен быть **свой** state.
+
+```bash setup
+lab_tfdir /home/student/tf/envs
+docker rm -f env-dev env-prod env-default >/dev/null 2>&1; true
+```
+
+```bash check
+d=/home/student/tf/envs
+ws=$(su - student -c "cd $d && terraform workspace list" 2>/dev/null | tr -d ' *')
+echo "$ws" | grep -qx dev && echo "$ws" | grep -qx prod || fail "Нет workspaces dev и prod (есть: $(echo $ws))"
+grep -q 'terraform.workspace' $d/*.tf || fail "Код не использует terraform.workspace"
+for p in dev:8193 prod:8194; do
+  e=${p%%:*}; port=${p#*:}
+  [ "$(docker inspect -f '{{.State.Running}}' env-$e 2>/dev/null)" = true ] || fail "Контейнер env-$e не запущен"
+  [ "$(docker port env-$e 80/tcp | head -1 | awk -F: '{print $NF}')" = $port ] || fail "env-$e опубликован не на порту $port"
+  [ -f $d/terraform.tfstate.d/$e/terraform.tfstate ] || fail "Нет отдельного state для $e"
+done
+docker inspect env-default >/dev/null 2>&1 && fail "Создан контейнер env-default — конфигурация применена в workspace default"
+ok "dev → env-dev:8193, prod → env-prod:8194, state раздельный"
+```
+
+```text hint
+1. Локальная переменная — карта «окружение → порт»; значение для текущего окружения берётся по ключу из имени workspace.
+2. Имя контейнера тоже строится из имени workspace.
+3. Команды workspace: создать новый (он сразу становится текущим), переключиться, показать список. Применять — в каждом нужном workspace отдельно.
+```
+
+```bash solution
+cd ~/tf/envs
+cat > main.tf <<'EOF'
+terraform {
+  required_providers {
+    docker = { source = "kreuzwerker/docker", version = "~> 3.0" }
+  }
+}
+
+provider "docker" {}
+
+locals {
+  ports = {
+    dev  = 8193
+    prod = 8194
+  }
+}
+
+resource "docker_image" "nginx" {
+  name         = "nginx:1.27-alpine"
+  keep_locally = true
+}
+
+resource "docker_container" "app" {
+  name  = "env-${terraform.workspace}"
+  image = docker_image.nginx.image_id
+  ports {
+    internal = 80
+    external = local.ports[terraform.workspace]
+  }
+}
+EOF
+terraform init -input=false
+terraform workspace new dev
+terraform apply -auto-approve
+terraform workspace new prod
+terraform apply -auto-approve
+terraform workspace list
+```
+
+```text review
+Эталон: `locals { ports = {...} }` + `terraform.workspace` → `workspace new dev` / `apply` → `workspace new prod` / `apply`.
+
+- Workspaces — отдельные state для одного кода. Удобно для одинаковых окружений, но опасно: легко сделать `apply` «не в том» workspace, а различия окружений прячутся в картах.
+- Частая альтернатива — **каталоги на окружение** (`envs/dev/`, `envs/prod/`), каждый вызывает общие модули со своими значениями и своим backend. Различия видны явно, права на prod можно разделить. Terragrunt автоматизирует эту схему.
+- Обращение к несуществующему ключу карты (`local.ports["stage"]`) — ошибка плана, и это хорошо: забытое окружение не создастся «как-нибудь».
+```
+
 ## Тест
 
 ### Чем должны отличаться окружения dev и prod в Terraform?

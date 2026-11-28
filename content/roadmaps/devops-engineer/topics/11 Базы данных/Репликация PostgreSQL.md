@@ -158,6 +158,87 @@ CREATE SUBSCRIPTION app_sub CONNECTION 'host=old-db dbname=app user=replicator' 
 - [ ] Настроить логическую репликацию одной таблицы между двумя базами (по желанию — между разными мажорными версиями)
 - [ ] Прочитать документацию Patroni и описать, как он предотвращает split-brain
 
+## Лаборатория
+
+Главный сервер — кластер `16/main` на порту 5432. Реплику поднимите **вторым кластером на этом же стенде** — `16/replica` на порту **5433** (в жизни это отдельный сервер; команды те же).
+
+```bash lib
+# PostgreSQL 16 на стенде: кластер 16/main, порт 5432. Администратор — системный пользователь postgres.
+lab_psql() { sudo -u postgres psql -qXtA "$@"; }
+# lab_shopdb — учебная база shop: customers, orders (крупная), audit_log (самая крупная), settings
+lab_shopdb() {
+  lab_psql -c "DROP DATABASE IF EXISTS shop WITH (FORCE)" -c "CREATE DATABASE shop" >/dev/null
+  lab_psql -d shop >/dev/null <<'EOF'
+CREATE TABLE customers (id serial PRIMARY KEY, name text, city text);
+CREATE TABLE orders (id serial PRIMARY KEY, customer_id int REFERENCES customers, total numeric, status text, created_at timestamptz DEFAULT now());
+CREATE TABLE audit_log (id bigserial PRIMARY KEY, event text, payload text, at timestamptz DEFAULT now());
+CREATE TABLE settings (key text PRIMARY KEY, value text);
+INSERT INTO customers (name, city) SELECT 'customer ' || g, (ARRAY['Москва','Казань','Пермь'])[1 + g % 3] FROM generate_series(1, 2000) g;
+INSERT INTO orders (customer_id, total, status) SELECT 1 + g % 2000, (g % 500) * 10, (ARRAY['new','paid','shipped'])[1 + g % 3] FROM generate_series(1, 30000) g;
+INSERT INTO audit_log (event, payload) SELECT 'event ' || g, repeat(md5(g::text), 8) FROM generate_series(1, 60000) g;
+INSERT INTO settings VALUES ('currency', 'RUB'), ('vat', '20');
+EOF
+}
+```
+
+### Потоковая реплика
+
+Настройте потоковую репликацию:
+
+1. на главном — роль **`replicator`** с правом репликации и паролем `repl-pass` (правило в `pg_hba.conf` для репликации с localhost по паролю уже есть);
+2. кластер **`16/replica`** на порту **5433** — копия главного, сделанная **`pg_basebackup`**, работает как **реплика в режиме восстановления** и получает изменения потоком.
+
+Проверка: на главном в `pg_stat_replication` есть реплика в состоянии `streaming`, а строка, вставленная в главный, появляется на реплике.
+
+```bash setup
+pg_dropcluster 16 replica --stop >/dev/null 2>&1; rm -rf /var/lib/postgresql/16/replica /etc/postgresql/16/replica
+lab_psql -c "DROP ROLE IF EXISTS replicator" >/dev/null
+lab_shopdb
+```
+
+```bash check
+pg_lsclusters | awk '$2 == "replica" && $3 == 5433' | grep -q . || fail "Кластера 16/replica на порту 5433 нет"
+pg_lsclusters | awk '$2 == "replica"' | grep -q online || fail "Кластер 16/replica не запущен"
+[ "$(sudo -u postgres psql -p 5433 -qXtA -c 'select pg_is_in_recovery()' 2>/dev/null)" = t ] || fail "16/replica не в режиме восстановления — это самостоятельный сервер, а не реплика"
+st=$(lab_psql -c "select state from pg_stat_replication where application_name <> '' limit 1")
+[ "$st" = streaming ] || fail "На главном в pg_stat_replication нет реплики в состоянии streaming (сейчас: ${st:-нет записей})"
+[ "$(lab_psql -c "select rolreplication from pg_roles where rolname = 'replicator'")" = t ] || fail "Нет роли replicator с правом репликации"
+mark="probe-$RANDOM$RANDOM"
+lab_psql -d shop -c "INSERT INTO settings VALUES ('$mark', 'x')" >/dev/null
+for i in $(seq 20); do [ "$(sudo -u postgres psql -p 5433 -d shop -qXtA -c "select count(*) from settings where key = '$mark'" 2>/dev/null)" = 1 ] && break; sleep 0.25; done
+[ "$(sudo -u postgres psql -p 5433 -d shop -qXtA -c "select count(*) from settings where key = '$mark'" 2>/dev/null)" = 1 ] || fail "Строка, вставленная в главный, не появилась на реплике"
+lab_psql -d shop -c "DELETE FROM settings WHERE key = '$mark'" >/dev/null
+ok "реплика 5433 streaming, отставание: $(lab_psql -c "select coalesce(replay_lag::text, '0') from pg_stat_replication limit 1")"
+```
+
+```text hint
+1. На главном создать роль с правами входа и репликации.
+2. Создать пустой кластер Debian-утилитой с нужным именем и портом, не запуская его, и очистить его каталог данных.
+3. Залить в этот каталог копию главного утилитой физического бэкапа: от имени роли репликации, с потоковой передачей WAL и ключом, который сам запишет настройки подключения к главному и пометит кластер как реплику.
+4. Запустить кластер-реплику и посмотреть статус репликации на главном.
+```
+
+```bash solution
+sudo -u postgres psql -c "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'repl-pass'"
+sudo pg_createcluster 16 replica -p 5433 >/dev/null
+sudo find /var/lib/postgresql/16/replica -mindepth 1 -delete
+sudo -u postgres env PGPASSWORD=repl-pass pg_basebackup -h 127.0.0.1 -p 5432 -U replicator -D /var/lib/postgresql/16/replica -R -X stream -P
+sudo pg_ctlcluster 16 replica start
+sleep 2
+sudo -u postgres psql -c "select application_name, state, sent_lsn, replay_lsn from pg_stat_replication"
+```
+
+```text review
+Эталон: роль `REPLICATION` → `pg_createcluster 16 replica -p 5433` → `pg_basebackup -R -X stream` в пустой каталог → запуск.
+
+- Ловушка: `sudo rm -rf /var/lib/postgresql/16/replica/*` не очистит каталог — звёздочку раскрывает **ваша** оболочка, а у вас нет прав на чтение каталога postgres. Нужно `sudo find ... -mindepth 1 -delete` или `sudo -u postgres sh -c 'rm -rf .../*'`.
+- `pg_basebackup` копирует весь кластер на уровне файлов; `-R` создаёт `standby.signal` и `primary_conninfo` в `postgresql.auto.conf` — сервер стартует как реплика.
+- Реплика — read-only: на ней можно читать (отчёты, аналитика) и с неё переключаются при аварии (`pg_ctlcluster 16 replica promote` / `SELECT pg_promote()`).
+- Мониторинг: `pg_stat_replication` на главном (`state`, `*_lag`), `pg_stat_wal_receiver` на реплике. Отставание растёт — тяжёлые запросы на реплике или узкий канал.
+- Репликация — **не бэкап**: `DROP TABLE` на главном мгновенно уедет на реплику. Автоматическое переключение и кластер — Patroni + etcd.
+- Слоты репликации (`-S slot --create-slot`) не дадут главному удалить WAL, пока реплика его не забрала, — но отставшая навсегда реплика со слотом заполнит диск главного.
+```
+
 ## Тест
 
 ### Что передаёт primary реплике при потоковой физической репликации?

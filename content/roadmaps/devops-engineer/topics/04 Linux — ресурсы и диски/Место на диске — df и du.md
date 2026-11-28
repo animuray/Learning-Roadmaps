@@ -81,6 +81,117 @@ sudo find / -xdev -type f -size +500M -exec ls -lh {} \; 2>/dev/null   # бол�
 - [ ] Воспроизвести «удалённый, но открытый файл»: создать большой файл, открыть его процессом, удалить, сравнить `df` и `du`, найти через `lsof +L1`
 - [ ] Посмотреть, сколько места занимают журнал (`journalctl --disk-usage`) и Docker (`docker system df`), если он установлен
 
+## Лаборатория
+
+```bash setup
+export LVM_SUPPRESS_FD_WARNINGS=1
+DISKS=/var/lib/lab-disks
+# Убрать всё, что могли оставить прошлые задачи с дисками: монтирования, массивы, тома, loop-устройства
+lab_disks_reset() {
+  for m in $(findmnt -rn -o TARGET | grep -E '^/mnt/(data|app|busy|raid|xfs-lab|ramcache|lab-[a-z]+)$|^/srv/overlay/merged$' | sort -r); do umount -l "$m"; done
+  mdadm --stop --scan >/dev/null 2>&1
+  for vg in data labvg; do vgremove -qq -ff "$vg" >/dev/null 2>&1; done
+  for l in $(losetup -nO NAME,BACK-FILE 2>/dev/null | awk -v d="$DISKS" 'index($2, d) == 1 {print $1}'); do
+    pvremove -qq -ff "$l" >/dev/null 2>&1; wipefs -qa "$l" >/dev/null 2>&1; losetup -d "$l"
+  done
+  rm -f /dev/lab-*; rm -rf "$DISKS"; mkdir -p "$DISKS"
+  sed -i -E '\#[[:space:]]/mnt/(data|app|raid|xfs-lab|ramcache)[[:space:]]#d' /etc/fstab
+  true
+}
+# lab_disk имя размер → пустой «диск» /dev/lab-имя (ссылка на loop-устройство)
+lab_disk() {
+  truncate -s "$2" "$DISKS/$1.img"
+  ln -sf "$(losetup -f --show "$DISKS/$1.img")" "/dev/lab-$1"
+}
+```
+
+### Какой каталог съел место
+
+Раздел с данными заполняется. В `/srv/data` четыре каталога: `logs`, `backups`, `cache`, `uploads`. Узнайте, какой из них **занимает больше всего места на диске**, и запишите его имя (только имя каталога) в `~/biggest.txt`.
+
+```bash setup
+rm -rf /srv/data /home/student/biggest.txt
+sizes=($(shuf -n 4 -e 20 35 50 65 80 95))
+i=0
+for n in logs backups cache uploads; do
+  mkdir -p /srv/data/$n/sub
+  s=${sizes[$i]}; i=$((i + 1))
+  fallocate -l ${s}M /srv/data/$n/sub/part1.bin
+  fallocate -l $(( (RANDOM % 5) + 1 ))M /srv/data/$n/part2.bin
+done
+# много мелких файлов: по количеству лидер другой, чем по объёму
+for i in $(seq 1 300); do echo "$i" > /srv/data/logs/small-$i.log; done
+du -s /srv/data/* | sort -n | tail -1 | awk '{print $2}' | xargs basename > /var/lib/lab/biggest
+```
+
+```bash check
+want=$(cat /var/lib/lab/biggest)
+[ -f /home/student/biggest.txt ] || fail "Нет ~/biggest.txt"
+got=$(tr -d '[:space:]' < /home/student/biggest.txt); got=${got%/}; got=${got##*/}
+[ "$got" = "$want" ] || fail "В ~/biggest.txt «$got» — этот каталог занимает не больше всех"
+ok "больше всех занимает /srv/data/$want ($(du -sh /srv/data/$want | cut -f1))"
+```
+
+```text hint
+1. Посчитать суммарный размер каждого каталога первого уровня (не каждого файла): у du есть ключ «итог по аргументу» и ключ «в удобных единицах».
+2. Отсортировать результат по размеру — у sort есть режим, который понимает суффиксы K, M, G.
+```
+
+```bash solution
+du -sh /srv/data/* | sort -h
+du -s /srv/data/* | sort -n | tail -1 | awk '{print $2}' | xargs basename > ~/biggest.txt
+```
+
+```text review
+Эталон: `du -sh /srv/data/* | sort -h`.
+
+- `df` — сколько занято и свободно на **разделе**, `du` — сколько занимают **файлы и каталоги**. Сначала `df -h` (какой раздел полон), потом `du` (кто его съел).
+- По всему разделу: `du -xh --max-depth=1 / | sort -h` (`-x` — не уходить на другие разделы) и спускаться в самый большой каталог. Удобнее — `ncdu -x /`.
+- `du` считает занятые блоки, а `ls -l` — длину файла. Разреженный файл (виртуальный диск, `truncate`) по `ls` может весить гигабайты, а по `du` — ничего.
+```
+
+### Резерв на диске с данными
+
+На отдельном диске для данных, смонтированном в `/mnt/lab-data`, ext4 по умолчанию держит **5% места в резерве** для root — на системном разделе это спасает, а на диске только с данными просто теряется. Уберите резерв полностью, **не отмонтируя** диск и не теряя данные.
+
+```bash setup
+lab_disks_reset
+lab_disk data 200M
+mkfs.ext4 -q -F /dev/lab-data
+mkdir -p /mnt/lab-data
+mount /dev/lab-data /mnt/lab-data
+echo "важные данные" > /mnt/lab-data/keep.txt
+```
+
+```bash check
+dev=$(findmnt -no SOURCE /mnt/lab-data) || fail "/mnt/lab-data не смонтирован"
+grep -q "важные данные" /mnt/lab-data/keep.txt 2>/dev/null || fail "Пропали данные с диска"
+r=$(tune2fs -l "$dev" | awk -F: '/^Reserved block count/ {gsub(/ /, "", $2); print $2}')
+[ "$r" = 0 ] || fail "Зарезервировано блоков: $r"
+ok "резерв убран: $(df -h --output=size,avail /mnt/lab-data | tail -1)"
+```
+
+```text hint
+1. Узнать устройство, смонтированное в каталог.
+2. У файловых систем ext есть утилита для изменения параметров уже созданной ФС, в том числе процента зарезервированных блоков. Работает на смонтированной ФС.
+3. Сравнить «доступно» в df до и после.
+```
+
+```bash solution
+dev=$(findmnt -no SOURCE /mnt/lab-data)
+df -h /mnt/lab-data
+sudo tune2fs -m 0 "$dev"
+df -h /mnt/lab-data
+```
+
+```text review
+Эталон: `sudo tune2fs -m 0 <устройство>`.
+
+- Резерв нужен на **корневом** разделе: когда пользователи забили диск, root и системные службы ещё могут писать логи и войти починить. Поэтому в df `Used + Avail` меньше `Size`.
+- На диске 2 ТБ 5% — это 100 ГБ. Для дисков с данными, бэкапами, Docker-образами резерв уменьшают до 0–1%.
+- `tune2fs -l <устройство>` — все параметры ext4: число inode, резерв, счётчик монтирований, время проверки. Для xfs резерва нет.
+```
+
 ## Тест
 
 ### Какая команда показывает свободное место по всем смонтированным файловым системам в удобном виде?

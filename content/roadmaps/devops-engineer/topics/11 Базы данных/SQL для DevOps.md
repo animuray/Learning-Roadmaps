@@ -147,6 +147,159 @@ VACUUM (VERBOSE, ANALYZE) orders;
 - [ ] Найти 10 самых больших таблиц и самые долгие активные запросы
 - [ ] Выгрузить результат запроса в CSV через `\copy`
 
+## Лаборатория
+
+PostgreSQL 16 на стенде, база **`shop`**. Подключение администратором: `sudo -u postgres psql -d shop`.
+
+```bash lib
+# PostgreSQL 16 на стенде: кластер 16/main, порт 5432. Администратор — системный пользователь postgres.
+lab_psql() { sudo -u postgres psql -qXtA "$@"; }
+# lab_shopdb — учебная база shop: customers, orders (крупная), audit_log (самая крупная), settings
+lab_shopdb() {
+  lab_psql -c "DROP DATABASE IF EXISTS shop WITH (FORCE)" -c "CREATE DATABASE shop" >/dev/null
+  lab_psql -d shop >/dev/null <<'EOF'
+CREATE TABLE customers (id serial PRIMARY KEY, name text, city text);
+CREATE TABLE orders (id serial PRIMARY KEY, customer_id int REFERENCES customers, total numeric, status text, created_at timestamptz DEFAULT now());
+CREATE TABLE audit_log (id bigserial PRIMARY KEY, event text, payload text, at timestamptz DEFAULT now());
+CREATE TABLE settings (key text PRIMARY KEY, value text);
+INSERT INTO customers (name, city) SELECT 'customer ' || g, (ARRAY['Москва','Казань','Пермь'])[1 + g % 3] FROM generate_series(1, 2000) g;
+INSERT INTO orders (customer_id, total, status) SELECT 1 + g % 2000, (g % 500) * 10, (ARRAY['new','paid','shipped'])[1 + g % 3] FROM generate_series(1, 30000) g;
+INSERT INTO audit_log (event, payload) SELECT 'event ' || g, repeat(md5(g::text), 8) FROM generate_series(1, 60000) g;
+INSERT INTO settings VALUES ('currency', 'RUB'), ('vat', '20');
+EOF
+}
+```
+
+### Самая большая таблица
+
+Диск базы растёт. Найдите в базе `shop` таблицу, которая занимает **больше всего места вместе с индексами и TOAST**, и запишите её имя в `~/biggest-table.txt`, а её полный размер в байтах — в `~/biggest-size.txt`.
+
+```bash setup
+lab_shopdb
+rm -f /home/student/biggest-table.txt /home/student/biggest-size.txt
+```
+
+```bash check
+want=$(lab_psql -d shop -c "select relname from pg_stat_user_tables order by pg_total_relation_size(relid) desc limit 1")
+size=$(lab_psql -d shop -c "select pg_total_relation_size('$want')")
+[ -f /home/student/biggest-table.txt ] || fail "Нет ~/biggest-table.txt"
+got=$(tr -d '[:space:]' < /home/student/biggest-table.txt); got=${got#public.}
+[ "$got" = "$want" ] || fail "В ~/biggest-table.txt «$got» — это не самая большая таблица"
+[ -f /home/student/biggest-size.txt ] || fail "Нет ~/biggest-size.txt"
+gs=$(tr -d '[:space:]' < /home/student/biggest-size.txt)
+[[ "$gs" =~ ^[0-9]+$ ]] || fail "В ~/biggest-size.txt должно быть число байт"
+d=$(( gs > size ? gs - size : size - gs )); [ $d -le $(( size / 20 )) ] || fail "Размер $gs байт не совпадает с полным размером таблицы"
+ok "$want: $(lab_psql -d shop -c "select pg_size_pretty(pg_total_relation_size('$want'))")"
+```
+
+```text hint
+1. Список пользовательских таблиц есть в системном представлении статистики.
+2. Полный размер (с индексами и TOAST) считает отдельная функция; для удобного вида — функция «красивый размер».
+3. Отсортировать по размеру и взять первую.
+```
+
+```bash solution
+sudo -u postgres psql -d shop -c "select relname, pg_size_pretty(pg_total_relation_size(relid)) from pg_stat_user_tables order by pg_total_relation_size(relid) desc"
+sudo -u postgres psql -d shop -qXtA -c "select relname from pg_stat_user_tables order by pg_total_relation_size(relid) desc limit 1" > ~/biggest-table.txt
+sudo -u postgres psql -d shop -qXtA -c "select pg_total_relation_size('$(cat ~/biggest-table.txt)')" > ~/biggest-size.txt
+```
+
+```text review
+Эталон: `pg_total_relation_size(relid)` по `pg_stat_user_tables`.
+
+- `pg_relation_size` — только данные таблицы, `pg_indexes_size` — индексы, `pg_total_relation_size` — всё вместе с TOAST (длинные значения хранятся отдельно). Размер базы — `pg_database_size('shop')`, в psql — `\l+` и `\dt+`.
+- Обычные виновники роста: журналы и аудит без ротации (чистят партициями по месяцам: `DROP` старой партиции мгновенно освобождает место), «распухание» (bloat) после массовых UPDATE/DELETE, неиспользуемые индексы (`pg_stat_user_indexes.idx_scan = 0`).
+- `DELETE` не возвращает место системе — только `VACUUM FULL` (блокирует таблицу) или `pg_repack`.
+```
+
+### Зависший запрос
+
+На сервере висит **долгий запрос** от приложения `report-job` — он съедает ресурсы. Найдите его и **завершите**, не перезапуская PostgreSQL и не трогая другие подключения.
+
+```bash setup
+lab_shopdb
+pkill -f 'application_name=report-job' 2>/dev/null; pkill -f 'application_name=web-app' 2>/dev/null
+systemctl stop lab-pg-report lab-pg-web 2>/dev/null; systemctl reset-failed lab-pg-report lab-pg-web 2>/dev/null
+systemd-run -q --unit=lab-pg-report -p User=postgres psql "dbname=shop application_name=report-job" -c "select pg_sleep(100000)"
+systemd-run -q --unit=lab-pg-web -p User=postgres psql "dbname=shop application_name=web-app" -c "select pg_sleep(100000)"
+sleep 1
+lab_psql -c "select pg_postmaster_start_time()" > /var/lib/lab/pg-start
+```
+
+```bash check
+[ "$(lab_psql -c 'select pg_postmaster_start_time()')" = "$(cat /var/lib/lab/pg-start)" ] || fail "PostgreSQL перезапускали — по условию нельзя"
+n=$(lab_psql -c "select count(*) from pg_stat_activity where application_name = 'report-job'")
+[ "$n" = 0 ] || fail "Запрос report-job всё ещё выполняется"
+[ "$(lab_psql -c "select count(*) from pg_stat_activity where application_name = 'web-app'")" = 1 ] || fail "Завершено и подключение web-app — его трогать было не нужно"
+ok "report-job завершён, остальные подключения на месте"
+```
+
+```text hint
+1. Активные подключения и их запросы — в системном представлении активности: имя приложения, состояние, начало запроса, сам запрос, PID.
+2. У PostgreSQL есть функции «отменить запрос» и «завершить подключение» по PID обслуживающего процесса.
+3. Отфильтровать по имени приложения, а не убивать процессы из операционной системы.
+```
+
+```bash solution
+sudo -u postgres psql -c "select pid, application_name, state, now() - query_start as duration, query from pg_stat_activity where state = 'active' order by duration desc"
+sudo -u postgres psql -c "select pg_terminate_backend(pid) from pg_stat_activity where application_name = 'report-job'"
+```
+
+```text review
+Эталон: `pg_stat_activity` → `pg_terminate_backend(pid)` (или мягче — `pg_cancel_backend(pid)`: отменить запрос, оставив подключение).
+
+- Не убивайте процессы postgres через `kill -9`: postmaster сочтёт это аварией и перезапустит **все** подключения с восстановлением.
+- Полезные колонки: `state` (`active`, `idle`, `idle in transaction` — опасные «висящие» транзакции), `wait_event_type` (ждёт блокировку, диск, клиента), `now() - xact_start` — длительность транзакции.
+- Защита на будущее: `statement_timeout` для роли приложения (`ALTER ROLE report SET statement_timeout = '5min'`), `idle_in_transaction_session_timeout`.
+```
+
+```text notes
+kill\s+(-9\s+)?[0-9] => Процесс завершали через kill из системы — для PostgreSQL безопаснее pg_cancel_backend/pg_terminate_backend; kill -9 обслуживающего процесса перезапускает все подключения.
+```
+
+### Кто держит блокировку
+
+Обновление цены в таблице `settings` базы `shop` от приложения `billing` **зависло**: оно ждёт блокировку. Найдите подключение, которое её **держит**, и завершите **именно его** — после этого обновление `billing` должно само выполниться (значение `vat` станет `22`).
+
+```bash setup
+lab_shopdb
+for u in lab-pg-holder lab-pg-billing; do systemctl stop $u 2>/dev/null; systemctl reset-failed $u 2>/dev/null; done
+systemd-run -q --unit=lab-pg-holder -p User=postgres sh -c 'printf "BEGIN;\nUPDATE settings SET value = value WHERE key = '"'"'vat'"'"';\nSELECT pg_sleep(100000);\n" | psql "dbname=shop application_name=admin-console"'
+sleep 1
+systemd-run -q --unit=lab-pg-billing -p User=postgres psql "dbname=shop application_name=billing" -c "UPDATE settings SET value = '22' WHERE key = 'vat'"
+sleep 1
+lab_psql -c "select pg_postmaster_start_time()" > /var/lib/lab/pg-start
+```
+
+```bash check
+[ "$(lab_psql -c 'select pg_postmaster_start_time()')" = "$(cat /var/lib/lab/pg-start)" ] || fail "PostgreSQL перезапускали"
+for i in $(seq 10); do v=$(lab_psql -d shop -c "select value from settings where key = 'vat'"); [ "$v" = 22 ] && break; sleep 0.5; done
+[ "$v" = 22 ] || fail "Обновление billing так и не выполнилось (vat = $v)"
+[ "$(lab_psql -c "select count(*) from pg_stat_activity where application_name = 'admin-console'")" = 0 ] || fail "Подключение, державшее блокировку, всё ещё живо"
+ok "блокировку держал admin-console — завершён, billing обновил vat"
+```
+
+```text hint
+1. В представлении активности у ждущего запроса видно, что он ждёт блокировку (тип события ожидания).
+2. Есть функция, которая по PID ждущего процесса возвращает массив PID тех, кто его блокирует.
+3. Завершить блокирующее подключение и проверить значение.
+```
+
+```bash solution
+sudo -u postgres psql -c "select pid, application_name, state, wait_event_type, pg_blocking_pids(pid) as blocked_by, query from pg_stat_activity where datname = 'shop'"
+sudo -u postgres psql -c "select pg_terminate_backend(b) from pg_stat_activity a, unnest(pg_blocking_pids(a.pid)) b where a.application_name = 'billing'"
+sleep 1
+sudo -u postgres psql -d shop -c "select * from settings"
+```
+
+```text review
+Эталон: `pg_blocking_pids(<PID billing>)` → `pg_terminate_backend(<блокирующий>)`.
+
+- Классика: кто-то открыл транзакцию в консоли (`BEGIN; UPDATE ...`) и ушёл пить кофе — состояние `idle in transaction`. Его блокировки держатся до `COMMIT`/`ROLLBACK`, а за ним выстраивается очередь.
+- Хуже всего, когда в очереди `ALTER TABLE` (миграция): он ждёт эксклюзивную блокировку, и **все** следующие запросы к таблице встают за ним. Поэтому миграциям ставят `SET lock_timeout = '5s'`.
+- Защита: `idle_in_transaction_session_timeout`, короткие транзакции в приложении, мониторинг `pg_locks` и длительности транзакций.
+```
+
 ## Тест
 
 ### Чем опасен запрос DELETE FROM orders без WHERE?

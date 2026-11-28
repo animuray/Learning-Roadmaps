@@ -245,6 +245,121 @@ Argo CD с версии 3 рекомендует именно операторы
 - [ ] Изменить секрет в Vault и убедиться, что Secret в кластере обновился после refreshInterval
 - [ ] (Дополнительно) Настроить database secrets engine для PostgreSQL и получить временного пользователя
 
+## Лаборатория
+
+Vault запущен в **dev-режиме** (служба `lab-vault`): адрес `http://127.0.0.1:8200`, токен администратора — **`root`**. Для работы в терминале: `export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root`. Движок KV v2 смонтирован в `secret/`. (Dev-режим хранит всё в памяти и сразу распечатан — только для учёбы.)
+
+```bash lib
+export VAULT_ADDR=http://127.0.0.1:8200
+# lab_vault — чистый dev-сервер Vault (всё в памяти)
+lab_vault() {
+  systemctl stop lab-vault 2>/dev/null; systemctl reset-failed lab-vault 2>/dev/null
+  systemd-run -q --unit=lab-vault vault server -dev -dev-root-token-id=root -dev-listen-address=127.0.0.1:8200
+  for i in $(seq 40); do VAULT_TOKEN=root vault status >/dev/null 2>&1 && return 0; sleep 0.25; done
+}
+lab_v() { VAULT_TOKEN=root vault "$@" 2>/dev/null; }
+```
+
+### Секрет и доступ только на чтение
+
+1. Сохраните в Vault секрет **`secret/shop/db`** с полями `username=app` и `password=S3cret-vault`.
+2. Создайте политику **`shop-read`**: **только чтение** секретов под `secret/shop/` (KV v2).
+3. Выпустите токен с политикой `shop-read` (без политики `default` не обойтись — она есть всегда) на **1 час** и сохраните его в `~/shop-token.txt`.
+
+С этим токеном приложение должно читать `secret/shop/db`, но не менять его и не видеть `secret/billing/`.
+
+```bash setup
+lab_vault
+lab_v kv put secret/billing/stripe api_key=sk-live-123 >/dev/null
+rm -f /home/student/shop-token.txt
+```
+
+```bash check
+lab_v kv get -format=json secret/shop/db | jq -e '.data.data.username == "app" and .data.data.password == "S3cret-vault"' >/dev/null || fail "В secret/shop/db нет username=app и password=S3cret-vault"
+lab_v policy read shop-read >/dev/null || fail "Политики shop-read нет"
+[ -f /home/student/shop-token.txt ] || fail "Нет ~/shop-token.txt"
+t=$(tr -d '[:space:]' < /home/student/shop-token.txt)
+info=$(VAULT_TOKEN=$t vault token lookup -format=json 2>/dev/null) || fail "Токен из ~/shop-token.txt не действителен"
+echo "$info" | jq -e '.data.policies | index("shop-read")' >/dev/null || fail "У токена нет политики shop-read"
+echo "$info" | jq -e '.data.policies | index("root")' >/dev/null && fail "Это токен root — приложению нужен токен с минимальными правами"
+ttl=$(echo "$info" | jq -r .data.creation_ttl)
+[ "$ttl" -le 3600 ] && [ "$ttl" -gt 0 ] || fail "Срок жизни токена — $ttl с, нужен 1 час"
+VAULT_TOKEN=$t vault kv get secret/shop/db >/dev/null 2>&1 || fail "С токеном shop-read не читается secret/shop/db"
+VAULT_TOKEN=$t vault kv put secret/shop/db password=hacked >/dev/null 2>&1 && fail "С токеном shop-read можно изменить секрет"
+VAULT_TOKEN=$t vault kv get secret/billing/stripe >/dev/null 2>&1 && fail "С токеном shop-read видны секреты billing"
+ok "токен shop-read: читает secret/shop/*, не пишет, не видит billing"
+```
+
+```text hint
+1. Записать секрет в KV-движок командой kv put с полями «ключ=значение».
+2. Политика — HCL-файл: путь и разрешения. У KV v2 данные лежат по пути с вставкой data/ после имени движка; для чтения нужны права read (и при желании list для metadata/).
+3. Создать токен с политикой и сроком жизни, вывести только сам токен в файл.
+4. Проверить: войти с этим токеном (переменная окружения) и попробовать прочитать и записать.
+```
+
+```bash solution
+export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root
+vault kv put secret/shop/db username=app password=S3cret-vault
+cat > /tmp/shop-read.hcl <<'EOF'
+path "secret/data/shop/*" {
+  capabilities = ["read"]
+}
+path "secret/metadata/shop/*" {
+  capabilities = ["list", "read"]
+}
+EOF
+vault policy write shop-read /tmp/shop-read.hcl
+vault token create -policy=shop-read -ttl=1h -field=token > ~/shop-token.txt
+VAULT_TOKEN=$(cat ~/shop-token.txt) vault kv get secret/shop/db
+```
+
+```text review
+Эталон — в «Решении»: `kv put` → политика на `secret/data/shop/*` → `vault token create -policy=shop-read -ttl=1h`.
+
+- Политика по умолчанию — «ничего нельзя»; права выдаются по путям. В KV v2 путь в политике — с `data/` (содержимое) и `metadata/` (версии, список).
+- Root-токен — только для первичной настройки, в работе его отзывают. Приложения входят своими способами аутентификации: **AppRole** (role_id + secret_id), **Kubernetes auth** (по токену ServiceAccount пода), JWT/OIDC из CI — без долгоживущих паролей.
+- Короткие TTL и аудит (`vault audit enable file ...`) — каждое чтение секрета видно в журнале.
+- Ещё сильнее — **динамические секреты**: движок database выдаёт приложению временного пользователя PostgreSQL на час и сам его удаляет.
+```
+
+### Версии секрета
+
+Пароль базы ротировали: в `secret/shop/db` записали новую версию, и приложение сломалось. Нужно срочно узнать **предыдущий** пароль. Найдите, какое значение `password` было **в версии 1** секрета `secret/shop/db`, и запишите его в `~/old-password.txt`. Текущую версию не трогайте.
+
+```bash setup
+lab_vault
+old="Old-$(tr -dc a-z0-9 </dev/urandom | head -c 8)"; echo "$old" > /var/lib/lab/vault-old
+lab_v kv put secret/shop/db username=app password="$old" >/dev/null
+lab_v kv put secret/shop/db username=app password="New-$(tr -dc a-z0-9 </dev/urandom | head -c 8)" >/dev/null
+lab_v kv get -format=json secret/shop/db | jq -r .data.metadata.version > /var/lib/lab/vault-ver
+rm -f /home/student/old-password.txt
+```
+
+```bash check
+[ -f /home/student/old-password.txt ] || fail "Нет ~/old-password.txt"
+[ "$(tr -d '[:space:]' < /home/student/old-password.txt)" = "$(cat /var/lib/lab/vault-old)" ] || fail "В ~/old-password.txt не пароль из версии 1"
+[ "$(lab_v kv get -format=json secret/shop/db | jq -r .data.metadata.version)" = "$(cat /var/lib/lab/vault-ver)" ] || fail "Секрет изменён — появилась новая версия (откат или запись)"
+ok "пароль версии 1 найден, текущая версия не тронута"
+```
+
+```text hint
+1. KV v2 хранит историю версий: метаданные секрета показывают, сколько их и когда созданы.
+2. У команды чтения есть ключ номера версии и ключ «вывести только одно поле».
+```
+
+```bash solution
+export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root
+vault kv metadata get secret/shop/db
+vault kv get -version=1 -field=password secret/shop/db > ~/old-password.txt
+```
+
+```text review
+Эталон: `vault kv metadata get` → `vault kv get -version=1 -field=password secret/shop/db`.
+
+- KV v2 хранит версии (по умолчанию 10, `max_versions`): можно прочитать старую, откатиться `vault kv rollback -version=1` (создаёт новую версию со старыми данными), удалить версию с возможностью восстановления (`delete`/`undelete`) или безвозвратно (`destroy`).
+- Ротация без простоя: приложение должно перечитывать секрет (Vault Agent или External Secrets сами обновят файл/Secret), а старый пароль некоторое время продолжает работать на стороне базы.
+```
+
 ## Тест
 
 ### Почему секреты не хранят в Git, даже в приватном репозитории?

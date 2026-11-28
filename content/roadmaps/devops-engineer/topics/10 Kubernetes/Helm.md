@@ -197,6 +197,194 @@ helm package ./myapp && helm push myapp-0.3.0.tgz oci://registry.gitlab.com/team
 - [ ] Добавить аннотацию `checksum/config`, изменить ConfigMap в values и убедиться, что поды пересоздались
 - [ ] Упаковать чарт и выгрузить его в OCI-реестр GitLab (или локальный registry)
 
+## Лаборатория
+
+Helm 3 установлен; кластер — k3s на стенде. Чарты в задачах — локальные (без интернета).
+
+```bash lib
+# Kubernetes на стенде — k3s (один узел). root работает с /etc/rancher/k3s/k3s.yaml, ученик — со своим ~/.kube/config
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# lab_kns имя — чистый namespace задачи (старый удаляется вместе со всем содержимым)
+lab_kns() {
+  kubectl delete ns "$1" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1
+  kubectl create ns "$1" >/dev/null
+}
+# убрать с узла метки и taint-ы, которые оставляют задачи про размещение подов
+lab_knode() {
+  kubectl taint nodes --all lab-dedicated- >/dev/null 2>&1
+  kubectl label nodes --all disktype- zone- >/dev/null 2>&1
+  true
+}
+# lab_kready ns селектор [секунд] — дождаться готовности подов
+lab_kready() { kubectl -n "$1" wait --for=condition=Ready pod -l "$2" --timeout="${3:-90}s" >/dev/null 2>&1; }
+# lab_kfiles каталог — каталог манифестов ученика (пустой)
+lab_kfiles() { rm -rf "$1"; mkdir -p "$1"; chown -R student:student "$1"; }
+lab_kj() { kubectl "$@" -o json 2>/dev/null; }
+lab_traefik() { kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'; }
+# lab_chart каталог — учебный чарт «web» (Deployment + Service), версия образа и реплики — из values
+lab_chart() {
+  rm -rf "$1"; mkdir -p "$1/templates"; chown student:student "$(dirname "$1")"
+  cat > "$1/Chart.yaml" <<'EOF'
+apiVersion: v2
+name: web
+version: 0.1.0
+appVersion: "1.0"
+EOF
+  cat > "$1/values.yaml" <<'EOF'
+replicaCount: 1
+message: "hello from helm"
+service:
+  port: 80
+EOF
+  cat > "$1/templates/deployment.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-web
+  labels:
+    app: {{ .Release.Name }}-web
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-web
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-web
+    spec:
+      containers:
+        - name: web
+          image: hashicorp/http-echo:1.0
+          args: ["-text={{ .Values.message }}"]
+          ports:
+            - containerPort: 5678
+EOF
+  cat > "$1/templates/service.yaml" <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-web
+spec:
+  selector:
+    app: {{ .Release.Name }}-web
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: 5678
+EOF
+  chown -R student:student "$1"
+}
+```
+
+```bash setup
+lab_knode
+```
+
+### Установить релиз со своими значениями
+
+В `~/charts/web` лежит чарт. Установите его как релиз **`shop`** в namespace **`lab-helm`** с **2 репликами** и сообщением **`shop v1`** — значения передайте **файлом** `~/charts/shop-values.yaml`, не правя сам чарт.
+
+```bash setup
+lab_kns lab-helm
+helm -n lab-helm uninstall shop >/dev/null 2>&1; true
+lab_chart /home/student/charts/web
+rm -f /home/student/charts/shop-values.yaml
+md5sum /home/student/charts/web/values.yaml > /var/lib/lab/helm-values.md5
+```
+
+```bash check
+md5sum -c --quiet /var/lib/lab/helm-values.md5 >/dev/null 2>&1 || fail "Изменён values.yaml самого чарта — значения нужно передавать снаружи"
+[ -f /home/student/charts/shop-values.yaml ] || fail "Нет ~/charts/shop-values.yaml"
+st=$(helm -n lab-helm status shop -o json 2>/dev/null | jq -r .info.status) || true
+[ "$st" = deployed ] || fail "Релиза shop в lab-helm нет или он не deployed ($st)"
+v=$(helm -n lab-helm get values shop -o json)
+[ "$(echo "$v" | jq -r .replicaCount)" = 2 ] && [ "$(echo "$v" | jq -r .message)" = "shop v1" ] || fail "Значения релиза: $v"
+kubectl -n lab-helm rollout status deploy/shop-web --timeout=90s >/dev/null 2>&1 || fail "Deployment shop-web не раскатился"
+[ "$(lab_kj -n lab-helm get deploy shop-web | jq -r .status.readyReplicas)" = 2 ] || fail "Готовых реплик не 2"
+ok "релиз shop: $(helm -n lab-helm list -o json | jq -r '.[0] | "\(.chart) rev \(.revision)"')"
+```
+
+```text hint
+1. Создать файл значений: только то, что отличается от значений чарта по умолчанию.
+2. Установка релиза: имя, путь к чарту, namespace и ключ «файл значений».
+3. Посмотреть, с какими значениями установлен релиз, — подкоманда получения значений.
+```
+
+```bash solution
+printf 'replicaCount: 2\nmessage: "shop v1"\n' > ~/charts/shop-values.yaml
+helm template shop ~/charts/web -f ~/charts/shop-values.yaml | head -30
+helm install shop ~/charts/web -n lab-helm -f ~/charts/shop-values.yaml
+helm -n lab-helm get values shop
+kubectl -n lab-helm rollout status deploy/shop-web
+```
+
+```text review
+Эталон: `helm install shop ~/charts/web -n lab-helm -f shop-values.yaml`.
+
+- Чарт — шаблоны манифестов + значения по умолчанию; релиз — установленный экземпляр чарта со своими значениями. Один чарт → релизы для dev, stage, prod с разными `values-*.yaml`.
+- `helm template` — отрисовать манифесты без установки (посмотреть, что получится, или отдать в Argo CD); `--dry-run` — проверка с сервером.
+- `-f` можно указать несколько раз (общие + окружение), `--set key=value` — точечно; приоритет у последнего.
+- Чужие чарты из репозиториев: `helm repo add bitnami ...`, `helm install pg bitnami/postgresql --version 15.5.0` — версию фиксируйте всегда.
+```
+
+```text notes
+--set\s => Значения передавались через --set — для одного-двух удобно, но набор значений релиза лучше держать файлом в Git.
+```
+
+### Обновить и откатить релиз
+
+Релиз **`shop`** в **`lab-helm`** работает (ревизия 1, сообщение `shop v1`). Обновите его до сообщения **`shop v2`** (ревизия 2), убедитесь, что новая версия отвечает, затем **откатите** релиз на ревизию 1. В итоге сервис снова отвечает `shop v1`, а в истории релиза — 3 ревизии.
+
+```bash setup
+lab_kns lab-helm
+helm -n lab-helm uninstall shop >/dev/null 2>&1
+lab_chart /home/student/charts/web
+printf 'replicaCount: 1\nmessage: "shop v1"\n' > /home/student/charts/shop-values.yaml
+chown student:student /home/student/charts/shop-values.yaml
+helm install shop /home/student/charts/web -n lab-helm -f /home/student/charts/shop-values.yaml >/dev/null
+kubectl -n lab-helm rollout status deploy/shop-web --timeout=90s >/dev/null
+kubectl -n lab-helm run client --image=busybox:1.36 --restart=Never --command -- sleep 100000 >/dev/null
+```
+
+```bash check
+h=$(helm -n lab-helm history shop -o json 2>/dev/null) || fail "Релиза shop нет"
+[ "$(echo "$h" | jq length)" -ge 3 ] || fail "В истории релиза $(echo "$h" | jq length) ревизии — обновление и откат не выполнены"
+echo "$h" | jq -e '.[] | select(.revision == 2)' >/dev/null || fail "Нет ревизии 2"
+last=$(echo "$h" | jq -r '.[-1].description')
+echo "$last" | grep -qi 'rollback to 1' || fail "Последняя ревизия — не откат на 1: «$last»"
+helm -n lab-helm get values shop --revision 2 -o json | jq -e '.message == "shop v2"' >/dev/null || fail "Ревизия 2 была не с сообщением shop v2"
+kubectl -n lab-helm rollout status deploy/shop-web --timeout=60s >/dev/null 2>&1
+kubectl -n lab-helm wait --for=condition=Ready pod/client --timeout=60s >/dev/null 2>&1
+for k in $(seq 15); do r=$(kubectl -n lab-helm exec client -- wget -qO- -T 2 http://shop-web/ 2>/dev/null); [ "$r" = "shop v1" ] && break; sleep 1; done
+[ "$r" = "shop v1" ] || fail "Сервис отвечает «$r», а после отката должен «shop v1»"
+ok "$(echo "$h" | jq -r '.[] | "rev \(.revision): \(.description)"' | tr '\n' ';')"
+```
+
+```text hint
+1. Обновление релиза — подкоманда upgrade с тем же чартом и новыми значениями.
+2. История ревизий и откат на номер ревизии — отдельные подкоманды helm.
+3. Откат тоже создаёт новую ревизию.
+```
+
+```bash solution
+sed -i 's/shop v1/shop v2/' ~/charts/shop-values.yaml
+helm upgrade shop ~/charts/web -n lab-helm -f ~/charts/shop-values.yaml
+kubectl -n lab-helm rollout status deploy/shop-web
+kubectl -n lab-helm exec client -- wget -qO- http://shop-web/
+helm -n lab-helm rollback shop 1
+kubectl -n lab-helm rollout status deploy/shop-web
+helm -n lab-helm history shop
+```
+
+```text review
+Эталон: `helm upgrade` → `helm history` → `helm rollback shop 1`.
+
+- Helm хранит каждую ревизию релиза (манифесты + значения) в Secret в namespace релиза — отсюда история и откат. `--history-max` ограничивает их число.
+- Откат = новая ревизия с содержимым старой: история только растёт, как `git revert`.
+- `helm upgrade --install` — установить или обновить одной командой (так пишут в CI). `--atomic` — при неудаче обновления откатиться автоматически, `--wait` — дождаться готовности подов.
+- Значения в CI не теряйте: `upgrade` без `-f` (или с `--reset-values`) вернёт значения по умолчанию из чарта; `--reuse-values` — оставить прежние.
+```
+
 ## Тест
 
 ### Что такое release в Helm?

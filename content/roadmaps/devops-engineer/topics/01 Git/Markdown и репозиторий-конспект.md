@@ -112,6 +112,111 @@ devops-notes/
 - [ ] Проверить, как GitHub отображает файл: заголовки, таблицы, подсветку кода, чек-лист
 - [ ] Поставить напоминание и с этого дня каждый день: написать конспект → `git commit` → `git push`
 
+## Лаборатория
+
+```bash setup
+su - student -c 'git config --global user.name >/dev/null || git config --global user.name Student; git config --global user.email >/dev/null || git config --global user.email student@stand.local'
+```
+
+### README для конспекта
+
+Создайте репозиторий `~/devops-notes` и закоммитьте в нём `README.md`, в котором есть:
+
+- заголовок первого уровня;
+- чек-лист плана минимум из трёх пунктов;
+- таблица (например, «команда — что делает»);
+- блок кода с указанием языка для подсветки.
+
+```bash setup
+rm -rf /home/student/devops-notes
+```
+
+```bash check
+r=/home/student/devops-notes
+git -C $r rev-parse --git-dir >/dev/null 2>&1 || fail "~/devops-notes — не репозиторий Git"
+md=$(git -C $r show HEAD:README.md 2>/dev/null) || fail "README.md не закоммичен"
+echo "$md" | grep -qE '^# [^ ]' || fail "В README.md нет заголовка первого уровня"
+n=$(echo "$md" | grep -cE '^[[:space:]]*[-*+] \[[ xX]\] ')
+[ "$n" -ge 3 ] || fail "В чек-листе $n пунктов, нужно хотя бы 3"
+echo "$md" | grep -qE '^[[:space:]]*\|?[[:space:]]*:?-{3,}:?[[:space:]]*\|' || fail "В README.md нет таблицы (не хватает строки-разделителя под шапкой)"
+echo "$md" | grep -qE '^[[:space:]]*(```|~~~)[[:space:]]*[A-Za-z]' || fail "Нет блока кода с указанием языка"
+ok "README.md: $(echo "$md" | wc -l) строк, пунктов плана: $n"
+```
+
+```text hint
+1. Создать каталог и инициализировать в нём репозиторий.
+2. Написать файл в любом редакторе: заголовок — одна решётка; пункт чек-листа — дефис и квадратные скобки с пробелом внутри; таблица — строки с вертикальными чертами и строка из дефисов под шапкой; блок кода — три обратные кавычки с названием языка сразу после них.
+3. Добавить файл в индекс и закоммитить.
+```
+
+```bash solution
+mkdir -p ~/devops-notes && cd ~/devops-notes
+git init -q -b main
+fence='```'
+printf '%s\n' '# DevOps-конспект' '' '- [x] Git' '- [ ] Linux' '- [ ] Docker' '' \
+  '| Команда | Что делает |' '| --- | --- |' '| git status | состояние рабочего каталога |' '' \
+  "${fence}bash" 'git log --oneline --graph' "${fence}" > README.md
+git add README.md
+git commit -qm "Add README with plan"
+```
+
+```text review
+Эталон — в «Решении».
+
+- Таблица в Markdown держится на строке-разделителе `| --- | --- |`: без неё GitHub покажет просто текст с чертами.
+- Язык после ```` ``` ```` включает подсветку: `bash`, `yaml`, `dockerfile`, `python`, `sql`, `json`.
+- Чек-лист `- [ ]` на GitHub отображается галочками, а в issue и PR их можно отмечать мышкой.
+- Проверить разметку до коммита: предпросмотр в VS Code (`Ctrl+Shift+V`) или Obsidian.
+```
+
+### Раздел конспекта и ссылка на него
+
+В `~/devops-notes` (репозиторий уже есть) создайте раздел `01-git/commands.md` с любым конспектом и добавьте в `README.md` **относительную ссылку** на этот файл, чтобы с главной страницы репозитория можно было перейти в раздел. Закоммитьте.
+
+```bash setup
+rm -rf /home/student/devops-notes
+su - student -c 'bash -s' <<'EOF'
+mkdir ~/devops-notes && cd ~/devops-notes && git init -q -b main
+printf '# DevOps-конспект\n\n- [ ] Git\n' > README.md && git add . && git commit -qm "Init notes"
+EOF
+```
+
+```bash check
+r=/home/student/devops-notes
+git -C $r cat-file -e HEAD:01-git/commands.md 2>/dev/null || fail "Файл 01-git/commands.md не закоммичен"
+[ -n "$(git -C $r show HEAD:01-git/commands.md | tr -d '[:space:]')" ] || fail "01-git/commands.md пустой"
+links=$(git -C $r show HEAD:README.md | grep -oE '\]\([^)]+\)' | sed -E 's/^\]\(//; s/\)$//; s/#.*$//; s/^\.\///')
+echo "$links" | grep -qx '01-git/commands.md' || fail "В закоммиченном README.md нет ссылки на 01-git/commands.md. Ссылки сейчас: $(echo $links)"
+ok "README → 01-git/commands.md"
+```
+
+```text hint
+1. Создать каталог раздела и файл в нём.
+2. В README добавить ссылку: текст в квадратных скобках, путь в круглых. Путь — относительно README, без адреса сайта и без ведущего слеша.
+3. Закоммитить оба файла.
+```
+
+```bash solution
+cd ~/devops-notes
+mkdir -p 01-git
+printf '# Git — команды\n\n- `git status` — что изменилось\n' > 01-git/commands.md
+printf '\n- [Конспект по Git](01-git/commands.md)\n' >> README.md
+git add README.md 01-git/commands.md
+git commit -qm "Add Git section"
+```
+
+```text review
+Эталон: `[Конспект по Git](01-git/commands.md)`.
+
+- Относительные ссылки работают везде: на GitHub, в GitLab, в VS Code и Obsidian, и не ломаются при переименовании репозитория. Абсолютные (`https://github.com/.../blob/main/...`) привязаны к сайту и ветке.
+- Ссылка на заголовок внутри файла: `01-git/commands.md#git-команды` — якорь строится из текста заголовка.
+- Ежедневный цикл конспекта: написал → `git add` → `git commit -m "Git: rebase и cherry-pick"` → `git push`. Зелёный график на GitHub работодатели правда смотрят.
+```
+
+```text notes
+\]\(https?://github\.com => Ссылка на файл сделана абсолютной (через github.com) — она привязана к ветке и сайту. Внутри репозитория используют относительные пути.
+```
+
 ## Тест
 
 ### Как в Markdown сделать заголовок второго уровня?

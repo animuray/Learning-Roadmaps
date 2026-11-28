@@ -143,6 +143,122 @@ kubectl auth can-i delete pods -n prod
 - [ ] Посмотреть `kubectl explain` для полей Deployment и `kubectl api-resources`
 - [ ] Установить k9s и пройтись по ресурсам кластера
 
+## Лаборатория
+
+На стенде работает одноузловой кластер **k3s**. `kubectl` у ученика уже настроен (`~/.kube/config`): `kubectl get nodes`.
+
+```bash lib
+# Kubernetes на стенде — k3s (один узел). root работает с /etc/rancher/k3s/k3s.yaml, ученик — со своим ~/.kube/config
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# lab_kns имя — чистый namespace задачи (старый удаляется вместе со всем содержимым)
+lab_kns() {
+  kubectl delete ns "$1" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1
+  kubectl create ns "$1" >/dev/null
+}
+# убрать с узла метки и taint-ы, которые оставляют задачи про размещение подов
+lab_knode() {
+  kubectl taint nodes --all lab-dedicated- >/dev/null 2>&1
+  kubectl label nodes --all disktype- zone- >/dev/null 2>&1
+  true
+}
+# lab_kready ns селектор [секунд] — дождаться готовности подов
+lab_kready() { kubectl -n "$1" wait --for=condition=Ready pod -l "$2" --timeout="${3:-90}s" >/dev/null 2>&1; }
+# lab_kfiles каталог — каталог манифестов ученика (пустой)
+lab_kfiles() { rm -rf "$1"; mkdir -p "$1"; chown -R student:student "$1"; }
+lab_kj() { kubectl "$@" -o json 2>/dev/null; }
+lab_traefik() { kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'; }
+```
+
+```bash setup
+lab_knode
+```
+
+### Найти под и прочитать его логи
+
+В namespace **`lab-shop`** работает несколько подов. Под сервиса оплаты помечен меткой **`app=payments`**. При запуске он пишет в лог строку с номером транзакции вида `txn=...`. Найдите под **по метке** и запишите номер транзакции (то, что после `txn=`) в `~/txn.txt`.
+
+```bash setup
+lab_kns lab-shop
+txn=$(tr -dc A-Z0-9 </dev/urandom | head -c 10)
+echo "$txn" > /var/lib/lab/k8s-txn
+for app in catalog cart payments delivery; do
+  msg="service $app started"; [ $app = payments ] && msg="payments ready txn=$txn"
+  kubectl -n lab-shop run $app-$(tr -dc a-z0-9 </dev/urandom | head -c 5) --image=busybox:1.36 --labels=app=$app --restart=Never \
+    --command -- sh -c "echo '$msg'; sleep 100000" >/dev/null
+done
+lab_kready lab-shop app=payments
+rm -f /home/student/txn.txt
+```
+
+```bash check
+want=$(cat /var/lib/lab/k8s-txn)
+[ -f /home/student/txn.txt ] || fail "Нет ~/txn.txt"
+got=$(tr -d '[:space:]' < /home/student/txn.txt); got=${got#txn=}
+[ "$got" = "$want" ] || fail "В ~/txn.txt «$got» — это не номер транзакции из лога пода payments"
+ok "txn=$want"
+```
+
+```text hint
+1. Список подов в namespace с фильтром по метке; имена подов случайные — по имени их не угадать.
+2. Логи можно смотреть по имени пода, а можно сразу по метке.
+3. Namespace указывается ключом во всех командах — иначе kubectl ищет в default.
+```
+
+```bash solution
+kubectl -n lab-shop get pods --show-labels
+kubectl -n lab-shop logs -l app=payments
+kubectl -n lab-shop logs -l app=payments | grep -o 'txn=[A-Z0-9]*' | cut -d= -f2 > ~/txn.txt
+```
+
+```text review
+Эталон: `kubectl -n lab-shop logs -l app=payments`.
+
+- Метки (labels) — главный способ выбирать объекты: `-l app=payments`, `-l 'env in (prod,stage)'`, `-l '!canary'`. Ими же Service и Deployment находят свои поды.
+- Логи: `-f` — следить, `--previous` — лог предыдущего, упавшего контейнера (главное при CrashLoopBackOff), `-c` — конкретный контейнер в поде, `--since=10m`, `--tail=100`.
+- Шпаргалка: `get` (список), `describe` (подробно + события — первое при проблемах), `logs`, `exec -it ... -- sh`, `apply -f`, `delete`, `explain pod.spec.containers` (документация по полям).
+```
+
+### Namespace по умолчанию
+
+Каждый раз писать `-n lab-dev` утомительно. Сделайте так, чтобы в **текущем контексте** kubectl namespace по умолчанию был **`lab-dev`**: команда `kubectl get pods` без `-n` должна показывать поды из `lab-dev`.
+
+```bash setup
+lab_kns lab-dev
+kubectl -n lab-dev run devbox --image=busybox:1.36 --restart=Never --command -- sleep 100000 >/dev/null
+su - student -c 'kubectl config set-context --current --namespace=default' >/dev/null
+```
+
+```bash check
+ns=$(su - student -c "kubectl config view --minify -o jsonpath='{..namespace}'" 2>/dev/null)
+[ "$ns" = lab-dev ] || fail "Namespace текущего контекста — «${ns:-default}»"
+su - student -c 'kubectl get pods --no-headers' 2>/dev/null | grep -q devbox || fail "kubectl get pods без -n не показывает поды lab-dev"
+ok "контекст $(su - student -c 'kubectl config current-context'): namespace lab-dev"
+```
+
+```text hint
+1. Настройки подключения хранятся в kubeconfig: кластеры, пользователи и контексты (кластер + пользователь + namespace).
+2. У подкоманды config есть способ изменить текущий контекст — задать в нём namespace.
+3. Проверить: вывести урезанный конфиг только для текущего контекста.
+```
+
+```bash solution
+kubectl config get-contexts
+kubectl config set-context --current --namespace=lab-dev
+kubectl get pods
+```
+
+```text review
+Эталон: `kubectl config set-context --current --namespace=lab-dev`.
+
+- Контекст = кластер + пользователь + namespace. Переключение между кластерами: `kubectl config use-context prod` — опасная операция: легко выполнить команду «не в том кластере». Многие выводят контекст в приглашение оболочки (kube-ps1) и красят прод красным.
+- Удобные утилиты: `kubectx` и `kubens`, `k9s` — консольный интерфейс к кластеру.
+- Несколько kubeconfig: `KUBECONFIG=~/.kube/dev:~/.kube/prod` — kubectl склеит их.
+```
+
+```text notes
+alias\s+k(ubectl)?= => Сделан алиас с -n — работает, но namespace в контексте видят все инструменты (helm, k9s), а алиас — только оболочка.
+```
+
 ## Тест
 
 ### Чем kind отличается от Minikube?

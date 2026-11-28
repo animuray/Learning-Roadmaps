@@ -139,6 +139,122 @@ PVC в `Pending`: нет StorageClass по умолчанию, неверное 
 - [ ] Развернуть Deployment с RWO-томом и RollingUpdate на мультинодовом кластере и посмотреть, что происходит при обновлении; переключить на Recreate
 - [ ] Разобраться, как устроены `volumeClaimTemplates` у StatefulSet из прошлой темы
 
+## Лаборатория
+
+Кластер — k3s на стенде; StorageClass по умолчанию — `local-path` (том — каталог на узле).
+
+```bash lib
+# Kubernetes на стенде — k3s (один узел). root работает с /etc/rancher/k3s/k3s.yaml, ученик — со своим ~/.kube/config
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# lab_kns имя — чистый namespace задачи (старый удаляется вместе со всем содержимым)
+lab_kns() {
+  kubectl delete ns "$1" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1
+  kubectl create ns "$1" >/dev/null
+}
+# убрать с узла метки и taint-ы, которые оставляют задачи про размещение подов
+lab_knode() {
+  kubectl taint nodes --all lab-dedicated- >/dev/null 2>&1
+  kubectl label nodes --all disktype- zone- >/dev/null 2>&1
+  true
+}
+# lab_kready ns селектор [секунд] — дождаться готовности подов
+lab_kready() { kubectl -n "$1" wait --for=condition=Ready pod -l "$2" --timeout="${3:-90}s" >/dev/null 2>&1; }
+# lab_kfiles каталог — каталог манифестов ученика (пустой)
+lab_kfiles() { rm -rf "$1"; mkdir -p "$1"; chown -R student:student "$1"; }
+lab_kj() { kubectl "$@" -o json 2>/dev/null; }
+lab_traefik() { kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'; }
+```
+
+```bash setup
+lab_knode
+```
+
+### Данные переживают под
+
+В namespace **`lab-pvc`**:
+
+1. создайте PersistentVolumeClaim **`notes-data`** на **100Mi** (режим `ReadWriteOnce`);
+2. запустите под **`notes`** (`busybox:1.36`, сон) с этим томом в `/data` и запишите в том файл `/data/notes.txt` со строкой `persist me`;
+3. **удалите под и создайте его заново** с тем же томом — файл должен остаться.
+
+```bash setup
+lab_kns lab-pvc
+```
+
+```bash check
+pvc=$(lab_kj -n lab-pvc get pvc notes-data) || fail "PVC notes-data нет"
+[ "$(echo "$pvc" | jq -r .spec.resources.requests.storage)" = 100Mi ] || fail "Размер PVC — $(echo "$pvc" | jq -r .spec.resources.requests.storage)"
+[ "$(echo "$pvc" | jq -r .status.phase)" = Bound ] || fail "PVC не привязан к тому (Bound)"
+p=$(lab_kj -n lab-pvc get pod notes) || fail "Пода notes нет"
+echo "$p" | jq -e '.spec.volumes[] | select(.persistentVolumeClaim.claimName == "notes-data")' >/dev/null || fail "Под notes не использует PVC notes-data"
+kubectl -n lab-pvc wait --for=condition=Ready pod/notes --timeout=60s >/dev/null 2>&1 || fail "Под notes не Ready"
+[ "$(kubectl -n lab-pvc exec notes -- cat /data/notes.txt 2>/dev/null)" = "persist me" ] || fail "В /data/notes.txt нет строки persist me"
+pc=$(date -d "$(echo "$pvc" | jq -r .metadata.creationTimestamp)" +%s); pp=$(date -d "$(echo "$p" | jq -r .metadata.creationTimestamp)" +%s)
+[ $((pp - pc)) -ge 3 ] || fail "Под notes создан вместе с PVC — его не пересоздавали"
+ok "notes.txt пережил пересоздание пода"
+```
+
+```text hint
+1. Заявка на том: режим доступа и размер; класс хранилища можно не указывать — возьмётся по умолчанию.
+2. В поде — том со ссылкой на заявку по имени и точка монтирования.
+3. Записать файл через exec, удалить под, применить тот же манифест снова и прочитать файл.
+```
+
+```bash solution
+mkdir -p ~/k8s
+cat > ~/k8s/notes.yaml <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: notes-data
+  namespace: lab-pvc
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 100Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: notes
+  namespace: lab-pvc
+spec:
+  containers:
+    - name: notes
+      image: busybox:1.36
+      command: ["sleep", "infinity"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: notes-data
+EOF
+kubectl apply -f ~/k8s/notes.yaml
+kubectl -n lab-pvc wait --for=condition=Ready pod/notes --timeout=60s
+kubectl -n lab-pvc exec notes -- sh -c 'echo "persist me" > /data/notes.txt'
+kubectl -n lab-pvc delete pod notes --wait=true
+sleep 3
+kubectl apply -f ~/k8s/notes.yaml
+kubectl -n lab-pvc wait --for=condition=Ready pod/notes --timeout=60s
+kubectl -n lab-pvc exec notes -- cat /data/notes.txt
+```
+
+```text review
+Эталон — в «Решении».
+
+- **PVC** — заявка «мне нужен том такого размера», **PV** — конкретный том, **StorageClass** — как его создать (local-path, Ceph RBD, облачные диски EBS/GCE PD). Динамический провиженинг создаёт PV под каждую заявку сам.
+- `ReadWriteOnce` — том подключается к одному узлу; `ReadWriteMany` (NFS, CephFS) — к нескольким сразу; облачные блочные диски RWX не умеют.
+- `reclaimPolicy: Delete` (по умолчанию у динамических) — удалили PVC, удалился и диск с данными. Для важного — `Retain`.
+- `local-path` привязывает том к узлу: под с таким томом не переедет на другой узел. В продакшене — сетевое хранилище.
+```
+
+```text notes
+emptyDir => Использовался emptyDir — он живёт только вместе с подом, после пересоздания данные пропадут. Постоянные данные — через PVC.
+```
+
 ## Тест
 
 ### Чем PersistentVolume отличается от PersistentVolumeClaim?

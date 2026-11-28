@@ -206,6 +206,293 @@ deploy-prod:
 - [ ] Сделать монорепозиторий с двумя сервисами и запускать дочерний пайплайн каждого только при изменениях в его каталоге
 - [ ] Запустить тесты на трёх версиях Python через `parallel: matrix`
 
+## Лаборатория
+
+Пайплайны выполняются локально через `gitlab-ci-local`; итоговый YAML после `extends`, `include` и `default` показывает `gitlab-ci-local --preview`.
+
+```bash lib
+# Пайплайны GitLab CI выполняются локально утилитой gitlab-ci-local (shell executor — задачи идут прямо на стенде)
+# lab_ci_repo каталог — новый репозиторий ученика с одним коммитом (файлы кладёт вызывающий до коммита)
+lab_ci_repo() { rm -rf "$1"; mkdir -p "$1"; }
+lab_ci_commit() { chown -R student:student "$1"; su - student -c "cd $1 && git init -q -b main 2>/dev/null; git add -A && git commit -qm 'Initial commit'"; }
+# lab_ci_run каталог [ключи] — пайплайн от имени ученика; вывод — в /tmp/lab-ci.log, код возврата — код пайплайна
+lab_ci_run() { su - student -c "cd $1 && timeout 300 gitlab-ci-local $2" > /tmp/lab-ci.log 2>&1; }
+# lab_ci_preview каталог — итоговый YAML после include, extends и default (JSON)
+lab_ci_preview() { su - student -c "cd $1 && gitlab-ci-local --preview" 2>/dev/null | sed -n '/^---$/,$p' | python3 -c 'import sys,yaml,json; print(json.dumps(yaml.safe_load(sys.stdin)))'; }
+# lab_ci_jobs каталог [ветка] — список задач (JSON); с веткой — во временной копии репозитория на этой ветке
+lab_ci_jobs() {
+  if [ -n "$2" ]; then
+    rm -rf /tmp/lab-ci-branch; su - student -c "git clone -q $1 /tmp/lab-ci-branch && cd /tmp/lab-ci-branch && cp $1/.gitlab-ci*.yml . 2>/dev/null; [ -d $1/ci ] && mkdir -p ci && cp -r $1/ci/. ci/; git switch -qc $2 && gitlab-ci-local --list-json" 2>/dev/null
+  else
+    su - student -c "cd $1 && gitlab-ci-local --list-json" 2>/dev/null
+  fi
+}
+lab_ci_log() { sed 's/\x1b\[[0-9;]*m//g' /tmp/lab-ci.log | grep -vE '^\s*$' | tail -n "${1:-4}" | tr '\n' ' ' | cut -c1-300; }
+lab_drm() { docker rm -f "$@" >/dev/null 2>&1; true; }
+# образ есть локально или скачивается (если ученик почистил образы через prune)
+lab_img() { for i in "$@"; do docker image inspect "$i" >/dev/null 2>&1 || docker pull -q "$i" >/dev/null; done; }
+# lab_wait_http URL [строка] — дождаться ответа
+lab_wait_http() { for i in $(seq 60); do curl -s --max-time 1 "$1" 2>/dev/null | grep -q "${2:-.}" && return 0; sleep 0.25; done; return 1; }
+```
+
+```bash setup
+su - student -c 'git config --global user.name >/dev/null || git config --global user.name Student; git config --global user.email >/dev/null || git config --global user.email student@stand.local'
+```
+
+### Граф вместо этапов
+
+В монорепозитории `~/ci-mono` два сервиса — `api` и `web`. Сейчас тест `web` ждёт сборки `api`, хотя они не связаны. Перепишите пайплайн через **`needs`**:
+
+- `build-api` и `build-web` — этап build;
+- `test-api` зависит **только** от `build-api`, `test-web` — **только** от `build-web`;
+- `deploy` — после **обоих** тестов.
+
+```bash setup
+d=/home/student/ci-mono
+lab_ci_repo $d
+mkdir -p $d/api $d/web
+echo 'print("api")' > $d/api/main.py; echo 'print("web")' > $d/web/main.py
+cat > $d/.gitlab-ci.yml <<'EOF'
+stages: [build, test, deploy]
+
+build-api:
+  stage: build
+  script: [echo "build api"]
+build-web:
+  stage: build
+  script: [echo "build web"]
+test-api:
+  stage: test
+  script: [python3 api/main.py]
+test-web:
+  stage: test
+  script: [python3 web/main.py]
+deploy:
+  stage: deploy
+  script: [echo "deploy all"]
+EOF
+printf '.gitlab-ci-local/\n' > $d/.gitignore
+lab_ci_commit $d
+```
+
+```bash check
+d=/home/student/ci-mono
+p=$(lab_ci_preview $d); [ -n "$p" ] && [ "$p" != null ] || fail "gitlab-ci-local не может разобрать .gitlab-ci.yml"
+n() { echo "$p" | jq -c --arg j "$1" '[.[$j].needs // [] | .[] | if type == "string" then . else .job end] | sort'; }
+[ "$(n test-api)" = '["build-api"]' ] || fail "test-api зависит от: $(n test-api)"
+[ "$(n test-web)" = '["build-web"]' ] || fail "test-web зависит от: $(n test-web)"
+[ "$(n deploy)" = '["test-api","test-web"]' ] || fail "deploy зависит от: $(n deploy)"
+lab_ci_run $d || fail "Пайплайн не проходит: $(lab_ci_log)"
+ok "граф: build-api → test-api, build-web → test-web, оба → deploy"
+```
+
+```text hint
+1. У задачи есть параметр со списком задач, после которых её можно запускать, — не дожидаясь окончания всего предыдущего этапа.
+2. Задать его тестам и деплою. Этапы можно оставить — они нужны для отображения.
+```
+
+```bash solution
+cd ~/ci-mono
+cat > .gitlab-ci.yml <<'EOF'
+stages: [build, test, deploy]
+
+build-api:
+  stage: build
+  script: [echo "build api"]
+build-web:
+  stage: build
+  script: [echo "build web"]
+test-api:
+  stage: test
+  needs: [build-api]
+  script: [python3 api/main.py]
+test-web:
+  stage: test
+  needs: [build-web]
+  script: [python3 web/main.py]
+deploy:
+  stage: deploy
+  needs: [test-api, test-web]
+  script: [echo "deploy all"]
+EOF
+gitlab-ci-local --list
+```
+
+```text review
+Эталон: `needs:` у тестов и деплоя.
+
+- `needs` превращает пайплайн в граф (DAG): задача стартует, как только готовы её зависимости. Медленная сборка web больше не задерживает тесты api.
+- `needs: []` — стартовать сразу, в первую очередь (линтеры).
+- С `needs` задача получает артефакты **только** перечисленных задач — ещё и экономия времени на скачивание.
+- В монорепо дальше: `rules: changes: [api/**/*]` — не запускать задачи сервиса, если его код не менялся, или дочерние пайплайны (`trigger: include:`) на каждый сервис.
+```
+
+### Общий шаблон через extends
+
+В `~/ci-tpl` три задачи на Python повторяют одинаковые `image`, `before_script` и переменные. Вынесите общее в **скрытую задачу** `.python-base` и подключите её через **`extends`** во все три задачи. У задачи `coverage` должна остаться **своя** переменная `COVERAGE_MIN: "80"` **вместе** с общими.
+
+```bash setup
+d=/home/student/ci-tpl
+lab_ci_repo $d
+echo 'print("ok")' > $d/app.py
+cat > $d/.gitlab-ci.yml <<'EOF'
+stages: [test]
+
+lint:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    PYTHONDONTWRITEBYTECODE: "1"
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  before_script:
+    - python3 --version
+  script:
+    - python3 -m py_compile app.py
+
+unit:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    PYTHONDONTWRITEBYTECODE: "1"
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  before_script:
+    - python3 --version
+  script:
+    - python3 app.py
+
+coverage:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    PYTHONDONTWRITEBYTECODE: "1"
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    COVERAGE_MIN: "80"
+  before_script:
+    - python3 --version
+  script:
+    - echo "coverage must be >= $COVERAGE_MIN"
+EOF
+printf '.gitlab-ci-local/\n' > $d/.gitignore
+lab_ci_commit $d
+```
+
+```bash check
+d=/home/student/ci-tpl
+f=$d/.gitlab-ci.yml
+grep -qE '^\.python-base:' $f || fail "Нет скрытой задачи .python-base"
+[ "$(grep -c 'python:3.12-slim' $f)" = 1 ] || fail "Образ python:3.12-slim всё ещё повторяется ($(grep -c 'python:3.12-slim' $f) раза)"
+[ "$(grep -c 'PIP_DISABLE_PIP_VERSION_CHECK' $f)" = 1 ] || fail "Общие переменные всё ещё повторяются"
+p=$(lab_ci_preview $d); [ -n "$p" ] && [ "$p" != null ] || fail "gitlab-ci-local не может разобрать .gitlab-ci.yml"
+for j in lint unit coverage; do
+  [ "$(echo "$p" | jq -r --arg j $j '.[$j].image | if type == "object" then .name else . end')" = python:3.12-slim ] || fail "У $j после extends нет образа python:3.12-slim"
+  echo "$p" | jq -e --arg j $j '.[$j].before_script | index("python3 --version")' >/dev/null || fail "У $j после extends нет общего before_script"
+  [ "$(echo "$p" | jq -r --arg j $j '.[$j].variables.PYTHONDONTWRITEBYTECODE')" = 1 ] || fail "У $j после extends нет общих переменных"
+done
+[ "$(echo "$p" | jq -r '.coverage.variables.COVERAGE_MIN')" = 80 ] || fail "У coverage пропала своя переменная COVERAGE_MIN"
+[ "$(echo "$p" | jq -r '.coverage.variables.PIP_DISABLE_PIP_VERSION_CHECK')" = 1 ] || fail "У coverage свои переменные заменили общие, а не дополнили"
+lab_ci_run $d || fail "Пайплайн не проходит: $(lab_ci_log)"
+ok "три задачи наследуют .python-base, у coverage — свои + общие переменные"
+```
+
+```text hint
+1. Задача, имя которой начинается с точки, не запускается — это шаблон.
+2. Перенести в шаблон образ, переменные и подготовительные команды; в задачах оставить этап, свои команды и ссылку на шаблон.
+3. Посмотреть итоговый YAML: словари при наследовании сливаются, а списки команд — заменяются.
+```
+
+```bash solution
+cat > ~/ci-tpl/.gitlab-ci.yml <<'EOF'
+stages: [test]
+
+.python-base:
+  image: python:3.12-slim
+  variables:
+    PYTHONDONTWRITEBYTECODE: "1"
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  before_script:
+    - python3 --version
+
+lint:
+  extends: .python-base
+  stage: test
+  script:
+    - python3 -m py_compile app.py
+
+unit:
+  extends: .python-base
+  stage: test
+  script:
+    - python3 app.py
+
+coverage:
+  extends: .python-base
+  stage: test
+  variables:
+    COVERAGE_MIN: "80"
+  script:
+    - echo "coverage must be >= $COVERAGE_MIN"
+EOF
+cd ~/ci-tpl && gitlab-ci-local --preview | sed -n '/^coverage:/,$p'
+```
+
+```text review
+Эталон: скрытая `.python-base` + `extends: .python-base`.
+
+- `extends` сливает словари рекурсивно (variables объединяются), а **списки заменяет** целиком: свой `before_script` в задаче выкинет шаблонный. Нужно и то и другое — `!reference [.python-base, before_script]`.
+- YAML-якоря (`<<: *base`) работают только в одном файле; `extends` — и через `include`, поэтому шаблоны в общем репозитории делают на `extends`.
+- Итоговый результат всегда смотрите через CI Lint → View merged YAML (здесь — `gitlab-ci-local --preview`).
+```
+
+### Матрица версий
+
+Добавьте в `~/ci-matrix` задачу **`test`**, которая запускается на **трёх версиях Python** — `3.11`, `3.12` и `3.13` — через **`parallel: matrix`** с переменной `PYTHON_VERSION`. Скрипт задачи — просто `echo "testing on $PYTHON_VERSION"`.
+
+```bash setup
+d=/home/student/ci-matrix
+lab_ci_repo $d
+printf 'stages: [test]\n' > $d/.gitlab-ci.yml
+printf '.gitlab-ci-local/\n' > $d/.gitignore
+lab_ci_commit $d
+```
+
+```bash check
+d=/home/student/ci-matrix
+m=$(lab_ci_jobs $d); [ -n "$m" ] || fail "gitlab-ci-local не может разобрать .gitlab-ci.yml"
+names=$(echo "$m" | jq -r '[.[] | select(.name | startswith("test")) | .name] | sort | join(", ")')
+for v in 3.11 3.12 3.13; do echo "$names" | grep -q "\[$v\]" || fail "Нет задачи для Python $v (задачи: ${names:-нет})"; done
+[ "$(echo "$m" | jq '[.[] | select(.name | startswith("test"))] | length')" = 3 ] || fail "Задач test должно быть ровно три: $names"
+lab_ci_run $d || fail "Пайплайн не проходит: $(lab_ci_log)"
+for v in 3.11 3.12 3.13; do sed 's/\x1b\[[0-9;]*m//g' /tmp/lab-ci.log | grep -q "testing on $v" || fail "Задача для $v не получила свою переменную PYTHON_VERSION"; done
+ok "матрица: $names"
+```
+
+```text hint
+У задачи есть параметр параллельного запуска; его вариант «матрица» — список наборов переменных, где значение переменной может быть списком: на каждое значение создаётся своя копия задачи.
+```
+
+```bash solution
+cat >> ~/ci-matrix/.gitlab-ci.yml <<'EOF'
+
+test:
+  stage: test
+  parallel:
+    matrix:
+      - PYTHON_VERSION: ["3.11", "3.12", "3.13"]
+  script:
+    - echo "testing on $PYTHON_VERSION"
+EOF
+cd ~/ci-matrix && gitlab-ci-local --list
+```
+
+```text review
+Эталон: `parallel: matrix: - PYTHON_VERSION: ["3.11", "3.12", "3.13"]`.
+
+- На настоящем раннере обычно добавляют `image: python:$PYTHON_VERSION-slim` — каждая копия задачи в своей версии.
+- Несколько переменных в одном наборе дают все сочетания: `OS: [ubuntu, alpine]` × `PY: [3.11, 3.12]` = 4 задачи.
+- `needs` на матричную задачу — `needs: [{job: test, parallel: {matrix: [{PYTHON_VERSION: "3.12"}]}}]`.
+- Версии в кавычках: `3.10` без кавычек YAML превратит в число 3.1.
+```
+
 ## Тест
 
 ### Что даёт ключ needs?

@@ -170,6 +170,166 @@ Ad-hoc команды хороши для разовых задач и диаг�
 - [ ] Попробовать пайп в модуле command и в модуле shell и объяснить разницу
 - [ ] Перезагрузить группу хостов по одному с `-f 1`
 
+## Лаборатория
+
+«Серверы» — контейнеры `lab-web1`, `lab-web2`, `lab-db1`, подключение — `ansible_connection=community.docker.docker` (см. тему «Ansible — как устроен»).
+
+```bash lib
+# «Серверы» для Ansible — контейнеры lab-web1, lab-web2, lab-db1 (Python, sudo, sshd); подключение — community.docker.docker
+lab_host_image() {
+  docker image inspect lab-ansible-host:2 >/dev/null 2>&1 && return
+  docker image inspect python:3.12-slim >/dev/null 2>&1 || docker pull -q python:3.12-slim >/dev/null
+  docker build -q -t lab-ansible-host:2 - >/dev/null <<'EOF'
+FROM python:3.12-slim
+RUN apt-get update -q && apt-get install -y -q --no-install-recommends sudo openssh-server \
+ && mkdir -p /run/sshd && rm -rf /var/lib/apt/lists/*
+CMD ["sleep", "infinity"]
+EOF
+}
+lab_hosts() { lab_host_image; for h in ${*:-lab-web1 lab-web2 lab-db1}; do docker rm -f $h >/dev/null 2>&1; docker run -d --name $h --hostname $h lab-ansible-host:2 >/dev/null; done; }
+# lab_inv каталог — ansible.cfg и inventory.ini: web = lab-web1, lab-web2; db = lab-db1
+lab_inv() {
+  mkdir -p "$1"
+  printf '[defaults]\ninventory = inventory.ini\ninterpreter_python = /usr/local/bin/python3\n' > "$1/ansible.cfg"
+  printf '[web]\nlab-web1\nlab-web2\n\n[db]\nlab-db1\n\n[all:vars]\nansible_connection=community.docker.docker\n' > "$1/inventory.ini"
+}
+lab_own() { chown -R student:student "$1"; }
+# lab_play каталог аргументы — ansible-playbook от имени ученика, вывод — в /tmp/lab-ans.log
+lab_play() { su - student -c "cd $1 && ANSIBLE_NOCOLOR=1 ansible-playbook $2" > /tmp/lab-ans.log 2>&1; }
+# сумма changed по всем хостам из итогов последнего прогона
+lab_changed() { grep -E '^lab-[a-z0-9]+ +:' /tmp/lab-ans.log | grep -oE 'changed=[0-9]+' | cut -d= -f2 | awk '{s += $1} END {print s + 0}'; }
+lab_anslog() { grep -E 'fatal|ERROR|FAILED|error' /tmp/lab-ans.log | head -2 | tr '\n' ' ' | cut -c1-300; }
+```
+
+```bash setup
+lab_hosts
+```
+
+### Inventory в YAML с переменными
+
+Создайте в `~/ansible-inv` inventory **в формате YAML** (`inventory.yml`):
+
+- группы **`web`** (`lab-web1`, `lab-web2`) и **`db`** (`lab-db1`);
+- родительская группа **`prod`**, в которую входят `web` и `db`;
+- переменная `http_port`: **8080** для группы `web` (файл в `group_vars/`), но **9090** для `lab-web2` (файл в `host_vars/`);
+- подключение `community.docker.docker` и интерпретатор `/usr/local/bin/python3` — для всех хостов.
+
+`ansible -i inventory.yml prod -m ping` должен пинговать все три хоста.
+
+```bash setup
+rm -rf /home/student/ansible-inv
+```
+
+```bash check
+d=/home/student/ansible-inv
+[ -f $d/inventory.yml ] || [ -f $d/inventory.yaml ] || fail "Нет ~/ansible-inv/inventory.yml"
+inv=$(ls $d/inventory.y*ml | head -1)
+ai() { su - student -c "cd $d && ansible-inventory -i $inv $*" 2>/dev/null; }
+g=$(ai --list) || fail "ansible-inventory не может разобрать inventory"
+for grp in web:lab-web1,lab-web2 db:lab-db1; do
+  name=${grp%%:*}; want=$(echo ${grp#*:} | tr ',' '\n' | sort | xargs)
+  got=$(echo "$g" | jq -r --arg n $name '.[$n].hosts // [] | sort | join(" ")')
+  [ "$got" = "$want" ] || fail "В группе $name хосты «$got», нужны «$want»"
+done
+[ "$(echo "$g" | jq -r '.prod.children // [] | sort | join(" ")')" = "db web" ] || fail "Группа prod должна включать группы web и db"
+grep -qE '^\s*\[' $inv && fail "inventory.yml написан в формате INI"
+[ "$(ai --host lab-web1 | jq -r .http_port)" = 8080 ] || fail "У lab-web1 http_port = $(ai --host lab-web1 | jq -r .http_port)"
+[ "$(ai --host lab-web2 | jq -r .http_port)" = 9090 ] || fail "У lab-web2 http_port = $(ai --host lab-web2 | jq -r .http_port)"
+[ "$(ai --host lab-db1 | jq -r '.http_port // "нет"')" = нет ] || fail "У lab-db1 не должно быть http_port"
+ls $d/group_vars/web* >/dev/null 2>&1 || fail "Переменная группы web не вынесена в group_vars/"
+ls $d/host_vars/lab-web2* >/dev/null 2>&1 || fail "Переменная lab-web2 не вынесена в host_vars/"
+out=$(su - student -c "cd $d && ansible -i $inv prod -m ping -o" 2>&1)
+[ "$(echo "$out" | grep -c '| SUCCESS')" = 3 ] || fail "Не все хосты prod отвечают: $(echo "$out" | cut -c1-120 | tr '\n' ';')"
+ok "$(su - student -c "cd $d && ansible-inventory -i $inv --graph" 2>/dev/null | tr -s ' \n' ' ')"
+```
+
+```text hint
+1. В YAML-inventory корень — группа all, у неё дочерние группы (children); у группы — хосты (hosts, словарь имён) и переменные (vars).
+2. Родительская группа перечисляет в children другие группы.
+3. Переменные группы и хоста — в каталогах group_vars и host_vars рядом с inventory: файл называется по имени группы или хоста.
+4. Проверить итог: дерево групп и переменные конкретного хоста — утилита ansible-inventory.
+```
+
+```bash solution
+mkdir -p ~/ansible-inv/group_vars ~/ansible-inv/host_vars && cd ~/ansible-inv
+cat > inventory.yml <<'EOF'
+all:
+  vars:
+    ansible_connection: community.docker.docker
+    ansible_python_interpreter: /usr/local/bin/python3
+  children:
+    prod:
+      children:
+        web:
+          hosts:
+            lab-web1:
+            lab-web2:
+        db:
+          hosts:
+            lab-db1:
+EOF
+echo 'http_port: 8080' > group_vars/web.yml
+echo 'http_port: 9090' > host_vars/lab-web2.yml
+ansible-inventory -i inventory.yml --graph
+ansible-inventory -i inventory.yml --host lab-web2
+ansible -i inventory.yml prod -m ping -o
+```
+
+```text review
+Эталон — в «Решении».
+
+- `group_vars/<группа>.yml` и `host_vars/<хост>.yml` рядом с inventory (или рядом с плейбуком) подхватываются сами. Переменная хоста сильнее переменной группы, дочерняя группа — сильнее родительской.
+- Родительские группы (`prod` из `web` + `db`) позволяют писать `hosts: prod` и задавать общие для окружения переменные в `group_vars/prod.yml`.
+- Частая схема: отдельный inventory на окружение — `inventories/stage/`, `inventories/prod/` со своими `group_vars`.
+- `ansible-inventory --graph` и `--host` — первое, что смотреть, когда «переменная не та».
+```
+
+### Ad-hoc: проверка и установка
+
+В `~/ansible-lab` (inventory с группами `web` и `db` уже есть) ad-hoc командами:
+
+1. узнайте из **фактов** Ansible версию дистрибутива (`ansible_distribution_version`) на `lab-db1` и запишите её в `~/distro-version.txt`;
+2. установите пакет **`curl`** **только** на группу **`db`** — сначала посмотрите, что будет, **в режиме проверки**, потом установите по-настоящему.
+
+```bash setup
+rm -rf /home/student/ansible-lab /home/student/distro-version.txt
+lab_inv /home/student/ansible-lab
+lab_own /home/student/ansible-lab
+```
+
+```bash check
+want=$(docker exec lab-db1 python3 -c 'import platform; print(platform.freedesktop_os_release()["VERSION_ID"])' 2>/dev/null); full=$(docker exec lab-db1 cat /etc/debian_version 2>/dev/null)
+[ -f /home/student/distro-version.txt ] || fail "Нет ~/distro-version.txt"
+got=$(tr -d '[:space:]"' < /home/student/distro-version.txt)
+[ "$got" = "$want" ] || [ "$got" = "$full" ] || fail "В ~/distro-version.txt «$got» — версия дистрибутива на lab-db1 другая"
+docker exec lab-db1 dpkg-query -W -f='${Status}' curl 2>/dev/null | grep -q 'install ok installed' || fail "На lab-db1 curl не установлен"
+for h in lab-web1 lab-web2; do docker exec $h dpkg-query -W -f='${Status}' curl 2>/dev/null | grep -q 'install ok installed' && fail "curl установлен и на $h — а нужно только на группу db"; done
+ok "lab-db1: Debian $want, curl установлен только на db"
+```
+
+```text hint
+1. Модуль сбора фактов можно запустить ad-hoc с фильтром по имени факта — вывод станет коротким.
+2. Модуль пакетов Debian; списки пакетов на свежем сервере пустые — их нужно обновить в том же вызове.
+3. Ключ режима проверки показывает, что изменится, ничего не меняя. Права администратора — ключ «become» (здесь подключение и так от root, но на серверах он нужен).
+```
+
+```bash solution
+cd ~/ansible-lab
+ansible lab-db1 -m setup -a 'filter=ansible_distribution_version'
+ansible lab-db1 -m setup -a 'filter=ansible_distribution_version' | grep -oE '"[0-9.]+"' | tr -d '"' > ~/distro-version.txt
+ansible db -b -m apt -a 'name=curl state=present update_cache=yes' --check
+ansible db -b -m apt -a 'name=curl state=present update_cache=yes'
+```
+
+```text review
+Эталон: `ansible lab-db1 -m setup -a 'filter=ansible_distribution_version'`, `ansible db -b -m apt -a 'name=curl state=present update_cache=yes' --check`, затем без `--check`.
+
+- Факты (`setup`) — всё, что Ansible знает о хосте: ОС, IP, память, диски. В плейбуках они собираются автоматически (`gather_facts`) и используются в `when` и шаблонах.
+- `--check` — сухой прогон, `--diff` — показать изменения файлов. Перед прогоном на прод — всегда.
+- `-b` (become) — sudo на сервере. `-f N` — сколько хостов параллельно (по умолчанию 5); `--limit` — сузить выборку.
+- Ad-hoc — для разовых действий («перезапусти nginx на web», «сколько места на дисках»). Всё, что повторяется, — в плейбук.
+```
+
 ## Тест
 
 ### Какие группы есть в inventory всегда, даже если их не описывать?

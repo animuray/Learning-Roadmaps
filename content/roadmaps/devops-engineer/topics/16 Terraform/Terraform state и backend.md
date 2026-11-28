@@ -175,6 +175,176 @@ resource "yandex_compute_instance" "app" {
 - [ ] Испортить state (например, удалить ресурс из него через state rm), найти проблему в plan и восстановить предыдущую версию state из версионированного бакета
 - [ ] Настроить разные ключи backend для dev и prod через -backend-config
 
+## Лаборатория
+
+Ресурсы в задачах — файлы (`hashicorp/local`) и контейнеры Docker (`kreuzwerker/docker`). PostgreSQL на стенде (порт 5432) годится и как **backend** для state — в Terraform есть встроенный backend `pg` с блокировками.
+
+```bash lib
+# Terraform 1.x на стенде; провайдеры скачиваются из registry.terraform.io (кэш — ~/.terraform.d/plugin-cache).
+# Инфраструктура в задачах — файлы (hashicorp/local) и контейнеры Docker (kreuzwerker/docker).
+lab_tf() { su - student -c "cd $1 && terraform $2" > /tmp/lab-tf.log 2>&1; }
+# план без изменений: 0 — ничего не меняется, 2 — есть изменения, 1 — ошибка
+lab_tfclean() { su - student -c "cd $1 && terraform plan -detailed-exitcode -input=false -lock=false" > /tmp/lab-tf.log 2>&1; echo $?; }
+lab_tflog() { sed 's/\x1b\[[0-9;]*m//g' /tmp/lab-tf.log | grep -E 'Error|will be|must be|#' | head -3 | tr '\n' ' ' | cut -c1-250; }
+lab_tfdir() { rm -rf "$1"; mkdir -p "$1"; chown -R student:student "$(dirname "$1")"; }
+lab_drm() { docker rm -f "$@" >/dev/null 2>&1; true; }
+# образ есть локально или скачивается (если ученик почистил образы через prune)
+lab_img() { for i in "$@"; do docker image inspect "$i" >/dev/null 2>&1 || docker pull -q "$i" >/dev/null; done; }
+# lab_wait_http URL [строка] — дождаться ответа
+lab_wait_http() { for i in $(seq 60); do curl -s --max-time 1 "$1" 2>/dev/null | grep -q "${2:-.}" && return 0; sleep 0.25; done; return 1; }
+```
+
+### State в общем хранилище
+
+Проект `~/tf/app` применён, но его state лежит локальным файлом — команда с ним работать не сможет. Перенесите state в backend **`pg`**: база **`tfstate`**, схема **`app`**, строка подключения `postgres://tf:tf-pass@localhost/tfstate?sslmode=disable` (роль и база уже созданы). Существующее состояние должно **переехать**, а не создаться заново: после переноса `terraform plan` — без изменений, локального `terraform.tfstate` больше нет.
+
+```bash setup
+lab_tfdir /home/student/tf/app
+sudo -u postgres psql -qX -c "DROP DATABASE IF EXISTS tfstate WITH (FORCE)" -c "DROP ROLE IF EXISTS tf" >/dev/null 2>&1
+sudo -u postgres psql -qX -c "CREATE ROLE tf LOGIN PASSWORD 'tf-pass'" -c "CREATE DATABASE tfstate OWNER tf" >/dev/null
+cat > /home/student/tf/app/main.tf <<'EOF'
+terraform {
+  required_providers {
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.5"
+    }
+  }
+}
+
+resource "local_file" "config" {
+  filename = "${path.module}/out/app.conf"
+  content  = "port=8080\n"
+}
+EOF
+chown -R student:student /home/student/tf
+su - student -c 'cd ~/tf/app && terraform init -input=false >/dev/null && terraform apply -auto-approve -input=false >/dev/null'
+```
+
+```bash check
+d=/home/student/tf/app
+grep -qE 'backend\s+"pg"' $d/*.tf || fail "В конфигурации нет backend \"pg\""
+[ -s $d/terraform.tfstate ] && fail "Локальный terraform.tfstate всё ещё есть — state не перенесён (или остался дубликат)"
+n=$(PGPASSWORD=tf-pass psql -h localhost -U tf -d tfstate -qXtA -c "select count(*) from app.states where name = 'default'" 2>/dev/null)
+[ "$n" = 1 ] || fail "В базе tfstate (схема app) нет state рабочего пространства default"
+PGPASSWORD=tf-pass psql -h localhost -U tf -d tfstate -qXtA -c "select data from app.states where name = 'default'" | grep -q 'local_file' || fail "В state из базы нет ресурса local_file.config — он не перенесён, а создан пустым"
+[ "$(lab_tfclean $d)" = 0 ] || fail "После переноса terraform plan находит изменения: $(lab_tflog)"
+ok "state в PostgreSQL (tfstate.app.states), plan — без изменений"
+```
+
+```text hint
+1. Добавить в блок terraform описание backend нужного типа со строкой подключения и именем схемы.
+2. Смена backend требует повторной инициализации — с ключом «перенести состояние» Terraform сам скопирует текущий state в новое хранилище (и спросит подтверждение; для скрипта есть ключ «не спрашивать»).
+3. Убедиться, что план пуст, и удалить старые локальные файлы state (в том числе резервную копию).
+```
+
+```bash solution
+cd ~/tf/app
+cat > backend.tf <<'EOF'
+terraform {
+  backend "pg" {
+    conn_str    = "postgres://tf:tf-pass@localhost/tfstate?sslmode=disable"
+    schema_name = "app"
+  }
+}
+EOF
+terraform init -migrate-state -force-copy -input=false
+rm -f terraform.tfstate terraform.tfstate.backup
+terraform plan -detailed-exitcode && echo "изменений нет"
+```
+
+```text review
+Эталон: `backend "pg"` → `terraform init -migrate-state`.
+
+- State — карта «ресурс в коде ↔ объект в реальности». Потеряли state — Terraform попытается создать всё заново (и упрётся в уже существующие ресурсы). Два человека с разными копиями state — гонка и порча инфраструктуры.
+- Удалённый backend решает это: одно хранилище и **блокировка** на время `apply`. В облаках — S3 (с блокировкой через DynamoDB или встроенной `use_lockfile`), GCS, Azure Blob, Terraform Cloud, GitLab-managed state (HTTP backend).
+- В state бывают секреты (пароли баз в атрибутах) — хранилище state шифруют и ограничивают доступ.
+- Пароль в `conn_str` в коде — плохо: в жизни его передают переменной окружения `PG_CONN_STR` или через `-backend-config`.
+```
+
+```text notes
+rm\s+[^\n]*tfstate[^\n]*&&[^\n]*init\s+(?![^\n]*migrate) => Похоже, локальный state удаляли до переноса — так ресурсы теряются из-под управления. Сначала init -migrate-state, потом удаление.
+```
+
+### Переименовать ресурс без пересоздания
+
+В проекте `~/tf/rename` контейнер описан как `docker_container.web`. По договорённости команды его нужно назвать **`docker_container.frontend`**. Переименуйте ресурс в коде так, чтобы Terraform **не пересоздавал** контейнер (он работает с пользователями): после переименования `terraform plan` — без изменений, ID контейнера `tf-frontend` тот же.
+
+```bash setup
+lab_tfdir /home/student/tf/rename
+docker rm -f tf-frontend >/dev/null 2>&1
+cat > /home/student/tf/rename/main.tf <<'EOF'
+terraform {
+  required_providers {
+    docker = {
+      source  = "kreuzwerker/docker"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "docker" {}
+
+resource "docker_image" "nginx" {
+  name         = "nginx:1.27-alpine"
+  keep_locally = true
+}
+
+resource "docker_container" "web" {
+  name  = "tf-frontend"
+  image = docker_image.nginx.image_id
+}
+EOF
+chown -R student:student /home/student/tf
+su - student -c 'cd ~/tf/rename && terraform init -input=false >/dev/null && terraform apply -auto-approve -input=false >/dev/null'
+docker inspect -f '{{.Id}}' tf-frontend > /var/lib/lab/tf-frontend-id
+```
+
+```bash check
+d=/home/student/tf/rename
+grep -qE 'resource\s+"docker_container"\s+"frontend"' $d/*.tf || fail "В коде нет resource \"docker_container\" \"frontend\""
+grep -qE 'resource\s+"docker_container"\s+"web"' $d/*.tf && fail "В коде остался docker_container.web"
+st=$(su - student -c "cd $d && terraform state list" 2>/dev/null)
+echo "$st" | grep -qx 'docker_container.frontend' || fail "В state нет docker_container.frontend"
+[ "$(docker inspect -f '{{.Id}}' tf-frontend 2>/dev/null)" = "$(cat /var/lib/lab/tf-frontend-id)" ] || fail "Контейнер tf-frontend пересоздан (другой ID)"
+[ "$(lab_tfclean $d)" = 0 ] || fail "terraform plan находит изменения: $(lab_tflog)"
+ok "docker_container.web → docker_container.frontend, контейнер тот же"
+```
+
+```text hint
+1. Если просто переименовать ресурс в коде, Terraform решит: старый удалить, новый создать. Посмотрите план и убедитесь.
+2. Сообщить Terraform о переименовании можно декларативно — специальным блоком в коде «откуда → куда», либо командой перемещения адреса в state.
+3. План после этого должен показать перемещение без пересоздания (или вовсе «No changes»), затем apply.
+```
+
+```bash solution
+cd ~/tf/rename
+sed -i 's/resource "docker_container" "web"/resource "docker_container" "frontend"/' main.tf
+cat >> main.tf <<'EOF'
+
+moved {
+  from = docker_container.web
+  to   = docker_container.frontend
+}
+EOF
+terraform plan
+terraform apply -auto-approve
+terraform state list
+```
+
+```text review
+Эталон: переименование в коде + блок `moved { from = docker_container.web; to = docker_container.frontend }` → `apply`.
+
+- `moved` — декларативный рефакторинг: изменение видно в ревью, применяется на всех окружениях одинаково. Старый способ — `terraform state mv docker_container.web docker_container.frontend` руками в каждом state.
+- Так же переносят ресурсы в модуль (`to = module.web.docker_container.this`). Блок `moved` можно убрать, когда все окружения применены.
+- Родственное: `import` (взять под управление созданный вручную ресурс, есть блок `import {}`), `terraform state rm` (перестать управлять, не удаляя).
+- Пересоздание по ошибке — частая авария: «переименовал ресурс базы — Terraform её удалил». Поэтому план читают глазами, а для важного ставят `lifecycle { prevent_destroy = true }`.
+```
+
+```text notes
+state\s+mv => Использовался terraform state mv — работает, но это ручная операция над одним state. Блок moved в коде переносится на все окружения и виден в ревью.
+```
+
 ## Тест
 
 ### Зачем Terraform нужен state?

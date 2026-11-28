@@ -114,6 +114,156 @@ sudo logrotate -f /etc/logrotate.d/myapp   # принудительная рот
 - [ ] Написать конфиг logrotate для логов своего приложения и проверить его через `logrotate -d`
 - [ ] Отправить сообщение из скрипта в журнал через `logger` и найти его в `journalctl`
 
+## Лаборатория
+
+### Найти ошибку в журнале
+
+Служба `billing` пишет в системный журнал много сообщений об оплатах. Среди них есть ошибки. Найдите **последнее** сообщение уровня `err` от `billing` и запишите номер заказа из него (только число) в `~/order.txt`.
+
+```bash setup
+rm -f /home/student/order.txt
+systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1
+for i in $(seq 1 25); do echo "payment ok order=$((RANDOM % 90000 + 10000)) amount=$((RANDOM % 5000))" | systemd-cat -t billing -p info; done
+id=$((RANDOM % 90000 + 10000))
+echo "payment failed order=$id: card declined" | systemd-cat -t billing -p err
+for i in $(seq 1 10); do echo "payment ok order=$((RANDOM % 90000 + 10000)) amount=$((RANDOM % 5000))" | systemd-cat -t billing -p info; done
+echo "$id" > /var/lib/lab/billing-order
+sleep 1
+```
+
+```bash check
+want=$(cat /var/lib/lab/billing-order)
+[ -f /home/student/order.txt ] || fail "Нет ~/order.txt"
+got=$(tr -d '[:space:]' < /home/student/order.txt)
+[ "$got" = "$want" ] || fail "В ~/order.txt «$got» — это не номер заказа из последней ошибки billing"
+ok "последняя ошибка billing: заказ $want"
+```
+
+```text hint
+1. У просмотрщика журнала есть фильтры: по идентификатору программы, по уровню важности и по количеству последних записей.
+2. Формат вывода «только текст сообщения» уберёт дату и имя хоста — номер станет проще вырезать.
+```
+
+```bash solution
+journalctl -t billing -p err -n 1 --no-pager -o cat
+journalctl -t billing -p err -n 1 --no-pager -o cat | grep -o 'order=[0-9]*' | cut -d= -f2 > ~/order.txt
+```
+
+```text review
+Эталон: `journalctl -t billing -p err -n 1 -o cat`.
+
+- Фильтры journalctl: `-u nginx` — юнит, `-t billing` — идентификатор (SYSLOG_IDENTIFIER), `-p err` — уровень **и важнее** (`err`, `crit`, `alert`, `emerg`), `--since "10 min ago"`, `-b` — текущая загрузка, `-f` — следить.
+- `-o cat` — только текст; `-o json` — все поля, удобно для разбора скриптом.
+- Писать в журнал из скриптов: `logger -t myapp -p user.err "текст"` или `echo текст | systemd-cat -t myapp -p err`.
+- `grep error` по тексту найдёт и «0 errors», и пропустит «FAILED». Уровень важности надёжнее — если программа его честно ставит.
+```
+
+```text notes
+grep\s+-i?\s*['"]?(error|failed|err)\b => Ошибки искались grep по тексту. Работает, но фильтр journalctl -p err по уровню надёжнее: он не цепляет «0 errors» в обычных сообщениях.
+```
+
+### Журнал, который переживает перезагрузку
+
+На этом сервере журнал хранится только в памяти: после перезагрузки все логи пропадают, разбирать причину сбоя не по чему. Сделайте хранение журнала **постоянным** — на диске — и примените настройку без перезагрузки сервера.
+
+```bash setup
+mkdir -p /etc/systemd/journald.conf.d
+find /etc/systemd/journald.conf.d -name '*.conf' ! -name '10-lab.conf' -delete
+printf '[Journal]\nStorage=volatile\n' > /etc/systemd/journald.conf.d/10-lab.conf
+sed -i 's/^Storage=.*/#Storage=auto/' /etc/systemd/journald.conf
+rm -rf /var/log/journal
+systemctl restart systemd-journald
+```
+
+```bash check
+eff=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -E '^Storage=' | tail -1 | cut -d= -f2)
+[ "$eff" = persistent ] || [ "$eff" = auto ] || fail "Итоговая настройка хранения журнала — «${eff:-по умолчанию}»: журнал живёт только в памяти"
+ls /var/log/journal/*/system.journal >/dev/null 2>&1 || fail "Журнал не пишется на диск: файлов в /var/log/journal нет (journald не перезапущен или настройка не применилась)"
+ok "Storage=$eff, журнал на диске: $(du -sh /var/log/journal | cut -f1)"
+```
+
+```text hint
+1. Настройки journald собираются из основного файла и из каталога дополнений рядом с ним; значения из дополнений важнее, а среди дополнений побеждает файл, который идёт последним по имени. Посмотрите итоговый конфиг — у systemd-analyze есть команда, которая склеивает все части.
+2. Нужный режим хранения задаётся одной строкой в разделе журнала.
+3. Перезапустить саму службу журнала — она создаст каталог на диске.
+```
+
+```bash solution
+systemd-analyze cat-config systemd/journald.conf | grep -E '^(#|Storage)' | grep -v '^#  ' | tail -5
+printf '[Journal]\nStorage=persistent\n' | sudo tee /etc/systemd/journald.conf.d/50-persistent.conf >/dev/null
+sudo systemctl restart systemd-journald
+sudo systemd-tmpfiles --create --prefix /var/log/journal
+journalctl --disk-usage
+```
+
+```text review
+Эталон: drop-in `/etc/systemd/journald.conf.d/50-persistent.conf` со `Storage=persistent` → `systemctl restart systemd-journald`.
+
+- Ловушка задачи: правка основного `/etc/systemd/journald.conf` не помогла бы — дополнение `10-lab.conf` с `volatile` важнее. `systemd-analyze cat-config` показывает, кто что задал. Так же устроены `sshd_config.d`, `sysctl.d`, unit-файлы с drop-in.
+- `Storage=auto` (по умолчанию) пишет на диск, **если** существует `/var/log/journal`. `persistent` создаёт каталог сам — но без прав для группы `systemd-journal` и `adm`: обычные пользователи из этих групп перестанут видеть журнал. Права выставляет `systemd-tmpfiles --create --prefix /var/log/journal` (при загрузке это происходит само).
+- Размер ограничивают `SystemMaxUse=500M` или чисткой: `journalctl --vacuum-time=14d`, `--vacuum-size=1G`.
+- Посмотреть прошлую загрузку: `journalctl --list-boots`, `journalctl -b -1 -p err` — главный инструмент после внезапной перезагрузки.
+```
+
+```text notes
+journald\.conf(?!\.d) => Правился основной journald.conf — в этой системе дополнения из journald.conf.d важнее его. Смотрите итоговую картину: systemd-analyze cat-config systemd/journald.conf.
+```
+
+### Ротация логов приложения
+
+Приложение пишет логи в `/var/log/labapp/*.log`, и они растут бесконечно. Настройте **logrotate** для этих файлов: ротация каждый день, хранить 7 старых файлов, сжимать их, не ругаться на отсутствующие файлы и не ротировать пустые.
+
+```bash setup
+rm -f /etc/logrotate.d/labapp
+rm -rf /var/log/labapp
+mkdir -p /var/log/labapp
+for f in app worker; do for i in $(seq 1 200); do echo "2026-11-28 12:00:$((i % 60)) INFO $f event $i"; done > /var/log/labapp/$f.log; done
+```
+
+```bash check
+c=/etc/logrotate.d/labapp
+[ -f $c ] || fail "Нет конфигурации /etc/logrotate.d/labapp"
+grep -q '/var/log/labapp/\*\.log' $c || fail "В конфигурации нет шаблона /var/log/labapp/*.log"
+grep -qwE '^[[:space:]]*daily' $c || fail "Не задана ежедневная ротация"
+grep -qwE '^[[:space:]]*compress' $c || fail "Старые файлы не сжимаются"
+grep -qwE '^[[:space:]]*missingok' $c || fail "Если файла нет, logrotate выдаст ошибку — не задан пропуск отсутствующих файлов"
+grep -qwE '^[[:space:]]*notifempty' $c || fail "Пустые файлы тоже будут ротироваться"
+grep -qE '^[[:space:]]*rotate[[:space:]]+7[[:space:]]*$' $c || fail "Число хранимых старых файлов не равно 7"
+out=$(logrotate -d $c 2>&1) || fail "logrotate находит ошибку в конфигурации: $(echo "$out" | grep -iE 'error' | head -1)"
+logrotate -f -s /tmp/lab-logrotate.state $c >/dev/null 2>&1 || fail "Принудительная ротация завершилась ошибкой"
+ls /var/log/labapp/app.log.1* >/dev/null 2>&1 || fail "После ротации нет app.log.1 — конфигурация не срабатывает"
+ok "ротация работает: $(ls /var/log/labapp | tr '\n' ' ')"
+```
+
+```text hint
+1. Свой файл для приложения — в каталоге дополнительных конфигураций logrotate.
+2. Структура: шаблон путей и фигурные скобки, внутри — директивы по одной на строку: периодичность, сколько хранить, сжатие и два «вежливых» правила для пустых и отсутствующих файлов.
+3. Проверить конфигурацию в режиме отладки (ничего не меняет), а затем — принудительной ротацией.
+```
+
+```bash solution
+sudo tee /etc/logrotate.d/labapp >/dev/null <<'EOF'
+/var/log/labapp/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+}
+EOF
+sudo logrotate -d /etc/logrotate.d/labapp
+```
+
+```text review
+Эталон — блок `/var/log/labapp/*.log { daily; rotate 7; compress; missingok; notifempty }`.
+
+- `logrotate -d` — сухой прогон с объяснением, `-f` — принудительно сейчас. Запускается он раз в сутки таймером `logrotate.timer` (или cron).
+- `delaycompress` — не сжимать самый свежий архив (`app.log.1`): программа может ещё дописывать в него.
+- Программа держит файл открытым: после переименования она продолжит писать в `app.log.1`. Решения: `postrotate` с `systemctl reload app` (программа переоткроет файл) или `copytruncate` (скопировать и обнулить — возможна потеря строк).
+- `maxsize 100M` — ротировать раньше срока, если файл вырос; `dateext` — суффикс с датой вместо номера.
+```
+
 ## Тест
 
 ### Как посмотреть логи службы nginx в journald?

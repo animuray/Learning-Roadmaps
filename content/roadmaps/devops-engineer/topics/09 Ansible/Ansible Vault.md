@@ -126,6 +126,177 @@ deploy:
 - [ ] Сменить пароль vault через `rekey`
 - [ ] Передать пароль vault в пайплайн GitLab через переменную типа File
 
+## Лаборатория
+
+«Серверы» — контейнеры `lab-web1`, `lab-web2`, `lab-db1`; проект `~/ansible-lab` с `ansible.cfg` и `inventory.ini` (группы `web` и `db`) готов.
+
+```bash lib
+# «Серверы» для Ansible — контейнеры lab-web1, lab-web2, lab-db1 (Python, sudo, sshd); подключение — community.docker.docker
+lab_host_image() {
+  docker image inspect lab-ansible-host:2 >/dev/null 2>&1 && return
+  docker image inspect python:3.12-slim >/dev/null 2>&1 || docker pull -q python:3.12-slim >/dev/null
+  docker build -q -t lab-ansible-host:2 - >/dev/null <<'EOF'
+FROM python:3.12-slim
+RUN apt-get update -q && apt-get install -y -q --no-install-recommends sudo openssh-server \
+ && mkdir -p /run/sshd && rm -rf /var/lib/apt/lists/*
+CMD ["sleep", "infinity"]
+EOF
+}
+lab_hosts() { lab_host_image; for h in ${*:-lab-web1 lab-web2 lab-db1}; do docker rm -f $h >/dev/null 2>&1; docker run -d --name $h --hostname $h lab-ansible-host:2 >/dev/null; done; }
+# lab_inv каталог — ansible.cfg и inventory.ini: web = lab-web1, lab-web2; db = lab-db1
+lab_inv() {
+  mkdir -p "$1"
+  printf '[defaults]\ninventory = inventory.ini\ninterpreter_python = /usr/local/bin/python3\n' > "$1/ansible.cfg"
+  printf '[web]\nlab-web1\nlab-web2\n\n[db]\nlab-db1\n\n[all:vars]\nansible_connection=community.docker.docker\n' > "$1/inventory.ini"
+}
+lab_own() { chown -R student:student "$1"; }
+# lab_play каталог аргументы — ansible-playbook от имени ученика, вывод — в /tmp/lab-ans.log
+lab_play() { su - student -c "cd $1 && ANSIBLE_NOCOLOR=1 ansible-playbook $2" > /tmp/lab-ans.log 2>&1; }
+# сумма changed по всем хостам из итогов последнего прогона
+lab_changed() { grep -E '^lab-[a-z0-9]+ +:' /tmp/lab-ans.log | grep -oE 'changed=[0-9]+' | cut -d= -f2 | awk '{s += $1} END {print s + 0}'; }
+lab_anslog() { grep -E 'fatal|ERROR|FAILED|error' /tmp/lab-ans.log | head -2 | tr '\n' ' ' | cut -c1-300; }
+```
+
+```bash setup
+lab_hosts
+rm -rf /home/student/ansible-lab /home/student/.vault_pass
+lab_inv /home/student/ansible-lab
+lab_own /home/student/ansible-lab
+```
+
+### Пароль базы в зашифрованном файле
+
+Плейбук `~/ansible-lab/db.yml` (уже написан) кладёт на `lab-db1` файл `/etc/app/db.env` со строкой `DB_PASSWORD={{ db_password }}`. Задайте `db_password` по схеме «открытый + зашифрованный файлы»:
+
+- `group_vars/db/vault.yml` — **зашифрованный** Ansible Vault, в нём `vault_db_password: S3cr3t-db`;
+- `group_vars/db/vars.yml` — открытый, в нём `db_password: "{{ vault_db_password }}"`;
+- пароль от vault — в файле **`~/.vault_pass`** (вне каталога проекта, права **600**).
+
+Запустите плейбук с этим файлом пароля.
+
+```bash setup
+mkdir -p /home/student/ansible-lab
+cat > /home/student/ansible-lab/db.yml <<'EOF'
+- name: Настройки базы
+  hosts: db
+  become: true
+  tasks:
+    - name: Каталог настроек
+      ansible.builtin.file:
+        path: /etc/app
+        state: directory
+        mode: "0755"
+    - name: Файл с паролем
+      ansible.builtin.copy:
+        dest: /etc/app/db.env
+        content: "DB_PASSWORD={{ db_password }}\n"
+        mode: "0600"
+      no_log: true
+EOF
+lab_own /home/student/ansible-lab
+```
+
+```bash check
+d=/home/student/ansible-lab
+v=$d/group_vars/db/vault.yml
+[ -f $v ] || fail "Нет group_vars/db/vault.yml"
+head -1 $v | grep -q '^\$ANSIBLE_VAULT' || fail "group_vars/db/vault.yml не зашифрован"
+grep -q 'S3cr3t-db' $v && fail "Пароль виден в vault.yml открытым текстом"
+[ -f $d/group_vars/db/vars.yml ] || fail "Нет group_vars/db/vars.yml"
+grep -q 'vault_db_password' $d/group_vars/db/vars.yml || fail "vars.yml не ссылается на vault_db_password"
+[ -f /home/student/.vault_pass ] || fail "Нет ~/.vault_pass"
+[ "$(stat -c %a /home/student/.vault_pass)" = 600 ] || fail "Права на ~/.vault_pass — $(stat -c %a /home/student/.vault_pass)"
+ls $d/.vault_pass $d/vault_pass* 2>/dev/null | grep -q . && fail "Файл пароля vault лежит в каталоге проекта — он попадёт в Git"
+su - student -c "cd $d && ansible-vault view --vault-password-file ~/.vault_pass group_vars/db/vault.yml" 2>/dev/null | grep -qE 'vault_db_password:\s*"?S3cr3t-db"?' || fail "vault.yml не расшифровывается паролем из ~/.vault_pass или в нём нет vault_db_password: S3cr3t-db"
+docker exec lab-db1 rm -f /etc/app/db.env
+lab_play $d "db.yml --vault-password-file ~/.vault_pass" || fail "Плейбук с паролем vault падает: $(lab_anslog)"
+[ "$(docker exec lab-db1 cat /etc/app/db.env 2>/dev/null)" = "DB_PASSWORD=S3cr3t-db" ] || fail "На lab-db1 в /etc/app/db.env не тот пароль"
+grep -q 'S3cr3t-db' /tmp/lab-ans.log && fail "Пароль виден в выводе плейбука"
+ok "секрет зашифрован, плейбук получил его через vault"
+```
+
+```text hint
+1. Создать файл пароля в домашнем каталоге и закрыть его от всех, кроме себя.
+2. Создать каталог переменных группы с двумя файлами: открытый — со ссылкой на «секретную» переменную, второй — с самим секретом. Второй зашифровать утилитой vault (у неё есть команды создать, зашифровать, посмотреть, отредактировать), указав файл пароля.
+3. Запустить плейбук, указав тот же файл пароля.
+```
+
+```bash solution
+echo 'lab-vault-password' > ~/.vault_pass && chmod 600 ~/.vault_pass
+cd ~/ansible-lab && mkdir -p group_vars/db
+echo 'db_password: "{{ vault_db_password }}"' > group_vars/db/vars.yml
+echo 'vault_db_password: S3cr3t-db' > group_vars/db/vault.yml
+ansible-vault encrypt --vault-password-file ~/.vault_pass group_vars/db/vault.yml
+head -1 group_vars/db/vault.yml
+ansible-playbook db.yml --vault-password-file ~/.vault_pass
+```
+
+```text review
+Эталон: `vars.yml` (`db_password: "{{ vault_db_password }}"`) + зашифрованный `vault.yml` + `--vault-password-file ~/.vault_pass`.
+
+- Схема «vars + vault»: по открытому файлу видно, **какие** переменные есть и откуда берутся (`grep db_password` работает), а значения — только в зашифрованном. Префикс `vault_` — договорённость.
+- Зашифрованный файл можно спокойно коммитить; пароль vault — **никогда**: он в `~/.vault_pass`, менеджере паролей, а в CI — в переменной типа File (`--vault-password-file $VAULT_PASS_FILE`) или в `ANSIBLE_VAULT_PASSWORD_FILE`.
+- `no_log: true` — чтобы значение не попало в вывод и логи (особенно с `-v` и при ошибке).
+- Команды: `ansible-vault create|edit|view|encrypt|decrypt|rekey`. `rekey` — сменить пароль при уходе человека из команды.
+```
+
+### Одно зашифрованное значение
+
+Иногда шифровать весь файл неудобно. В `~/ansible-lab/group_vars/web.yml` уже есть открытые переменные. Добавьте туда переменную **`api_token`** со значением **`tok-web-7781`**, **зашифрованную как одно значение** (`!vault |`), — остальные переменные файла должны остаться открытыми. Пароль vault — тот же `~/.vault_pass` (создайте, если его нет). Затем запустите плейбук `~/ansible-lab/token.yml` (уже написан) — он кладёт токен на серверы `web`.
+
+```bash setup
+mkdir -p /home/student/ansible-lab/group_vars
+printf 'app_port: 8080\nlog_level: info\n' > /home/student/ansible-lab/group_vars/web.yml
+cat > /home/student/ansible-lab/token.yml <<'EOF'
+- name: Токен API
+  hosts: web
+  become: true
+  tasks:
+    - name: Записать токен
+      ansible.builtin.copy:
+        dest: /etc/api_token
+        content: "{{ api_token }}\n"
+        mode: "0600"
+      no_log: true
+EOF
+lab_own /home/student/ansible-lab
+```
+
+```bash check
+d=/home/student/ansible-lab
+f=$d/group_vars/web.yml
+grep -q 'tok-web-7781' $f && fail "Токен виден в group_vars/web.yml открытым текстом"
+grep -qE '^api_token:\s*!vault\s*\|' $f || fail "В group_vars/web.yml нет api_token, зашифрованного как одно значение (!vault |)"
+head -1 $f | grep -q '^\$ANSIBLE_VAULT' && fail "Зашифрован весь файл, а нужно одно значение"
+grep -qE '^app_port:\s*8080' $f && grep -qE '^log_level:\s*info' $f || fail "Открытые переменные файла пропали или изменились"
+for h in lab-web1 lab-web2; do docker exec $h rm -f /etc/api_token; done
+lab_play $d "token.yml --vault-password-file ~/.vault_pass" || fail "Плейбук падает: $(lab_anslog)"
+for h in lab-web1 lab-web2; do [ "$(docker exec $h cat /etc/api_token 2>/dev/null)" = tok-web-7781 ] || fail "На $h в /etc/api_token не тот токен"; done
+ok "api_token зашифрован одной строкой, остальное — открыто"
+```
+
+```text hint
+1. У утилиты vault есть команда шифрования одной строки: ей передают значение и имя переменной — она печатает готовый фрагмент YAML.
+2. Дописать этот фрагмент в файл переменных группы.
+3. Запустить плейбук с файлом пароля.
+```
+
+```bash solution
+[ -f ~/.vault_pass ] || { echo 'lab-vault-password' > ~/.vault_pass; chmod 600 ~/.vault_pass; }
+cd ~/ansible-lab
+ansible-vault encrypt_string --vault-password-file ~/.vault_pass 'tok-web-7781' --name api_token >> group_vars/web.yml
+cat group_vars/web.yml
+ansible-playbook token.yml --vault-password-file ~/.vault_pass
+```
+
+```text review
+Эталон: `ansible-vault encrypt_string 'tok-web-7781' --name api_token >> group_vars/web.yml`.
+
+- Плюс: файл остаётся читаемым и diff в merge request показывает, что поменялось. Минус: такое значение нельзя «просто отредактировать» — только заменить новой строкой из `encrypt_string`.
+- Посмотреть значение: `ansible localhost -m debug -a var=api_token -e @group_vars/web.yml --vault-password-file ~/.vault_pass`.
+- Для больших проектов секреты часто уносят из Ansible совсем — в HashiCorp Vault (lookup `community.hashi_vault.hashi_vault`) или облачный Secret Manager.
+```
+
 ## Тест
 
 ### Для чего нужен Ansible Vault?

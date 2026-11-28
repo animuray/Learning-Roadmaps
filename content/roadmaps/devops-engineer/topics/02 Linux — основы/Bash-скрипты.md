@@ -187,6 +187,212 @@ shellcheck script.sh    # линтер: находит забытые кавыч
 - [ ] Прогнать все скрипты через `shellcheck` и исправить замечания
 - [ ] Попросить нейросеть дать 10 задач на bash и решить их, складывая решения в репозиторий-конспект
 
+## Лаборатория
+
+### Скрипт бэкапа
+
+Напишите скрипт `~/backup.sh`, который:
+
+- принимает **один аргумент** — путь к каталогу;
+- создаёт архив `~/backups/<имя каталога>-<ГГГГ-ММ-ДД>.tar.gz` с содержимым каталога (каталог `~/backups` создаёт сам, если его нет);
+- если аргумента нет или каталога не существует — печатает понятную ошибку и завершается с **ненулевым** кодом.
+
+Для проверки есть каталог `~/data`.
+
+```bash setup
+rm -rf /home/student/backups /home/student/backup.sh /home/student/data
+mkdir -p /home/student/data/sub
+echo "важные данные" > /home/student/data/a.txt
+echo "ещё" > /home/student/data/sub/b.txt
+chown -R student:student /home/student/data
+```
+
+```bash check
+s=/home/student/backup.sh
+[ -f $s ] || fail "Нет ~/backup.sh"
+[ -x $s ] || fail "~/backup.sh не исполняемый"
+head -1 $s | grep -q '^#!' || fail "Нет shebang в первой строке"
+rm -rf /home/student/backups
+su - student -c "~/backup.sh ~/data" >/dev/null 2>&1 || fail "~/backup.sh ~/data завершился с ошибкой (код $?)"
+a=/home/student/backups/data-$(date +%F).tar.gz
+[ -f $a ] || fail "Не появился архив $a. Есть: $(ls /home/student/backups 2>/dev/null | tr '\n' ' ')"
+tar -tzf $a | grep -q 'a.txt' || fail "В архиве нет a.txt"
+tar -tzf $a | grep -q 'sub/b.txt' || fail "В архиве нет вложенного sub/b.txt"
+su - student -c "~/backup.sh /no/such/dir" >/dev/null 2>&1 && fail "С несуществующим каталогом скрипт завершился с кодом 0 — должен с ошибкой"
+su - student -c "~/backup.sh" >/dev/null 2>&1 && fail "Без аргумента скрипт завершился с кодом 0 — должен с ошибкой"
+err=$(su - student -c "~/backup.sh /no/such/dir" 2>&1 >/dev/null)
+[ -n "$err" ] || fail "При ошибке скрипт ничего не пишет в поток ошибок — пользователь не поймёт, что случилось"
+ok "архив $(basename $a), ошибки: «$err»"
+```
+
+```text hint
+1. Проверить, что аргумент передан и это существующий каталог; иначе — сообщение в поток ошибок и выход с кодом 1.
+2. Создать каталог для архивов (без ошибки, если уже есть).
+3. Имя архива: базовое имя каталога + дата в формате ГГГГ-ММ-ДД.
+4. Упаковать каталог архиватором со сжатием; чтобы в архиве не было полного пути, архивируйте относительно родительского каталога.
+5. Не забудьте сделать файл исполняемым.
+```
+
+```bash solution
+cat > ~/backup.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+src="${1:-}"
+if [[ -z "$src" || ! -d "$src" ]]; then
+    echo "Использование: $0 <каталог> (каталог «$src» не найден)" >&2
+    exit 1
+fi
+
+dest="$HOME/backups"
+mkdir -p "$dest"
+name="$(basename "$src")-$(date +%F).tar.gz"
+tar -czf "$dest/$name" -C "$(dirname "$src")" "$(basename "$src")"
+echo "Готово: $dest/$name"
+EOF
+chmod +x ~/backup.sh
+```
+
+```text review
+Эталон — в «Решении». На что смотрят на ревью скриптов:
+
+- `set -euo pipefail` — скрипт падает при первой ошибке, на неизвестной переменной и при ошибке внутри пайпа. Без этого бэкап «успешно» создаст пустой архив.
+- `${1:-}` — безопасное чтение аргумента при `set -u`.
+- Ошибки — в stderr (`>&2`) и с ненулевым кодом: cron и мониторинг ориентируются именно на код возврата.
+- Все переменные в двойных кавычках: каталог с пробелом в имени не должен ломать скрипт.
+- `tar -C "$(dirname ...)"` — в архиве будет `data/a.txt`, а не `home/student/data/a.txt`.
+- `date +%F` = `%Y-%m-%d`. Удаление старых архивов: `find "$dest" -name '*.tar.gz' -mtime +7 -delete`.
+- Проверьте скрипт `shellcheck backup.sh` — он ловит большинство таких ошибок автоматически.
+```
+
+```text notes
+tar\s+[^\n]*\$1(?!["}]) => $1 без кавычек: каталог с пробелом в имени развалится на несколько аргументов. Берите переменные в двойные кавычки: "$1".
+```
+
+### Проверка диска
+
+Напишите скрипт `~/check-disk.sh`:
+
+- аргумент — порог заполнения в процентах (по умолчанию `90`);
+- печатает текущее заполнение корневой файловой системы `/` в процентах;
+- завершается с кодом **1**, если заполнение **больше** порога, иначе с кодом **0**.
+
+```bash setup
+rm -f /home/student/check-disk.sh
+```
+
+```bash check
+s=/home/student/check-disk.sh
+[ -x $s ] || fail "Нет исполняемого ~/check-disk.sh"
+use=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+su - student -c "~/check-disk.sh 100" >/dev/null 2>&1 || fail "С порогом 100 (заполнение $use%) скрипт вернул ошибку — должен 0"
+su - student -c "~/check-disk.sh 0" >/dev/null 2>&1 && fail "С порогом 0 (заполнение $use% > 0) скрипт вернул 0 — должен 1"
+lo=$((use - 1)); hi=$((use + 1))
+su - student -c "~/check-disk.sh $hi" >/dev/null 2>&1 || fail "С порогом $hi% (заполнение $use%) должен быть код 0"
+su - student -c "~/check-disk.sh $lo" >/dev/null 2>&1 && fail "С порогом $lo% (заполнение $use%) должен быть код 1"
+out=$(su - student -c "~/check-disk.sh 100" 2>&1)
+echo "$out" | grep -q "$use" || fail "Скрипт не печатает текущее заполнение ($use%). Вывод: «$out»"
+su - student -c "~/check-disk.sh" >/dev/null 2>&1 || [ "$use" -gt 90 ] || fail "Без аргумента (порог 90) скрипт вернул ошибку при заполнении $use%"
+ok "заполнение $use%, вывод: «$out»"
+```
+
+```text hint
+1. Порог — первый аргумент, а если его нет — значение по умолчанию (у оболочки есть подстановка «значение или запасное»).
+2. Узнать заполнение корня: команда свободного места умеет выводить только колонку процентов. Оставьте от неё одно число без знака %.
+3. Сравнить два целых числа и выйти с нужным кодом.
+```
+
+```bash solution
+cat > ~/check-disk.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+limit="${1:-90}"
+usage=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+echo "Заполнение /: ${usage}% (порог ${limit}%)"
+if (( usage > limit )); then
+    exit 1
+fi
+EOF
+chmod +x ~/check-disk.sh
+```
+
+```text review
+Эталон — в «Решении».
+
+- `${1:-90}` — значение по умолчанию.
+- `df --output=pcent /` выводит только проценты; `tail -1` убирает заголовок, `tr -dc '0-9'` — пробелы и знак %. Разбор обычного `df -h | awk` ломается, когда имя устройства длинное и строка переносится.
+- `(( usage > limit ))` — арифметическое сравнение. `[ "$usage" > "$limit" ]` — ошибка: внутри `[` знак `>` — перенаправление в файл с именем из `$limit`.
+- Такие скрипты подключают к мониторингу или cron: важен именно код возврата, текст — для человека.
+```
+
+```text notes
+\[\s*"?\$\w+"?\s*>\s*"?\$?\w+ => Внутри [ ... ] знак > — это перенаправление в файл, а не сравнение. Для чисел используйте -gt или (( a > b )).
+```
+
+### Управление «службой»
+
+Напишите скрипт `~/svc.sh` с командами:
+
+| Команда | Что делает | Код возврата |
+| --- | --- | --- |
+| `start` | создаёт файл `~/svc.running`, печатает `started` | 0 |
+| `stop` | удаляет `~/svc.running`, печатает `stopped` | 0 |
+| `status` | печатает `running` или `stopped` | 0 если работает, 3 если нет |
+| любая другая или пусто | печатает подсказку по использованию в stderr | 2 |
+
+```bash setup
+rm -f /home/student/svc.sh /home/student/svc.running
+```
+
+```bash check
+s=/home/student/svc.sh
+[ -x $s ] || fail "Нет исполняемого ~/svc.sh"
+run() { su - student -c "~/svc.sh $1" 2>/dev/null; }
+code() { su - student -c "~/svc.sh $1" >/dev/null 2>&1; echo $?; }
+rm -f /home/student/svc.running
+[ "$(code status)" = 3 ] || fail "status у остановленной службы должен вернуть 3, а вернул $(code status)"
+[ "$(run status)" = stopped ] || fail "status у остановленной должен печатать stopped, а печатает «$(run status)»"
+[ "$(run start)" = started ] || fail "start должен печатать started"
+[ -f /home/student/svc.running ] || fail "После start нет файла ~/svc.running"
+[ "$(code status)" = 0 ] || fail "status у работающей должен вернуть 0"
+[ "$(run status)" = running ] || fail "status у работающей должен печатать running"
+[ "$(run stop)" = stopped ] || fail "stop должен печатать stopped"
+[ -f /home/student/svc.running ] && fail "После stop файл ~/svc.running остался"
+[ "$(code restart-everything)" = 2 ] || fail "Неизвестная команда должна завершаться с кодом 2"
+[ "$(code '')" = 2 ] || fail "Запуск без команды должен завершаться с кодом 2"
+u=$(su - student -c "~/svc.sh bad" 2>&1 >/dev/null)
+[ -n "$u" ] || fail "Подсказка по использованию должна идти в stderr"
+ok "start/stop/status и коды возврата работают"
+```
+
+```text hint
+Разбор первого аргумента конструкцией выбора по вариантам: для каждой команды — своя ветка, плюс ветка «всё остальное». Коды возврата: команда выхода с числом. Подсказку для «всего остального» выведите в поток ошибок.
+```
+
+```bash solution
+cat > ~/svc.sh <<'EOF'
+#!/bin/bash
+pidfile="$HOME/svc.running"
+case "${1:-}" in
+    start)  touch "$pidfile"; echo started ;;
+    stop)   rm -f "$pidfile"; echo stopped ;;
+    status)
+        if [[ -f "$pidfile" ]]; then echo running; else echo stopped; exit 3; fi ;;
+    *)      echo "Использование: $0 {start|stop|status}" >&2; exit 2 ;;
+esac
+EOF
+chmod +x ~/svc.sh
+```
+
+```text review
+Эталон — в «Решении». Это скелет init-скрипта из времён до systemd.
+
+- Коды возврата взяты не с потолка: по стандарту LSB `status` возвращает 0 — работает, 3 — не работает; `systemctl status` следует тому же соглашению. Мониторинг и Ansible полагаются на эти коды.
+- `case "${1:-}"` — безопасно при пустом аргументе.
+- Ветка `*)` с подсказкой в stderr и кодом 2 («неправильное использование») — признак аккуратного скрипта.
+- Цепочка `if/elif` тоже решает задачу, но `case` читается проще и поддерживает шаблоны: `start|up)`.
+```
+
 ## Тест
 
 ### Зачем нужна первая строка #!/usr/bin/env bash?

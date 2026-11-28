@@ -142,6 +142,148 @@ CMD ["node", "server.js"]
 - [ ] Просканировать оба образа через trivy и сравнить число уязвимостей
 - [ ] Проверить, как приложение реагирует на `docker stop`: завершается ли сразу или ждёт 10 секунд
 
+## Лаборатория
+
+```bash setup
+lab_drm() { docker rm -f "$@" >/dev/null 2>&1; true; }
+# образ есть локально или скачивается (если ученик почистил образы через prune)
+lab_img() { for i in "$@"; do docker image inspect "$i" >/dev/null 2>&1 || docker pull -q "$i" >/dev/null; done; }
+# lab_wait_http URL [строка] — дождаться ответа
+lab_wait_http() { for i in $(seq 60); do curl -s --max-time 1 "$1" 2>/dev/null | grep -q "${2:-.}" && return 0; sleep 0.25; done; return 1; }
+lab_img python:3.12-slim hadolint/hadolint:v2.12.0
+```
+
+### Чистый отчёт линтера
+
+В `~/lintme/Dockerfile` собраны типичные ошибки. Исправьте его так, чтобы **hadolint** не находил ни ошибок, ни предупреждений (`docker run --rm -i hadolint/hadolint:v2.12.0 < Dockerfile`), образ **`lintme:1.0`** собирался, а приложение в нём запускалось **не от root**.
+
+```bash setup
+docker rmi -f lintme:1.0 >/dev/null 2>&1
+rm -rf /home/student/lintme && mkdir -p /home/student/lintme
+echo 'print("lint ok")' > /home/student/lintme/app.py
+echo '# пусто' > /home/student/lintme/requirements.txt
+cat > /home/student/lintme/Dockerfile <<'EOF'
+FROM python:latest
+RUN mkdir /app
+RUN cd /app
+ADD app.py /app/app.py
+ADD requirements.txt /app/requirements.txt
+RUN pip install -r /app/requirements.txt
+CMD python3 /app/app.py
+EOF
+chown -R student:student /home/student/lintme
+```
+
+```bash check
+f=/home/student/lintme/Dockerfile
+out=$(docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --failure-threshold warning - < $f 2>&1) || fail "hadolint находит проблемы: $(echo "$out" | head -3 | sed 's/^-:/строка /' | tr '\n' ' ')"
+docker image inspect lintme:1.0 >/dev/null 2>&1 || fail "Образа lintme:1.0 нет"
+su - student -c 'docker build -q -t lab-lintme-check ~/lintme' >/dev/null 2>&1 || fail "Исправленный Dockerfile не собирается"
+[ "$(docker run --rm lab-lintme-check 2>&1)" = "lint ok" ] || fail "Приложение в образе не запускается"
+uid=$(docker run --rm --entrypoint id lab-lintme-check -u 2>/dev/null)
+[ -n "$uid" ] && [ "$uid" != 0 ] || fail "Приложение в образе работает от root"
+docker rmi -f lab-lintme-check >/dev/null 2>&1
+ok "hadolint: чисто; uid $uid"
+```
+
+```text hint
+1. Запустить линтер и прочитать каждое замечание: у каждого есть код (DL…) — по нему находится объяснение и способ исправления.
+2. Типичные правки: конкретный тег базового образа, рабочий каталог вместо смены каталога в RUN, копирование вместо ADD для локальных файлов, установка пакетов без кэша, команда запуска в exec-форме.
+3. Добавить непривилегированного пользователя и переключиться на него. Собрать образ и проверить ещё раз.
+```
+
+```bash solution
+cat > ~/lintme/Dockerfile <<'EOF'
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+RUN useradd -r -u 10001 app
+USER app
+CMD ["python3", "app.py"]
+EOF
+docker run --rm -i hadolint/hadolint:v2.12.0 < ~/lintme/Dockerfile && echo "hadolint: OK"
+docker build -q -t lintme:1.0 ~/lintme
+```
+
+```text review
+Эталон — в «Решении».
+
+- **DL3007** `latest`: сегодня это 3.12, завтра 3.13 — сборка «сама» меняется. Фиксируйте тег, а для полной воспроизводимости — digest (`python:3.12-slim@sha256:...`).
+- **DL3003** `RUN cd`: не действует на следующие инструкции — `WORKDIR`.
+- **DL3020** `ADD` для локальных файлов: `ADD` ещё распаковывает архивы и качает URL — неожиданное поведение; для файлов — `COPY`.
+- **DL3042** `pip install` без `--no-cache-dir`: кэш pip остаётся в слое.
+- **DL3025** shell-форма CMD: приложение не PID 1 и не получает SIGTERM.
+- hadolint ставят в CI перед сборкой и в редактор (расширение VS Code). Вместе с trivy (уязвимости в образе) — базовая проверка Dockerfile в пайплайне.
+```
+
+```text notes
+hadolint\s+ignore|--ignore => Предупреждения hadolint подавлялись. Иногда это оправдано, но здесь все замечания исправляются.
+```
+
+### Быстрая остановка
+
+Контейнер из образа `~/slowstop` останавливается командой `docker stop` целых **10 секунд**, хотя приложение умеет завершаться мгновенно. Исправьте **образ** (Dockerfile), чтобы обычный `docker stop` занимал **меньше 3 секунд**. Соберите его как **`slowstop:fixed`**. Ключ `--init` при запуске не подходит — исправление должно быть в образе.
+
+```bash setup
+docker rmi -f slowstop:fixed >/dev/null 2>&1
+rm -rf /home/student/slowstop && mkdir -p /home/student/slowstop
+cat > /home/student/slowstop/app.py <<'EOF'
+import signal, sys, time
+def stop(signum, frame):
+    print("получен сигнал, завершаюсь", flush=True)
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+print("работаю", flush=True)
+while True:
+    time.sleep(1)
+EOF
+cat > /home/student/slowstop/Dockerfile <<'EOF'
+FROM python:3.12-slim
+WORKDIR /app
+COPY app.py .
+CMD python3 app.py
+EOF
+chown -R student:student /home/student/slowstop
+```
+
+```bash check
+docker image inspect slowstop:fixed >/dev/null 2>&1 || fail "Образа slowstop:fixed нет"
+docker rm -f lab-slowstop-check >/dev/null 2>&1
+docker run -d --name lab-slowstop-check slowstop:fixed >/dev/null
+sleep 2
+[ "$(docker inspect -f '{{.State.Running}}' lab-slowstop-check)" = true ] || { docker rm -f lab-slowstop-check >/dev/null; fail "Контейнер из slowstop:fixed не работает"; }
+t0=$(date +%s%N); docker stop lab-slowstop-check >/dev/null; t1=$(date +%s%N)
+ms=$(( (t1 - t0) / 1000000 ))
+code=$(docker inspect -f '{{.State.ExitCode}}' lab-slowstop-check); docker rm -f lab-slowstop-check >/dev/null
+[ $ms -lt 3000 ] || fail "docker stop занял $ms мс — приложение не получило SIGTERM и было убито по тайм-ауту"
+[ "$code" = 0 ] || fail "Контейнер завершился с кодом $code, а приложение умеет выходить с 0"
+ok "docker stop: $ms мс, код выхода $code"
+```
+
+```text hint
+1. Засечь время остановки и посмотреть дерево процессов в контейнере: кто там PID 1?
+2. В shell-форме команды запуска главным процессом становится оболочка, а она не передаёт сигнал остановки приложению. Запишите команду так, чтобы приложение само было главным процессом.
+```
+
+```bash solution
+sed -i 's/^CMD python3 app.py$/CMD ["python3", "app.py"]/' ~/slowstop/Dockerfile
+docker build -q -t slowstop:fixed ~/slowstop
+docker run -d --name slow-test slowstop:fixed && sleep 1
+time docker stop slow-test
+docker rm slow-test
+```
+
+```text review
+Эталон: exec-форма `CMD ["python3", "app.py"]`.
+
+- В shell-форме PID 1 — `/bin/sh -c "python3 app.py"`. `docker stop` шлёт SIGTERM в PID 1, оболочка его не пересылает дочернему процессу, через 10 секунд приходит SIGKILL — и приложение умирает без уборки (код 137).
+- Если приложению нужен скрипт-обёртка (миграции, подстановка переменных) — заканчивайте его `exec python3 app.py`: тогда приложение заменит оболочку и станет PID 1.
+- Процесс PID 1 в Linux не получает сигналы по умолчанию — без обработчика SIGTERM игнорируется. Поэтому либо обработчик в приложении, либо init-процесс в образе (`tini` в ENTRYPOINT) или `docker run --init`.
+- В Kubernetes то же самое с `terminationGracePeriodSeconds` (30 с по умолчанию) — медленная остановка тормозит каждый деплой.
+```
+
 ## Тест
 
 ### Почему не стоит использовать тег latest в FROM?

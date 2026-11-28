@@ -112,6 +112,148 @@ gitops/
 - [ ] Настроить защиту каталога prod: изменения только через MR с ревью
 - [ ] Выписать, какие секреты есть в проекте, и выбрать способ работы с ними в GitOps (Sealed Secrets, SOPS или External Secrets)
 
+## Лаборатория
+
+В кластере работает Argo CD, приложение **`shop`** уже развёрнуто из репозитория `git://<IP узла>/shop.git` (каталог `manifests/`) в namespace `lab-gitops`. Ваш клон репозитория — `~/shop-manifests`.
+
+```bash lib
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# Git-сервер для Argo CD: git daemon отдаёт /srv/gitops по git://<IP узла>/; ученик пушит в репозитории по пути на диске
+lab_node_ip() { kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'; }
+lab_gitd() {
+  mkdir -p /srv/gitops && chown student:student /srv/gitops
+  [ "$(systemctl is-active lab-gitd 2>/dev/null)" = active ] && return
+  systemctl reset-failed lab-gitd 2>/dev/null
+  systemd-run -q --unit=lab-gitd -p User=student git daemon --reuseaddr --base-path=/srv/gitops --export-all /srv/gitops
+  sleep 1
+}
+# lab_shop_repo — репозиторий манифестов /srv/gitops/shop.git: Deployment shop (1 реплика) и Service в каталоге manifests/
+lab_shop_repo() {
+  rm -rf /srv/gitops/shop.git /home/student/shop-manifests
+  su - student -c 'git config --global user.name >/dev/null || git config --global user.name Student; git config --global user.email >/dev/null || git config --global user.email student@stand.local'
+  su - student -c 'git init -q --bare -b main /srv/gitops/shop.git && git clone -q /srv/gitops/shop.git ~/shop-manifests 2>/dev/null'
+  mkdir -p /home/student/shop-manifests/manifests
+  cat > /home/student/shop-manifests/manifests/app.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: shop
+  template:
+    metadata:
+      labels:
+        app: shop
+    spec:
+      containers:
+        - name: shop
+          image: hashicorp/http-echo:1.0
+          args: ["-text=shop via gitops"]
+          ports:
+            - containerPort: 5678
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop
+spec:
+  selector:
+    app: shop
+  ports:
+    - port: 80
+      targetPort: 5678
+EOF
+  chown -R student:student /home/student/shop-manifests
+  su - student -c 'cd ~/shop-manifests && git add -A && git commit -qm "Shop manifests" && git push -q origin main'
+}
+lab_argo_app() { kubectl -n argocd get application "$1" -o json 2>/dev/null; }
+lab_argo_refresh() { kubectl -n argocd annotate application "$1" argocd.argoproj.io/refresh=normal --overwrite >/dev/null 2>&1; }
+```
+
+### Изменения — только через Git
+
+Магазину нужно **3 реплики**. Сделайте это по-GitOps:
+
+1. измените число реплик **в Git** (коммит и push в `main`) — не командами `kubectl` в кластере;
+2. включите в приложении `shop` **самовосстановление** (selfHeal): ручная правка в кластере должна откатываться к состоянию из Git, и **удаление лишнего** (prune): ресурс, удалённый из Git, должен удаляться из кластера.
+
+Argo CD опрашивает Git раз в 3 минуты — чтобы не ждать, попросите его обновиться (кнопка Refresh в интерфейсе или аннотация `argocd.argoproj.io/refresh=normal` на приложении).
+
+```bash setup
+lab_gitd
+kubectl -n argocd delete application shop --ignore-not-found --wait=true >/dev/null 2>&1
+kubectl delete ns lab-gitops --ignore-not-found --wait=true >/dev/null 2>&1
+lab_shop_repo
+ip=$(lab_node_ip)
+cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: shop
+  namespace: argocd
+spec:
+  project: default
+  source: {repoURL: "git://$ip/shop.git", targetRevision: main, path: manifests}
+  destination: {server: "https://kubernetes.default.svc", namespace: lab-gitops}
+  syncPolicy:
+    automated: {}
+    syncOptions: [CreateNamespace=true]
+EOF
+for i in $(seq 60); do [ "$(kubectl -n argocd get application shop -o jsonpath='{.status.sync.status}')" = Synced ] && break; sleep 1; done
+```
+
+```bash check
+a=$(lab_argo_app shop) || fail "Приложения shop нет"
+[ "$(echo "$a" | jq -r .spec.syncPolicy.automated.selfHeal)" = true ] || fail "Самовосстановление (selfHeal) не включено"
+[ "$(echo "$a" | jq -r .spec.syncPolicy.automated.prune)" = true ] || fail "Удаление лишнего (prune) не включено"
+r=$(git -C /srv/gitops/shop.git show main:manifests/app.yaml 2>/dev/null | python3 -c 'import sys,yaml; print([d for d in yaml.safe_load_all(sys.stdin) if d and d["kind"] == "Deployment"][0]["spec"]["replicas"])' 2>/dev/null)
+[ "$r" = 3 ] || fail "В Git (ветка main) у Deployment shop реплик: ${r:-?}"
+lab_argo_refresh shop
+head=$(git -C /srv/gitops/shop.git rev-parse main)
+for i in $(seq 40); do a=$(lab_argo_app shop); [ "$(echo "$a" | jq -r .status.sync.revision)" = "$head" ] && [ "$(echo "$a" | jq -r .status.sync.status)" = Synced ] && break; sleep 1; done
+[ "$(echo "$a" | jq -r .status.sync.revision)" = "$head" ] || fail "Argo CD ещё не применил последний коммит из Git"
+for i in $(seq 30); do [ "$(kubectl -n lab-gitops get deploy shop -o jsonpath='{.spec.replicas}')" = 3 ] && break; sleep 1; done
+[ "$(kubectl -n lab-gitops get deploy shop -o jsonpath='{.spec.replicas}')" = 3 ] || fail "В кластере у shop не 3 реплики"
+kubectl -n lab-gitops scale deploy shop --replicas=5 >/dev/null
+for i in $(seq 40); do [ "$(kubectl -n lab-gitops get deploy shop -o jsonpath='{.spec.replicas}')" = 3 ] && break; sleep 1; done
+[ "$(kubectl -n lab-gitops get deploy shop -o jsonpath='{.spec.replicas}')" = 3 ] || fail "Ручное изменение в кластере (5 реплик) не откатилось к Git"
+ok "3 реплики из Git; ручная правка в кластере откатилась автоматически"
+```
+
+```text hint
+1. Изменить число реплик в манифесте клона, закоммитить и отправить на сервер.
+2. Политика автоматической синхронизации приложения принимает два флага: самовосстановление и удаление лишнего. Изменить приложение можно правкой его манифеста или патчем ресурса Application.
+3. Попросить Argo CD обновить состояние из Git (аннотация) и дождаться синхронизации.
+```
+
+```bash solution
+cd ~/shop-manifests
+sed -i 's/replicas: 1/replicas: 3/' manifests/app.yaml
+git commit -qam "shop: 3 replicas"
+git push -q origin main
+kubectl -n argocd patch application shop --type=merge -p '{"spec":{"syncPolicy":{"automated":{"selfHeal":true,"prune":true}}}}'
+kubectl -n argocd annotate application shop argocd.argoproj.io/refresh=normal --overwrite
+sleep 15
+kubectl -n lab-gitops get deploy shop
+```
+
+```text review
+Эталон: коммит с `replicas: 3` → push → `automated: {selfHeal: true, prune: true}` → refresh.
+
+- **Git — единственный источник правды.** `kubectl edit` в проде при selfHeal откатится через секунды — и это правильно: правка, которой нет в Git, потеряется при следующем деплое и не прошла ревью.
+- **prune** без опаски включают, когда всё описано в Git; иначе Argo удалит «чужие» ресурсы. Защитить конкретный ресурс: аннотация `argocd.argoproj.io/sync-options: Prune=false`.
+- Откат в GitOps — `git revert` коммита: история изменений инфраструктуры = история Git (кто, когда, зачем, с ревью).
+- Вместо опроса раз в 3 минуты настраивают webhook из GitLab/GitHub в Argo CD — синхронизация сразу после push.
+- Секреты в GitOps-репозитории — только зашифрованными (Sealed Secrets, SOPS) или ссылками на внешнее хранилище (External Secrets Operator + Vault).
+```
+
+```text notes
+kubectl\s+(-n\s+\S+\s+)?(scale|edit|patch)\s+(deploy|deployment)\b => Deployment правили командой kubectl напрямую — при включённом selfHeal Argo CD вернёт состояние из Git. Изменения — через коммит.
+```
+
 ## Тест
 
 ### Какие четыре принципа GitOps определяет OpenGitOps?

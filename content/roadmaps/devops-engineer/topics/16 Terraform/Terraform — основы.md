@@ -266,6 +266,181 @@ import {
 - [ ] Добавить .gitignore для .terraform, tfstate и tfvars с секретами, закоммитить .terraform.lock.hcl
 - [ ] Удалить всё через terraform destroy
 
+## Лаборатория
+
+Облака на стенде нет, поэтому «инфраструктура» в задачах — локальные файлы (провайдер `hashicorp/local`) и контейнеры Docker (провайдер `kreuzwerker/docker`). Язык, команды и state — ровно те же, что для AWS или Yandex Cloud.
+
+```bash lib
+# Terraform 1.x на стенде; провайдеры скачиваются из registry.terraform.io (кэш — ~/.terraform.d/plugin-cache).
+# Инфраструктура в задачах — файлы (hashicorp/local) и контейнеры Docker (kreuzwerker/docker).
+lab_tf() { su - student -c "cd $1 && terraform $2" > /tmp/lab-tf.log 2>&1; }
+# план без изменений: 0 — ничего не меняется, 2 — есть изменения, 1 — ошибка
+lab_tfclean() { su - student -c "cd $1 && terraform plan -detailed-exitcode -input=false -lock=false" > /tmp/lab-tf.log 2>&1; echo $?; }
+lab_tflog() { sed 's/\x1b\[[0-9;]*m//g' /tmp/lab-tf.log | grep -E 'Error|will be|must be|#' | head -3 | tr '\n' ' ' | cut -c1-250; }
+lab_tfdir() { rm -rf "$1"; mkdir -p "$1"; chown -R student:student "$(dirname "$1")"; }
+lab_drm() { docker rm -f "$@" >/dev/null 2>&1; true; }
+# образ есть локально или скачивается (если ученик почистил образы через prune)
+lab_img() { for i in "$@"; do docker image inspect "$i" >/dev/null 2>&1 || docker pull -q "$i" >/dev/null; done; }
+# lab_wait_http URL [строка] — дождаться ответа
+lab_wait_http() { for i in $(seq 60); do curl -s --max-time 1 "$1" 2>/dev/null | grep -q "${2:-.}" && return 0; sleep 0.25; done; return 1; }
+```
+
+### Первый ресурс
+
+В `~/tf/hello` опишите конфигурацию Terraform:
+
+- провайдер **`hashicorp/local`** (версия `~> 2.5`) в блоке `required_providers`;
+- переменная **`greeting`** со значением по умолчанию `Привет, Terraform`;
+- ресурс **`local_file.hello`** — файл `out/hello.txt` в каталоге проекта с содержимым из переменной;
+- output **`hello_path`** — путь к файлу.
+
+Примените конфигурацию. Повторный `terraform plan` не должен находить изменений.
+
+```bash setup
+lab_tfdir /home/student/tf/hello
+```
+
+```bash check
+d=/home/student/tf/hello
+ls $d/*.tf >/dev/null 2>&1 || fail "В ~/tf/hello нет файлов .tf"
+grep -qE 'hashicorp/local' $d/*.tf || fail "Провайдер hashicorp/local не объявлен в required_providers"
+[ -f $d/terraform.tfstate ] || fail "Конфигурация не применена: нет terraform.tfstate"
+su - student -c "cd $d && terraform state list" 2>/dev/null | grep -qx 'local_file.hello' || fail "В state нет ресурса local_file.hello"
+[ "$(cat $d/out/hello.txt 2>/dev/null)" = "Привет, Terraform" ] || fail "out/hello.txt отсутствует или содержимое не «Привет, Terraform»"
+[ "$(lab_tfclean $d)" = 0 ] || fail "terraform plan находит изменения: $(lab_tflog)"
+o=$(su - student -c "cd $d && terraform output -raw hello_path" 2>/dev/null)
+[ -n "$o" ] || fail "Нет output hello_path"
+lab_tf $d "apply -auto-approve -input=false -var greeting=Проверка" && [ "$(cat $d/out/hello.txt)" = Проверка ] || fail "Содержимое файла не берётся из переменной greeting"
+lab_tf $d "apply -auto-approve -input=false"
+ok "local_file.hello создан, hello_path = $o"
+```
+
+```text hint
+1. Блок terraform с required_providers: источник провайдера и ограничение версии.
+2. Переменная — блок variable с типом и значением по умолчанию; ресурс файла — имя файла (путь проекта доступен выражением path.module) и содержимое; output — значение, которое Terraform печатает после применения.
+3. Порядок работы: инициализация (скачать провайдеры), план, применение. Повторный план после применения — «No changes».
+```
+
+```bash solution
+cd ~/tf/hello
+cat > main.tf <<'EOF'
+terraform {
+  required_providers {
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.5"
+    }
+  }
+}
+
+variable "greeting" {
+  type    = string
+  default = "Привет, Terraform"
+}
+
+resource "local_file" "hello" {
+  filename = "${path.module}/out/hello.txt"
+  content  = var.greeting
+}
+
+output "hello_path" {
+  value = local_file.hello.filename
+}
+EOF
+terraform init -input=false
+terraform plan
+terraform apply -auto-approve
+terraform plan -detailed-exitcode && echo "изменений нет"
+```
+
+```text review
+Эталон — в «Решении».
+
+- Цикл Terraform: `init` (провайдеры и backend) → `plan` (сравнить код, state и реальность) → `apply` → state обновлён. `plan` перед каждым `apply` — обязательный ритуал, в CI его вывод смотрят в merge request.
+- Ограничение версии провайдера (`~> 2.5` — 2.5 и выше, но не 3.0) и файл `.terraform.lock.hcl` (коммитится!) дают одинаковые версии у всей команды.
+- `.terraform/` и `*.tfstate` в Git не кладут: первый — скачанные провайдеры, второй — состояние, часто с секретами (следующая тема — удалённый state).
+- `terraform fmt` и `terraform validate` — первые шаги проверки кода в CI.
+```
+
+### Контейнер через Terraform
+
+В `~/tf/web` опишите через провайдер **`kreuzwerker/docker`** (версия `~> 3.0`):
+
+- образ `nginx:1.27-alpine` (`docker_image`, **не удалять** образ при destroy);
+- контейнер **`tf-web`** (`docker_container`) из этого образа с портом **8190** на хосте → 80.
+
+Примените. Затем **кто-то вручную удалил контейнер** (`docker rm -f tf-web`) — восстановите его тоже через Terraform, без правки кода.
+
+```bash setup
+lab_tfdir /home/student/tf/web
+docker rm -f tf-web >/dev/null 2>&1; true
+```
+
+```bash check
+d=/home/student/tf/web
+grep -qE 'kreuzwerker/docker' $d/*.tf 2>/dev/null || fail "Провайдер kreuzwerker/docker не объявлен"
+st=$(su - student -c "cd $d && terraform state list" 2>/dev/null)
+echo "$st" | grep -qE '^docker_container\.' || fail "В state нет docker_container"
+echo "$st" | grep -qE '^docker_image\.' || fail "В state нет docker_image"
+[ "$(docker inspect -f '{{.State.Running}}' tf-web 2>/dev/null)" = true ] || fail "Контейнер tf-web не запущен"
+curl -s --max-time 3 localhost:8190 | grep -q 'Welcome to nginx' || fail "localhost:8190 не отдаёт nginx"
+grep -qE 'keep_locally\s*=\s*true' $d/*.tf || fail "Образ будет удалён при terraform destroy — нужно keep_locally = true"
+docker rm -f tf-web >/dev/null
+[ "$(lab_tfclean $d)" = 2 ] || fail "После ручного удаления контейнера terraform plan не видит расхождения"
+lab_tf $d "apply -auto-approve -input=false" || fail "terraform apply не смог восстановить контейнер: $(lab_tflog)"
+[ "$(docker inspect -f '{{.State.Running}}' tf-web 2>/dev/null)" = true ] || fail "terraform apply не восстановил tf-web"
+ok "tf-web управляется Terraform: удалённый вручную контейнер возвращается apply"
+```
+
+```text hint
+1. Провайдер Docker подключается к локальному демону без настроек — пустой блок provider.
+2. Ресурс образа: имя образа и флаг «оставлять локально». Ресурс контейнера: имя, ссылка на образ (атрибут ресурса образа) и блок портов: внутренний и внешний.
+3. После ручного удаления посмотрите план: Terraform сравнивает state с реальностью и хочет вернуть описанное состояние.
+```
+
+```bash solution
+cd ~/tf/web
+cat > main.tf <<'EOF'
+terraform {
+  required_providers {
+    docker = {
+      source  = "kreuzwerker/docker"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "docker" {}
+
+resource "docker_image" "nginx" {
+  name         = "nginx:1.27-alpine"
+  keep_locally = true
+}
+
+resource "docker_container" "web" {
+  name  = "tf-web"
+  image = docker_image.nginx.image_id
+  ports {
+    internal = 80
+    external = 8190
+  }
+}
+EOF
+terraform init -input=false
+terraform apply -auto-approve
+docker rm -f tf-web
+terraform plan
+terraform apply -auto-approve
+```
+
+```text review
+Эталон — в «Решении».
+
+- **Drift** (дрейф) — реальность разошлась с кодом (кто-то поправил руками в консоли облака). `terraform plan` его показывает, `apply` возвращает описанное состояние. Регулярный `plan` по расписанию в CI — способ ловить дрейф.
+- `docker_container.web.image = docker_image.nginx.image_id` — ссылка на атрибут создаёт **зависимость**: Terraform сам выстроит порядок (сначала образ, потом контейнер) и параллелит независимое. Граф — `terraform graph`.
+- `keep_locally` — образом пользуются и другие, удалять его при `destroy` нельзя. В облаке аналог — `prevent_destroy` в `lifecycle` для баз и бакетов с данными.
+```
+
 ## Тест
 
 ### Чем Terraform отличается от Ansible?

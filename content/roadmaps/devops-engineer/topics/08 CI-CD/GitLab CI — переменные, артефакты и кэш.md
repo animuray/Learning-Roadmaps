@@ -210,6 +210,236 @@ deploy-prod:
 - [ ] Собрать образ в CI и выгрузить в Container Registry проекта с тегом `$CI_COMMIT_SHORT_SHA`
 - [ ] Описать окружения staging (автоматически) и production (`when: manual`) и найти историю деплоев в Operate → Environments
 
+## Лаборатория
+
+Пайплайны выполняются локально через `gitlab-ci-local` (см. тему «GitLab CI — основы»).
+
+```bash lib
+# Пайплайны GitLab CI выполняются локально утилитой gitlab-ci-local (shell executor — задачи идут прямо на стенде)
+# lab_ci_repo каталог — новый репозиторий ученика с одним коммитом (файлы кладёт вызывающий до коммита)
+lab_ci_repo() { rm -rf "$1"; mkdir -p "$1"; }
+lab_ci_commit() { chown -R student:student "$1"; su - student -c "cd $1 && git init -q -b main 2>/dev/null; git add -A && git commit -qm 'Initial commit'"; }
+# lab_ci_run каталог [ключи] — пайплайн от имени ученика; вывод — в /tmp/lab-ci.log, код возврата — код пайплайна
+lab_ci_run() { su - student -c "cd $1 && timeout 300 gitlab-ci-local $2" > /tmp/lab-ci.log 2>&1; }
+# lab_ci_preview каталог — итоговый YAML после include, extends и default (JSON)
+lab_ci_preview() { su - student -c "cd $1 && gitlab-ci-local --preview" 2>/dev/null | sed -n '/^---$/,$p' | python3 -c 'import sys,yaml,json; print(json.dumps(yaml.safe_load(sys.stdin)))'; }
+# lab_ci_jobs каталог [ветка] — список задач (JSON); с веткой — во временной копии репозитория на этой ветке
+lab_ci_jobs() {
+  if [ -n "$2" ]; then
+    rm -rf /tmp/lab-ci-branch; su - student -c "git clone -q $1 /tmp/lab-ci-branch && cd /tmp/lab-ci-branch && cp $1/.gitlab-ci*.yml . 2>/dev/null; [ -d $1/ci ] && mkdir -p ci && cp -r $1/ci/. ci/; git switch -qc $2 && gitlab-ci-local --list-json" 2>/dev/null
+  else
+    su - student -c "cd $1 && gitlab-ci-local --list-json" 2>/dev/null
+  fi
+}
+lab_ci_log() { sed 's/\x1b\[[0-9;]*m//g' /tmp/lab-ci.log | grep -vE '^\s*$' | tail -n "${1:-4}" | tr '\n' ' ' | cut -c1-300; }
+lab_drm() { docker rm -f "$@" >/dev/null 2>&1; true; }
+# образ есть локально или скачивается (если ученик почистил образы через prune)
+lab_img() { for i in "$@"; do docker image inspect "$i" >/dev/null 2>&1 || docker pull -q "$i" >/dev/null; done; }
+# lab_wait_http URL [строка] — дождаться ответа
+lab_wait_http() { for i in $(seq 60); do curl -s --max-time 1 "$1" 2>/dev/null | grep -q "${2:-.}" && return 0; sleep 0.25; done; return 1; }
+```
+
+```bash setup
+su - student -c 'git config --global user.name >/dev/null || git config --global user.name Student; git config --global user.email >/dev/null || git config --global user.email student@stand.local'
+```
+
+### Передать сборку в деплой
+
+В `~/ci-site` — статический сайт: шаблон `index.html` с меткой `__VERSION__`. Напишите пайплайн из двух этапов:
+
+- **build** — задача `build` собирает сайт в `public/`: копирует `index.html`, заменив `__VERSION__` на **короткий SHA коммита** (готовая переменная GitLab), и сохраняет `public/` как **артефакт**;
+- **deploy** — задача `deploy` **без пересборки** берёт `public/` из артефакта и копирует его содержимое в `~/ci-www/` (это «сервер»).
+
+После запуска пайплайна `~/ci-www/index.html` должен содержать SHA текущего коммита.
+
+```bash setup
+d=/home/student/ci-site
+lab_ci_repo $d
+rm -rf /home/student/ci-www
+echo '<h1>Сайт, версия __VERSION__</h1>' > $d/index.html
+printf '.gitlab-ci-local/\npublic/\n' > $d/.gitignore
+lab_ci_commit $d
+```
+
+```bash check
+d=/home/student/ci-site
+[ -f $d/.gitlab-ci.yml ] || fail "Нет ~/ci-site/.gitlab-ci.yml"
+rm -rf /home/student/ci-www $d/public
+lab_ci_run $d || fail "Пайплайн не проходит: $(lab_ci_log)"
+sha=$(su - student -c "cd $d && git rev-parse --short=8 HEAD")
+[ -f /home/student/ci-www/index.html ] || fail "После пайплайна нет ~/ci-www/index.html"
+grep -q "$sha" /home/student/ci-www/index.html || fail "~/ci-www/index.html не содержит SHA коммита $sha: $(head -c 100 /home/student/ci-www/index.html)"
+p=$(lab_ci_preview $d)
+echo "$p" | jq -e '.build.artifacts.paths | map(test("^public/?$")) | any' >/dev/null || fail "Задача build не сохраняет public/ как артефакт"
+[ "$(echo "$p" | jq -r '.deploy.script | join(" ")' | grep -cE 'sed|__VERSION__')" = 0 ] || fail "Задача deploy пересобирает сайт сама, а должна брать готовый из артефакта"
+ok "сборка $sha доехала до ~/ci-www через артефакт"
+```
+
+```text hint
+1. В задаче сборки: создать каталог, подставить переменную с коротким SHA в шаблон потоковым редактором, описать артефакт с путём к каталогу.
+2. Задача следующего этапа получает артефакты предыдущих этапов автоматически — в ней остаётся только скопировать файлы.
+3. Короткий SHA — переменная с «SHORT_SHA» в имени.
+```
+
+```bash solution
+cat > ~/ci-site/.gitlab-ci.yml <<'EOF'
+stages: [build, deploy]
+
+build:
+  stage: build
+  script:
+    - mkdir -p public
+    - sed "s/__VERSION__/$CI_COMMIT_SHORT_SHA/" index.html > public/index.html
+  artifacts:
+    paths: [public/]
+    expire_in: 1 day
+
+deploy:
+  stage: deploy
+  script:
+    - mkdir -p "$HOME/ci-www"
+    - cp -r public/. "$HOME/ci-www/"
+EOF
+cd ~/ci-site && gitlab-ci-local && cat ~/ci-www/index.html
+```
+
+```text review
+Эталон: `artifacts: paths: [public/]` в build, в deploy — только копирование.
+
+- **Артефакт** — результат задачи для следующих этапов и людей: собранные файлы, отчёты тестов (`artifacts: reports: junit:`), образы не кладут — для них реестр.
+- **Кэш** — ускоритель (зависимости между запусками пайплайнов), его может и не быть. Путать их — частая ошибка: собранное приложение через кэш передавать нельзя.
+- Принцип «build once, deploy many»: собрали один раз, тот же артефакт уходит на staging и prod. Пересборка в deploy = на прод уходит не то, что тестировали.
+- `needs: [build]` у deploy — запуск сразу после build, не дожидаясь всего этапа; `dependencies: []` — не скачивать артефакты вовсе.
+```
+
+```text notes
+\bcache: => Сборка передавалась через cache — кэш может не доехать (другой раннер, очищен). Результат сборки передают артефактами.
+```
+
+### Секрет вне репозитория
+
+Задача `deploy` в `~/ci-secret` использует токен `$DEPLOY_TOKEN` и падает, если его нет. В GitLab секреты хранят в настройках проекта (Settings → CI/CD → Variables), **а не в `.gitlab-ci.yml`**. У `gitlab-ci-local` аналог настроек проекта — файл **`.gitlab-ci-local-variables.yml`** в корне проекта.
+
+Задайте `DEPLOY_TOKEN` со значением `tok-9f3a7c21` **там**, а не в `.gitlab-ci.yml`, и сделайте так, чтобы этот файл **никогда не попал в Git**. Пайплайн должен проходить.
+
+```bash setup
+d=/home/student/ci-secret
+lab_ci_repo $d
+cat > $d/.gitlab-ci.yml <<'EOF'
+stages: [deploy]
+
+deploy:
+  stage: deploy
+  script:
+    - test -n "$DEPLOY_TOKEN" || { echo "DEPLOY_TOKEN не задан"; exit 1; }
+    - echo "deploying with token of length ${#DEPLOY_TOKEN}"
+    - test "$(echo -n "$DEPLOY_TOKEN" | sha256sum | cut -c1-8)" = "f85a86e4" || { echo "токен неверный"; exit 1; }
+EOF
+printf '.gitlab-ci-local/\n' > $d/.gitignore
+lab_ci_commit $d
+```
+
+```bash check
+d=/home/student/ci-secret
+grep -q 'tok-9f3a7c21' $d/.gitlab-ci.yml && fail "Токен записан прямо в .gitlab-ci.yml — он попадёт в историю Git"
+[ -f $d/.gitlab-ci-local-variables.yml ] || fail "Нет файла .gitlab-ci-local-variables.yml"
+su - student -c "cd $d && git check-ignore -q .gitlab-ci-local-variables.yml" || fail ".gitlab-ci-local-variables.yml не игнорируется Git"
+su - student -c "cd $d && git log --all --format=%H -- .gitlab-ci-local-variables.yml" | grep -q . && fail "Файл с секретом уже попал в историю Git"
+lab_ci_run $d || fail "Пайплайн не проходит: $(lab_ci_log 3)"
+ok "секрет — вне репозитория, пайплайн проходит"
+```
+
+```text hint
+1. Файл переменных — обычный YAML: имя переменной и значение.
+2. Добавить его имя в файл исключений Git и убедиться, что Git его не видит.
+3. Запустить пайплайн.
+```
+
+```bash solution
+cd ~/ci-secret
+echo 'DEPLOY_TOKEN: tok-9f3a7c21' > .gitlab-ci-local-variables.yml
+echo '.gitlab-ci-local-variables.yml' >> .gitignore
+git status --short
+gitlab-ci-local
+```
+
+```text review
+Эталон: значение — в «настройках проекта» (здесь `.gitlab-ci-local-variables.yml`), файл — в `.gitignore`.
+
+- В GitLab: Settings → CI/CD → Variables. Флаги: **Masked** — значение заменяется `[MASKED]` в логах, **Protected** — доступно только пайплайнам защищённых веток и тегов (feature-ветка не украдёт прод-токен), **Type: File** — значение пишется во временный файл (SSH-ключи, kubeconfig).
+- Секрет в `.gitlab-ci.yml` = секрет навсегда в истории Git и у всех, у кого есть доступ к репозиторию.
+- Masked не спасает от `echo $TOKEN | base64` — защита от случайной утечки, не от злого умысла.
+- Ещё лучше — не хранить долгоживущие токены вообще: OIDC (`id_tokens`) для облаков и Vault (тема «HashiCorp Vault»).
+```
+
+### Кэш зависимостей
+
+Задача `install` в `~/ci-cache` ставит зависимости через pip. Настройте для неё **кэш** pip: каталог кэша — внутри проекта (`.cache/pip`, через переменную `PIP_CACHE_DIR`), а **ключ** кэша зависит от содержимого `requirements.txt` — изменились зависимости, кэш создаётся заново.
+
+```bash setup
+d=/home/student/ci-cache
+lab_ci_repo $d
+echo '# зависимости (для учебного примера список пуст)' > $d/requirements.txt
+cat > $d/.gitlab-ci.yml <<'EOF'
+stages: [install]
+
+install:
+  stage: install
+  script:
+    - python3 -m venv .venv
+    - .venv/bin/pip install -r requirements.txt
+EOF
+printf '.gitlab-ci-local/\n.venv/\n.cache/\n' > $d/.gitignore
+lab_ci_commit $d
+```
+
+```bash check
+d=/home/student/ci-cache
+p=$(lab_ci_preview $d); [ -n "$p" ] && [ "$p" != null ] || fail "gitlab-ci-local не может разобрать .gitlab-ci.yml"
+echo "$p" | jq -e '.install.cache' >/dev/null || echo "$p" | jq -e '.default.cache' >/dev/null || fail "У задачи install нет кэша"
+c=$(echo "$p" | jq -c '.install.cache // .default.cache | if type == "array" then .[0] else . end')
+echo "$c" | jq -e '.paths | map(test("^\\.cache/pip/?$")) | any' >/dev/null || fail "Кэшируется не каталог .cache/pip: $c"
+echo "$c" | jq -e '.key.files | index("requirements.txt")' >/dev/null || fail "Ключ кэша не зависит от requirements.txt: $(echo "$c" | jq -c .key)"
+v=$(echo "$p" | jq -r '.install.variables.PIP_CACHE_DIR // .variables.PIP_CACHE_DIR // empty')
+echo "$v" | grep -qE '^\$\{?CI_PROJECT_DIR\}?/\.cache/pip/?$' || fail "PIP_CACHE_DIR не указывает на .cache/pip в каталоге проекта: «$v»"
+lab_ci_run $d || fail "Пайплайн не проходит: $(lab_ci_log)"
+ok "кэш: $(echo "$c" | jq -c '{key, paths}')"
+```
+
+```text hint
+1. Переменная окружения для pip задаётся в разделе переменных — глобально или у задачи; путь к проекту в раннере — готовая переменная GitLab.
+2. У кэша: список путей и ключ. Ключ можно вычислять из содержимого файлов — для этого у ключа есть вложенный параметр со списком файлов.
+```
+
+```bash solution
+cat > ~/ci-cache/.gitlab-ci.yml <<'EOF'
+stages: [install]
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+install:
+  stage: install
+  cache:
+    key:
+      files: [requirements.txt]
+    paths: [.cache/pip/]
+  script:
+    - python3 -m venv .venv
+    - .venv/bin/pip install -r requirements.txt
+EOF
+cd ~/ci-cache && gitlab-ci-local
+```
+
+```text review
+Эталон: `variables: PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"` + `cache: key: files: [requirements.txt], paths: [.cache/pip/]`.
+
+- Кэшировать можно только каталоги **внутри** проекта — поэтому pip/npm/maven перенаправляют туда переменными (`npm_config_cache`, `MAVEN_OPTS=-Dmaven.repo.local=...`).
+- `key: files:` — ключ = хеш lock-файла: пока зависимости те же, кэш общий для всех веток и пайплайнов; изменили `requirements.txt` / `package-lock.json` — кэш новый.
+- `policy: pull` у задач, которые только читают кэш, — экономит время на загрузку обратно.
+- Кэш — ускоритель, не гарантия: задача должна работать и без него.
+```
+
 ## Тест
 
 ### Что делает опция Protected у CI/CD-переменной?

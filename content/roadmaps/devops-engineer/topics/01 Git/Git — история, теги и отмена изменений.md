@@ -135,6 +135,220 @@ git stash drop stash@{1}
 - [ ] Сделать `git reset --hard HEAD~2`, а затем вернуть «потерянные» коммиты через `git reflog`
 - [ ] Начать правку, спрятать её через `git stash`, переключиться на другую ветку и вернуть через `git stash pop`
 
+## Лаборатория
+
+```bash setup
+su - student -c 'git config --global user.name >/dev/null || git config --global user.name Student; git config --global user.email >/dev/null || git config --global user.email student@stand.local'
+mkdir -p /srv/git
+```
+
+### Отменить опубликованный коммит
+
+В `~/shop` история уже отправлена на сервер `/srv/git/shop.git`. Один из коммитов, «Enable debug mode», включил отладку на проде — его нужно отменить. После него был ещё коммит, его трогать не надо. История на сервере **не должна переписываться**: коллеги уже скачали эти коммиты. Отмена должна попасть и на сервер.
+
+```bash setup
+rm -rf /home/student/shop /srv/git/shop.git
+git init -q --bare -b main /srv/git/shop.git
+chown -R student:student /srv/git/shop.git
+su - student -c 'bash -s' <<'EOF'
+git clone -q /srv/git/shop.git ~/shop 2>/dev/null && cd ~/shop
+printf 'debug=false\nport=8080\n' > app.conf && git add . && git commit -qm "Init shop"
+sed -i 's/debug=false/debug=true/' app.conf && git commit -qam "Enable debug mode"
+echo "<footer>shop</footer>" > footer.html && git add . && git commit -qm "Add footer"
+git push -q origin main
+EOF
+git -C /srv/git/shop.git rev-parse main > /var/lib/lab/shop-pushed
+```
+
+```bash check
+b=/srv/git/shop.git
+git -C $b merge-base --is-ancestor "$(cat /var/lib/lab/shop-pushed)" main || fail "История на сервере переписана: прежних коммитов больше нет в main"
+[ "$(git -C $b show main:app.conf | grep '^debug=')" = "debug=false" ] || fail "На сервере в app.conf отладка всё ещё включена"
+git -C $b show main:footer.html >/dev/null 2>&1 || fail "Пропал коммит «Add footer» — его отменять было не нужно"
+git -C $b log -1 --format=%s main | grep -q '^Revert' || fail "Последний коммит на сервере — не отмена коммита"
+[ "$(git -C /home/student/shop rev-parse main)" = "$(git -C $b rev-parse main)" ] || fail "Локальная main и main на сервере различаются"
+ok "$(git -C $b log --oneline -4 main | tr '\n' ';')"
+```
+
+```text hint
+1. Найти хеш коммита, который включил отладку.
+2. Есть команда, которая создаёт **новый** коммит с обратными изменениями указанного коммита — история при этом не переписывается.
+3. Отправить результат на сервер обычным способом.
+```
+
+```bash solution
+cd ~/shop
+git revert --no-edit "$(git log --format=%H --grep='^Enable debug mode$')"
+git push
+```
+
+```text review
+Эталон: `git revert <хеш>` → `git push`.
+
+- `revert` не удаляет коммит, а добавляет новый с обратными изменениями. История только растёт — это безопасно для общих веток.
+- `git reset --hard` + `git push --force` тоже убрали бы коммит, но у коллег разъехалась бы история, а вместе с ним пропал бы «Add footer».
+- Отменить можно и не последний коммит: Git вычислит обратный diff. Если более поздние коммиты меняли те же строки — будет конфликт, как при слиянии.
+- Отменили по ошибке — отмените отмену: `git revert` от коммита «Revert …».
+```
+
+```text notes
+reset\s+--hard => Использовался reset --hard: для опубликованной истории это переписывание, коллеги получат расхождение. Для отмены на общей ветке — git revert.
+push\s+[^\n]*(--force\b|\s-f\b) => Использовался force-push в общую ветку.
+```
+
+### Поставить тег на релиз
+
+В `~/lib` среди коммитов есть «Release 1.0» — он не последний. Поставьте на **этот** коммит **аннотированный** тег `v1.0` с сообщением и отправьте тег на сервер `/srv/git/lib.git`.
+
+```bash setup
+rm -rf /home/student/lib /srv/git/lib.git
+git init -q --bare -b main /srv/git/lib.git
+chown -R student:student /srv/git/lib.git
+su - student -c 'bash -s' <<'EOF'
+git clone -q /srv/git/lib.git ~/lib 2>/dev/null && cd ~/lib
+echo "0.9" > VERSION && git add . && git commit -qm "Beta"
+echo "1.0" > VERSION && git commit -qam "Release 1.0"
+echo "def new(): pass" > new.py && git add . && git commit -qm "Start 1.1"
+git push -q origin main
+EOF
+```
+
+```bash check
+b=/srv/git/lib.git
+git -C $b rev-parse -q --verify refs/tags/v1.0 >/dev/null || fail "На сервере нет тега v1.0"
+[ "$(git -C $b cat-file -t v1.0)" = tag ] || fail "v1.0 — лёгкий тег: у него нет автора, даты и сообщения"
+[ "$(git -C $b log -1 --format=%s 'v1.0^{commit}')" = "Release 1.0" ] || fail "Тег v1.0 стоит на коммите «$(git -C $b log -1 --format=%s 'v1.0^{commit}')»"
+[ -n "$(git -C $b for-each-ref refs/tags/v1.0 --format='%(contents:subject)')" ] || fail "У тега нет сообщения"
+ok "v1.0 → $(git -C $b log -1 --format='%h %s' 'v1.0^{commit}'): $(git -C $b for-each-ref refs/tags/v1.0 --format='%(contents:subject)')"
+```
+
+```text hint
+1. Найти хеш нужного коммита в истории.
+2. Создать тег с ключом «аннотированный» и сообщением, указав этот хеш (без хеша тег встанет на последний коммит).
+3. Теги не отправляются вместе с веткой — их нужно отправить отдельно.
+```
+
+```bash solution
+cd ~/lib
+git tag -a v1.0 -m "Версия 1.0" "$(git log --format=%H --grep='^Release 1.0$')"
+git push origin v1.0
+```
+
+```text review
+Эталон: `git tag -a v1.0 -m "..." <хеш>` → `git push origin v1.0`.
+
+- Аннотированный тег — отдельный объект: автор, дата, сообщение, можно подписать. Для релизов используют только их; лёгкий тег (`git tag v1.0`) — просто указатель.
+- `git push` теги не отправляет. Один тег — `git push origin v1.0`, все сразу — `git push --tags` (осторожно: уйдут и черновые).
+- Посмотреть: `git show v1.0`, список — `git tag -l 'v1.*'`. На GitHub из тега делают Release.
+- Тег поставили не туда: `git tag -d v1.0`, на сервере — `git push origin :refs/tags/v1.0`. Но если тег уже скачали, лучше выпустить новую версию.
+```
+
+### Вернуть потерянные коммиты
+
+В `~/payments` вы поторопились и выполнили `git reset --hard HEAD~2`: из ветки `main` пропали два последних коммита — «Add refunds» и «Add tests». Верните их в `main`.
+
+```bash setup
+rm -rf /home/student/payments
+su - student -c 'bash -s' <<'EOF'
+mkdir ~/payments && cd ~/payments && git init -q -b main
+echo "def pay(): pass" > pay.py && git add . && git commit -qm "Add payments"
+echo "def refund(): pass" > refunds.py && git add . && git commit -qm "Add refunds"
+echo "def test_pay(): pass" > tests.py && git add . && git commit -qm "Add tests"
+git reset -q --hard HEAD~2
+EOF
+```
+
+```bash check
+r=/home/student/payments
+for m in "Add refunds" "Add tests"; do
+  git -C $r log --format=%s main | grep -qx "$m" || fail "В main нет коммита «$m»"
+done
+git -C $r cat-file -e HEAD:tests.py 2>/dev/null && git -C $r cat-file -e HEAD:refunds.py 2>/dev/null || fail "В последнем коммите нет файлов refunds.py и tests.py"
+[ -z "$(git -C $r status --porcelain)" ] || fail "В рабочем каталоге остались незакоммиченные изменения"
+ok "$(git -C $r log --oneline | tr '\n' ';')"
+```
+
+```text hint
+1. Обычный журнал коммитов их уже не показывает. Но Git ведёт отдельный журнал всех перемещений HEAD — посмотрите его.
+2. Найдите в нём состояние до сброса.
+3. Верните ветку в это состояние той же командой, которой её сбросили.
+```
+
+```bash solution
+cd ~/payments
+git reflog -5
+git reset --hard 'HEAD@{1}'
+```
+
+```text review
+Эталон: `git reflog` → `git reset --hard HEAD@{1}` (или хеш из reflog).
+
+- Коммиты после `reset --hard` не удаляются сразу: на них больше не ссылается ветка, но reflog помнит их около 90 дней (до сборки мусора).
+- `HEAD@{1}` — «где был HEAD одно перемещение назад». Надёжнее взять хеш из вывода `git reflog`: после пары лишних команд номера сдвинутся.
+- Альтернатива без перемещения ветки: `git branch rescue <хеш>` — сохранить коммиты в новой ветке и спокойно разобраться.
+- Чего reflog не спасёт: **незакоммиченные** изменения, стёртые `reset --hard` или `checkout -- .`. Поэтому коммитьте часто.
+```
+
+```text notes
+cherry-pick => Коммиты возвращались через cherry-pick — сработает, но создаст копии с новыми хешами. Проще вернуть ветку на прежний коммит: git reset --hard <хеш из reflog>.
+```
+
+### Срочно переключиться, не теряя работу
+
+В `~/web` на ветке `main` вы начали правку `app.py` и ещё не закончили — коммитить её рано. Срочно нужно исправить опечатку в `README.md` («Wellcome» → «Welcome») на ветке `hotfix` и закоммитить. Потом вернитесь на `main` и продолжите: незаконченные правки `app.py` должны снова оказаться в рабочем каталоге, **не закоммиченными**.
+
+```bash setup
+rm -rf /home/student/web
+su - student -c 'bash -s' <<'EOF'
+mkdir ~/web && cd ~/web && git init -q -b main
+echo "Wellcome to web" > README.md && echo "print('app')" > app.py && git add . && git commit -qm "Init web"
+git branch hotfix
+echo "# WIP: новая форма входа" >> app.py
+EOF
+git -C /home/student/web rev-parse main > /var/lib/lab/web-main
+git -C /home/student/web rev-parse hotfix > /var/lib/lab/web-hotfix
+```
+
+```bash check
+r=/home/student/web
+[ "$(git -C $r rev-parse hotfix)" != "$(cat /var/lib/lab/web-hotfix)" ] || fail "На ветке hotfix нет нового коммита"
+git -C $r show hotfix:README.md | grep -qx "Welcome to web" || fail "В README.md на ветке hotfix опечатка не исправлена"
+[ -z "$(git -C $r diff --name-only "$(cat /var/lib/lab/web-hotfix)" hotfix -- app.py)" ] || fail "В коммит на hotfix попали изменения app.py"
+[ "$(git -C $r branch --show-current)" = main ] || fail "Сейчас выбрана ветка «$(git -C $r branch --show-current)», а не main"
+[ "$(git -C $r rev-parse main)" = "$(cat /var/lib/lab/web-main)" ] || fail "В main появились новые коммиты — незаконченная работа закоммичена"
+git -C $r diff -- app.py | grep -q "WIP: новая форма входа" || fail "Незаконченных правок app.py нет в рабочем каталоге"
+ok "hotfix: $(git -C $r log -1 --format=%s hotfix); в работе: $(git -C $r status --porcelain | tr '\n' ' ')"
+```
+
+```text hint
+1. Временно убрать незаконченные правки в «тайник» — рабочий каталог станет чистым.
+2. Перейти на ветку hotfix, исправить опечатку и закоммитить.
+3. Вернуться на main и достать правки из тайника.
+```
+
+```bash solution
+cd ~/web
+git stash
+git switch hotfix
+sed -i 's/Wellcome/Welcome/' README.md
+git commit -qam "Fix typo in README"
+git switch main
+git stash pop
+```
+
+```text review
+Эталон: `git stash` → `git switch hotfix` → правка и коммит → `git switch main` → `git stash pop`.
+
+- `stash` прячет изменения отслеживаемых файлов; новые файлы — только с `git stash -u`.
+- `stash pop` = применить и удалить из тайника; `stash apply` оставляет копию. Список — `git stash list`, подписать — `git stash push -m "форма входа"`.
+- Альтернатива: временный коммит `WIP` и потом `git reset --soft HEAD~1`. А для долгих параллельных задач удобнее `git worktree add ../web-hotfix hotfix` — второй рабочий каталог той же истории.
+- Иногда Git переключает ветку и с изменениями (если они не мешают), и правки «переезжают» на другую ветку — легко закоммитить не туда.
+```
+
+```text notes
+commit\s+[^\n]*(WIP|wip) => Незаконченная работа коммитилась как WIP. Так тоже делают, но потом коммит нужно убрать (git reset --soft HEAD~1), иначе он останется в истории.
+```
+
 ## Тест
 
 ### Чем git revert отличается от git reset?

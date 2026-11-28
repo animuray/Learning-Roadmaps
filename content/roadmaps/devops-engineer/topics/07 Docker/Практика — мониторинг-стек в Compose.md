@@ -178,6 +178,121 @@ rate(container_cpu_usage_seconds_total{name!=""}[5m])
 - [ ] Подключить к Prometheus метрики приложения из прошлой практики (если у приложения есть `/metrics`) или nginx через nginx-prometheus-exporter
 - [ ] Пересоздать стек (`down` и `up`) и убедиться, что история метрик и дашборды сохранились
 
+## Лаборатория
+
+### Prometheus, node-exporter и Grafana
+
+В `~/monitoring/compose.yaml` описан стек: `prometheus` (UI на порту **9091** хоста), `node-exporter` и `grafana` (порт **3300**, вход `admin` / `admin`). Не хватает двух файлов конфигурации — допишите их и поднимите стек:
+
+1. `~/monitoring/prometheus/prometheus.yml` — Prometheus собирает метрики **самого себя** и **node-exporter** раз в 15 секунд; все цели в состоянии UP.
+2. `~/monitoring/grafana/provisioning/datasources/prometheus.yml` — Grafana при старте **сама** создаёт источник данных типа Prometheus по адресу `http://prometheus:9090` (источник по умолчанию).
+
+```bash setup
+lab_drm() { docker rm -f "$@" >/dev/null 2>&1; true; }
+# образ есть локально или скачивается (если ученик почистил образы через prune)
+lab_img() { for i in "$@"; do docker image inspect "$i" >/dev/null 2>&1 || docker pull -q "$i" >/dev/null; done; }
+# lab_wait_http URL [строка] — дождаться ответа
+lab_wait_http() { for i in $(seq 60); do curl -s --max-time 1 "$1" 2>/dev/null | grep -q "${2:-.}" && return 0; sleep 0.25; done; return 1; }
+lab_img prom/prometheus:v2.55.1 prom/node-exporter:v1.8.2 grafana/grafana-oss:11.3.0
+[ -d /home/student/monitoring ] && (cd /home/student/monitoring && docker compose down -v --remove-orphans >/dev/null 2>&1)
+docker rm -f $(docker ps -aq --filter label=com.docker.compose.project=monitoring) >/dev/null 2>&1
+# порт 3300 мог остаться за контейнером grafana из темы «Grafana»
+docker rm -f grafana >/dev/null 2>&1
+rm -rf /home/student/monitoring
+mkdir -p /home/student/monitoring/prometheus /home/student/monitoring/grafana/provisioning/datasources
+cat > /home/student/monitoring/compose.yaml <<'EOF'
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    pid: host
+    volumes:
+      - /:/host:ro
+    command: ["--path.rootfs=/host"]
+
+  grafana:
+    image: grafana/grafana-oss:11.3.0
+    ports:
+      - "3300:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  prometheus-data:
+  grafana-data:
+EOF
+chown -R student:student /home/student/monitoring
+```
+
+```bash check
+tg=$(curl -s --max-time 5 localhost:9091/api/v1/targets) || fail "Prometheus не отвечает на localhost:9091"
+[ -n "$tg" ] || fail "Prometheus не отвечает на localhost:9091"
+jobs=$(echo "$tg" | jq -r '.data.activeTargets[] | "\(.labels.job)=\(.health)"' | sort | xargs)
+echo "$tg" | jq -e '.data.activeTargets[] | select(.scrapeUrl | test("node-exporter:9100"))' >/dev/null || fail "Prometheus не собирает node-exporter (цели: $jobs)"
+echo "$tg" | jq -e '.data.activeTargets[] | select(.scrapeUrl | test(":9090/metrics"))' >/dev/null || fail "Prometheus не собирает метрики самого себя (цели: $jobs)"
+for i in $(seq 30); do down=$(curl -s localhost:9091/api/v1/targets | jq '[.data.activeTargets[] | select(.health != "up")] | length'); [ "$down" = 0 ] && break; sleep 1; done
+[ "$down" = 0 ] || fail "Не все цели UP: $(curl -s localhost:9091/api/v1/targets | jq -r '.data.activeTargets[] | "\(.labels.job)=\(.health) \(.lastError)"' | xargs)"
+iv=$(curl -s localhost:9091/api/v1/status/config | jq -r '.data.yaml' | grep -m1 -E '^\s+scrape_interval:' | awk '{print $2}')
+[ "$iv" = 15s ] || fail "Интервал сбора — ${iv:-не задан}"
+for i in $(seq 40); do ds=$(curl -s -u admin:admin localhost:3300/api/datasources 2>/dev/null); echo "$ds" | jq -e 'type == "array"' >/dev/null 2>&1 && break; sleep 1; done
+echo "$ds" | jq -e 'type == "array"' >/dev/null 2>&1 || fail "Grafana не отвечает на localhost:3300"
+echo "$ds" | jq -e '.[] | select(.type == "prometheus" and (.url | test("^http://prometheus:9090/?$")) and .isDefault == true)' >/dev/null || fail "В Grafana нет источника по умолчанию типа prometheus с адресом http://prometheus:9090 (сейчас: $(echo "$ds" | jq -c '[.[] | {type, url, isDefault}]'))"
+ok "цели: $jobs; Grafana: источник Prometheus подключён"
+```
+
+```text hint
+1. Конфиг Prometheus: глобальный интервал сбора и список заданий сбора — у каждого имя и статический список целей «хост:порт». Внутри сети Compose хост — имя сервиса; порт node-exporter стандартный.
+2. Файл provisioning для Grafana: версия формата и список источников данных с именем, типом, способом доступа через сервер Grafana, адресом и пометкой «по умолчанию».
+3. Поднять стек, открыть в Prometheus страницу состояния целей (Status → Targets) и список источников в Grafana.
+```
+
+```bash solution
+cd ~/monitoring
+cat > prometheus/prometheus.yml <<'EOF'
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+EOF
+cat > grafana/provisioning/datasources/prometheus.yml <<'EOF'
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+EOF
+docker compose up -d
+sleep 20
+curl -s localhost:9091/api/v1/targets | jq -r '.data.activeTargets[] | "\(.labels.job) \(.health)"'
+```
+
+```text review
+Эталон — в «Решении».
+
+- Prometheus **сам ходит** за метриками (pull) по адресам из `scrape_configs`. Внутри Compose адрес — имя сервиса и внутренний порт (`node-exporter:9100`), а не опубликованный порт хоста.
+- Provisioning — конфигурация Grafana как код: источники и дашборды из файлов, без кликов. После `down`/`up` всё на месте, а в Git видна история изменений.
+- `pid: host` и `/:/host:ro` дают node-exporter видеть процессы и диски **хоста**, иначе он покажет метрики самого контейнера. На обычном сервере монтируют `/:/host:ro,rslave` — чтобы видеть и диски, подключённые позже; в WSL корень не «shared», и `rslave` не даёт контейнеру запуститься.
+- Дальше: импортировать дашборд Node Exporter Full (ID 1860), добавить cAdvisor для метрик контейнеров и Alertmanager для алертов.
+```
+
 ## Тест
 
 ### Какие метрики собирает Node Exporter?

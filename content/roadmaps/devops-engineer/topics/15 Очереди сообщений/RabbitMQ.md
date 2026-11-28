@@ -119,6 +119,123 @@ rabbitmq-diagnostics check_port_connectivity
 - [ ] Поднять кластер из трёх узлов, остановить один и проверить, что quorum-очередь продолжает работать
 - [ ] Включить rabbitmq_prometheus и построить дашборд глубины очередей; заполнить очередь и посмотреть алармы памяти или диска
 
+## Лаборатория
+
+RabbitMQ установлен из пакетов (служба `rabbitmq-server`). Управление — `sudo rabbitmqctl ...`; для очередей и обменников есть `rabbitmqadmin` (работает через плагин управления, он включён: веб-интерфейс `http://localhost:15672`, пользователь `admin` / `admin`).
+
+```bash lib
+# lab_rabbit — запущенный RabbitMQ с плагином управления, пользователем admin и утилитой rabbitmqadmin
+lab_rabbit() {
+  systemctl is-active -q rabbitmq-server || systemctl start rabbitmq-server
+  for i in $(seq 60); do rabbitmqctl -q status >/dev/null 2>&1 && break; sleep 1; done
+  rabbitmq-plugins -q enable rabbitmq_management >/dev/null 2>&1
+  rabbitmqctl -q list_users | grep -q '^admin' || { rabbitmqctl -q add_user admin admin >/dev/null; rabbitmqctl -q set_user_tags admin administrator >/dev/null; rabbitmqctl -q set_permissions -p / admin '.*' '.*' '.*' >/dev/null; }
+  for i in $(seq 60); do curl -s -u admin:admin localhost:15672/api/overview >/dev/null 2>&1 && break; sleep 1; done
+  [ -x /usr/local/bin/rabbitmqadmin ] || { curl -s -o /usr/local/bin/rabbitmqadmin localhost:15672/cli/rabbitmqadmin && chmod 755 /usr/local/bin/rabbitmqadmin; }
+}
+lab_ra() { rabbitmqadmin -u admin -p admin "$@" 2>/dev/null; }
+```
+
+```bash setup
+lab_rabbit
+```
+
+### Отдельный виртуальный хост для приложения
+
+Магазину нужен свой изолированный «раздел» брокера. Создайте:
+
+- виртуальный хост **`shop`**;
+- пользователя **`shop`** с паролем **`shop-pass`**;
+- права пользователя `shop` **на всё внутри `shop`** — и никаких прав на виртуальный хост по умолчанию `/`.
+
+```bash setup
+rabbitmqctl -q delete_vhost shop >/dev/null 2>&1; rabbitmqctl -q delete_user shop >/dev/null 2>&1; true
+```
+
+```bash check
+rabbitmqctl -q list_vhosts | grep -qx shop || fail "Виртуального хоста shop нет"
+rabbitmqctl -q list_users | grep -q '^shop' || fail "Пользователя shop нет"
+rabbitmqctl -q authenticate_user shop shop-pass >/dev/null 2>&1 || fail "Пользователь shop не входит с паролем shop-pass"
+p=$(rabbitmqctl -q list_user_permissions shop 2>/dev/null)
+echo "$p" | awk '$1 == "shop"' | grep -qE '^shop\s+\.\*\s+\.\*\s+\.\*' || fail "У shop нет полных прав (configure/write/read: .*) на vhost shop"
+echo "$p" | awk '$1 == "/"' | grep -q . && fail "У пользователя shop есть права на vhost /"
+curl -s -u shop:shop-pass localhost:15672/api/whoami | grep -q '"name":"shop"' || true
+ok "vhost shop: права только у пользователя shop"
+```
+
+```text hint
+1. Утилита управления брокером умеет создавать виртуальные хосты и пользователей.
+2. Права задаются тремя регулярными выражениями — на настройку, запись и чтение ресурсов — для пары «пользователь + виртуальный хост».
+```
+
+```bash solution
+sudo rabbitmqctl add_vhost shop
+sudo rabbitmqctl add_user shop shop-pass
+sudo rabbitmqctl set_permissions -p shop shop '.*' '.*' '.*'
+sudo rabbitmqctl list_user_permissions shop
+```
+
+```text review
+Эталон: `add_vhost shop` → `add_user shop shop-pass` → `set_permissions -p shop shop '.*' '.*' '.*'`.
+
+- Виртуальный хост — изолированное пространство очередей, обменников и прав внутри одного брокера: разные приложения или окружения не видят друг друга.
+- Пользователь `guest` по умолчанию пускается только с localhost — для приложений всегда создают своих пользователей.
+- Права можно сузить: `^orders\..*` — только ресурсы с этим префиксом.
+```
+
+### Обменник, очередь и маршрут
+
+В виртуальном хосте **`/`** настройте маршрутизацию заказов:
+
+- обменник **`orders`** типа **direct**, **устойчивый** (переживает перезапуск брокера);
+- устойчивая очередь **`orders.created`**;
+- привязка очереди к обменнику по ключу маршрутизации **`created`**.
+
+Сообщение, опубликованное в `orders` с ключом `created`, должно попадать в `orders.created`.
+
+```bash setup
+lab_ra delete exchange name=orders >/dev/null; lab_ra delete queue name=orders.created >/dev/null; true
+```
+
+```bash check
+e=$(curl -s -u admin:admin localhost:15672/api/exchanges/%2F/orders)
+[ "$(echo "$e" | jq -r .type)" = direct ] || fail "Обменника orders типа direct нет"
+[ "$(echo "$e" | jq -r .durable)" = true ] || fail "Обменник orders не устойчивый — пропадёт при перезапуске брокера"
+q=$(curl -s -u admin:admin localhost:15672/api/queues/%2F/orders.created)
+[ "$(echo "$q" | jq -r .durable)" = true ] || fail "Очереди orders.created нет или она не устойчивая"
+curl -s -u admin:admin localhost:15672/api/bindings/%2F/e/orders/q/orders.created | jq -e '.[] | select(.routing_key == "created")' >/dev/null || fail "Очередь orders.created не привязана к orders по ключу created"
+lab_ra purge queue name=orders.created >/dev/null
+lab_ra publish exchange=orders routing_key=created payload='{"order":42}' >/dev/null
+lab_ra publish exchange=orders routing_key=paid payload='{"order":43}' >/dev/null
+sleep 1
+n=$(curl -s -u admin:admin localhost:15672/api/queues/%2F/orders.created | jq -r .messages)
+m=$(lab_ra get queue=orders.created ackmode=ack_requeue_false count=5 -f raw_json | jq -r '.[].payload')
+[ "$m" = '{"order":42}' ] || fail "В orders.created пришло не то: «$m»"
+ok "orders --created--> orders.created"
+```
+
+```text hint
+1. Утилита rabbitmqadmin умеет объявлять обменники, очереди и привязки — у каждого объекта свои параметры: тип, устойчивость, источник, назначение и ключ маршрутизации.
+2. Проверить: опубликовать сообщение в обменник с ключом и забрать его из очереди.
+```
+
+```bash solution
+rabbitmqadmin -u admin -p admin declare exchange name=orders type=direct durable=true
+rabbitmqadmin -u admin -p admin declare queue name=orders.created durable=true
+rabbitmqadmin -u admin -p admin declare binding source=orders destination=orders.created routing_key=created
+rabbitmqadmin -u admin -p admin publish exchange=orders routing_key=created payload='{"order":1}'
+rabbitmqadmin -u admin -p admin get queue=orders.created ackmode=ack_requeue_false
+```
+
+```text review
+Эталон: `declare exchange orders type=direct durable=true` → `declare queue orders.created durable=true` → `declare binding ... routing_key=created`.
+
+- Продюсер пишет в **обменник**, а не в очередь; обменник раскладывает по очередям по правилам: `direct` — точное совпадение ключа, `topic` — шаблоны (`orders.*.eu`), `fanout` — во все привязанные очереди, `headers` — по заголовкам.
+- Сообщение без подходящей привязки **теряется** (ключ `paid` из проверки). Чтобы не терять — alternate exchange или флаг `mandatory`.
+- Устойчивость: обменник и очередь `durable` **и** сообщения с `delivery_mode=2` (persistent). Для надёжной очереди в кластере — quorum queues.
+- Необработанные сообщения отправляют в dead-letter exchange (`x-dead-letter-exchange`) — ничего не пропадает молча.
+```
+
 ## Тест
 
 ### Куда продюсер публикует сообщение в RabbitMQ?

@@ -117,6 +117,144 @@ export EDITOR=vim   # добавьте в ~/.bashrc
 - [ ] Создать `~/.vimrc` с номерами строк и пробелами вместо табов
 - [ ] Неделю править все файлы только в vim
 
+## Лаборатория
+
+Проверка смотрит только на результат, но цель темы — руки в vim: делайте задачи в нём, а не через `sed`.
+
+### Порт и вход root в копии sshd_config
+
+В `~/sshd_config` — копия настроек SSH-сервера. Откройте её в vim и:
+
+- раскомментируйте строку порта и поставьте порт `2200`;
+- раскомментируйте `PermitRootLogin` и запретите вход root: значение `no`.
+
+Остальные строки файла должны остаться как были.
+
+```bash setup
+cp /etc/ssh/sshd_config /home/student/sshd_config
+chown student:student /home/student/sshd_config
+grep -vE '^#?(Port|PermitRootLogin) ' /etc/ssh/sshd_config > /var/lib/lab/sshd-rest
+```
+
+```bash check
+f=/home/student/sshd_config
+[ -f $f ] || fail "Файла ~/sshd_config нет"
+grep -qx 'Port 2200' $f || fail "В файле нет активной строки «Port 2200»"
+grep -qx 'PermitRootLogin no' $f || fail "В файле нет активной строки «PermitRootLogin no»"
+[ "$(grep -cE '^Port ' $f)" = 1 ] || fail "Активных строк Port несколько — sshd возьмёт первую"
+grep -vE '^#?(Port|PermitRootLogin) ' $f | diff -q - /var/lib/lab/sshd-rest >/dev/null || fail "Изменились другие строки файла"
+ok "$(grep -E '^(Port|PermitRootLogin) ' $f | tr '\n' ' ')"
+```
+
+```text hint
+1. Открыть файл и найти строку с портом поиском (в обычном режиме — косая черта и слово).
+2. Встать в начало строки, удалить символ комментария, перейти в конец и заменить число. Либо одна команда замены по всему файлу: двоеточие, процент, s/что/на что/.
+3. Так же со строкой входа root.
+4. Сохранить и выйти.
+```
+
+```bash solution
+vim -es -c '%s/^#Port 22$/Port 2200/' -c '%s/^#PermitRootLogin .*/PermitRootLogin no/' -c 'wq' ~/sshd_config
+```
+
+```text review
+Эталон в vim: `/Port` → `0` → `x` (удалить `#`) → `$` → `ciw` → `2200` → `Esc`; или замена `:%s/^#Port 22$/Port 2200/`, затем `:%s/^#PermitRootLogin .*/PermitRootLogin no/` и `:wq`.
+
+- В sshd_config строки с `#` — значения **по умолчанию** для справки. Меняют их, раскомментируя или дописывая свою строку.
+- Для sshd действует **первое** найденное значение параметра: две строки `Port` — частая причина «поменял, а не работает».
+- На настоящем сервере после правки: `sudo sshd -t` (проверка синтаксиса) и только потом `systemctl reload ssh`, не закрывая текущую сессию.
+```
+
+```text notes
+sed\s+-i => Задача решена через sed — в работе так и надо, но в этой теме цель — тренировать vim: :%s/старое/новое/.
+```
+
+### Свой ~/.vimrc
+
+Создайте `~/.vimrc`, чтобы в vim всегда были:
+
+- номера строк;
+- пробелы вместо табуляции;
+- ширина табуляции и отступа — 4.
+
+```bash setup
+rm -f /home/student/.vimrc
+```
+
+```bash check
+[ -f /home/student/.vimrc ] || fail "Файла ~/.vimrc нет"
+rm -f /tmp/lab-vimopts
+su - student -c "vim -es -N -u ~/.vimrc -c 'redir! > /tmp/lab-vimopts' -c 'set number? expandtab? tabstop? shiftwidth?' -c 'redir END' -c 'qa!' </dev/null" >/dev/null 2>&1
+opts=$(tr -s ' \n' '\n' < /tmp/lab-vimopts 2>/dev/null); rm -f /tmp/lab-vimopts
+[ -n "$opts" ] || fail "vim не смог прочитать ~/.vimrc — в файле ошибка"
+echo "$opts" | grep -qx number || fail "Номера строк выключены"
+echo "$opts" | grep -qx expandtab || fail "Табуляция не заменяется пробелами"
+echo "$opts" | grep -qx 'tabstop=4' || fail "Ширина табуляции — $(echo "$opts" | grep tabstop)"
+echo "$opts" | grep -qx 'shiftwidth=4' || fail "Ширина отступа — $(echo "$opts" | grep shiftwidth)"
+ok "$(echo $opts)"
+```
+
+```text hint
+Файл настроек — это команды двоеточия, только без двоеточия, по одной на строку: включить номера, включить замену табов пробелами, задать ширину табуляции и ширину отступа.
+```
+
+```bash solution
+printf 'set number\nset expandtab\nset tabstop=4\nset shiftwidth=4\n' > ~/.vimrc
+```
+
+```text review
+Эталон: `set number`, `set expandtab`, `set tabstop=4`, `set shiftwidth=4`.
+
+- `tabstop` — как отображается символ табуляции, `shiftwidth` — на сколько сдвигают `>>` и автоотступ, `expandtab` — вставлять пробелы вместо таба.
+- Для YAML (Ansible, Kubernetes, GitLab CI) табы **запрещены** — `expandtab` спасает от ошибок разбора. Часто добавляют `autocmd FileType yaml setlocal ts=2 sw=2 et`.
+- Посмотреть текущее значение в vim: `:set tabstop?`. Полезные ещё: `syntax on`, `set hlsearch`, `set paste` (вставка без автоотступов).
+```
+
+### Убрать отладочные строки
+
+В `~/service.log` перемешаны строки уровней INFO, WARN и DEBUG. Откройте файл в vim и удалите **все** строки уровня DEBUG одной командой. Остальные строки должны остаться в прежнем порядке.
+
+```bash setup
+for i in $(seq 1 120); do
+  case $((i % 4)) in
+    0) echo "2026-11-28 10:$((i % 60)):00 DEBUG cache miss key=user:$i" ;;
+    1) echo "2026-11-28 10:$((i % 60)):00 INFO request id=$i status=200" ;;
+    2) echo "2026-11-28 10:$((i % 60)):00 DEBUG sql: select * from users where id=$i" ;;
+    3) echo "2026-11-28 10:$((i % 60)):00 WARN slow request id=$i" ;;
+  esac
+done > /home/student/service.log
+chown student:student /home/student/service.log
+grep -v ' DEBUG ' /home/student/service.log > /var/lib/lab/service-clean
+```
+
+```bash check
+f=/home/student/service.log
+[ -s $f ] || fail "~/service.log пуст или удалён"
+grep -q ' DEBUG ' $f && fail "Осталось строк DEBUG: $(grep -c ' DEBUG ' $f)"
+diff -q $f /var/lib/lab/service-clean >/dev/null || fail "Вместе с DEBUG пропали или изменились другие строки"
+ok "осталось строк: $(wc -l < $f)"
+```
+
+```text hint
+В vim есть «глобальная» команда: для всех строк, где встречается шаблон, выполнить действие. Действие здесь — удалить строку. Команда вводится после двоеточия.
+```
+
+```bash solution
+vim -es -c 'g/ DEBUG /d' -c 'wq' ~/service.log
+```
+
+```text review
+Эталон: `:g/DEBUG/d`.
+
+- `:g/шаблон/команда` выполняет команду на каждой строке с шаблоном; `:v/шаблон/d` (или `:g!`) — наоборот, удаляет всё, **где шаблона нет**.
+- Отменить — `u`, если удалили лишнее.
+- Вне vim то же самое: `grep -v DEBUG service.log > clean.log` или `sed -i '/DEBUG/d' service.log`. На проде логи не правят руками — их фильтруют при чтении.
+```
+
+```text notes
+sed\s+-i|grep\s+-v => Задача решена без vim — в работе так и надо, но здесь цель — команда :g/DEBUG/d.
+```
+
 ## Тест
 
 ### Как сохранить файл и выйти из nano?

@@ -124,6 +124,206 @@ build/
 - [ ] Добавить `.gitignore` с `.env` и `*.log` и проверить, что `git status` их больше не показывает
 - [ ] Посмотреть историю через `git log --oneline --graph`
 
+## Лаборатория
+
+### Представиться Git
+
+Настройте Git для пользователя `student` **глобально**: имя автора коммитов, почту и ветку по умолчанию `main` для новых репозиториев.
+
+```bash setup
+rm -f /home/student/.gitconfig
+```
+
+```bash check
+g() { su - student -c "git config --global $1" 2>/dev/null; }
+[ -n "$(g user.name)" ] || fail "Для пользователя student не задано имя автора коммитов"
+g user.email | grep -q '@' || fail "Для пользователя student не задана почта автора коммитов (или в ней нет @)"
+[ "$(g init.defaultBranch)" = main ] || fail "Ветка по умолчанию для новых репозиториев — «$(g init.defaultBranch)», а не main"
+ok "$(g user.name) <$(g user.email)>, ветка по умолчанию main"
+```
+
+```text hint
+У Git три уровня настроек: системный, глобальный (для пользователя) и локальный (для репозитория). Нужен глобальный. Три параметра: имя пользователя, почта и имя ветки по умолчанию при инициализации.
+```
+
+```bash solution
+git config --global user.name "Student Lab"
+git config --global user.email "student@example.com"
+git config --global init.defaultBranch main
+```
+
+```text review
+Эталон: три команды `git config --global`.
+
+- Глобальные настройки лежат в `~/.gitconfig`, посмотреть все — `git config --global --list`, а с указанием файла-источника — `git config --list --show-origin`.
+- Имя и почта попадают в **каждый** коммит. Рабочую почту для рабочих репозиториев задают локально (`git config user.email` внутри репозитория) или через `includeIf` по каталогу.
+- На GitHub почта коммита связывает его с аккаунтом. Чтобы не светить личную почту — адрес вида `id+login@users.noreply.github.com`.
+```
+
+### Первый коммит и .gitignore
+
+В `~/project` лежит проект: код, логи и файл с секретами. Сделайте из него репозиторий Git и закоммитьте всё, **кроме** логов (`*.log`) и файла `.env`, — они должны игнорироваться через `.gitignore` (сам `.gitignore` коммитится).
+
+```bash setup
+su - student -c 'git config --global user.name >/dev/null || git config --global user.name Student; git config --global user.email >/dev/null || git config --global user.email student@stand.local'
+rm -rf /home/student/project
+mkdir -p /home/student/project/src
+cd /home/student/project
+echo "# Мой проект" > README.md
+printf 'print("hello")\n' > src/app.py
+echo "DB_PASSWORD=s3cr3t" > .env
+echo "2026-11-27 started" > debug.log
+echo "trace" > src/trace.log
+chown -R student:student /home/student/project
+```
+
+```bash check
+r=/home/student/project
+git -C $r rev-parse --git-dir >/dev/null 2>&1 || fail "~/project — не репозиторий Git"
+git -C $r rev-parse HEAD >/dev/null 2>&1 || fail "В репозитории нет ни одного коммита"
+files=$(git -C $r ls-files)
+for f in README.md src/app.py .gitignore; do
+  echo "$files" | grep -qx "$f" || fail "Файл $f не закоммичен"
+done
+echo "$files" | grep -q '\.env$' && fail "Файл .env с паролем попал в репозиторий"
+echo "$files" | grep -q '\.log$' && fail "Лог-файлы попали в репозиторий"
+git -C $r check-ignore -q .env || fail "Git не игнорирует .env"
+git -C $r check-ignore -q src/trace.log || fail "Git не игнорирует src/trace.log во вложенном каталоге"
+[ -z "$(git -C $r status --porcelain)" ] || fail "Остались незакоммиченные изменения: $(git -C $r status --porcelain | tr '\n' ' ')"
+ok "закоммичено: $(echo $files)"
+```
+
+```text hint
+1. Инициализировать репозиторий в каталоге проекта.
+2. Создать файл правил игнорирования: шаблон для всех файлов с расширением .log и отдельно имя файла с секретами.
+3. Проверить статус: игнорируемые файлы не должны в нём появляться.
+4. Добавить всё в индекс и сделать коммит с понятным сообщением.
+```
+
+```bash solution
+cd ~/project
+git init
+printf '*.log\n.env\n' > .gitignore
+git add .
+git commit -m "Первый коммит проекта"
+```
+
+```text review
+Эталон: `git init`, `.gitignore` с `*.log` и `.env`, `git add .`, `git commit`.
+
+- `.gitignore` пишут **до** первого `git add`. Если секрет уже попал в коммит, `.gitignore` не поможет: файл придётся удалить из индекса (`git rm --cached .env`), а пароль — **сменить**, потому что он навсегда остался в истории.
+- `*.log` без слеша действует в любом каталоге; `/debug.log` — только в корне репозитория.
+- Перед коммитом полезно посмотреть `git status` — это последний шанс заметить лишнее.
+- В реальных проектах кладут ещё `.env.example` без значений, чтобы было видно, какие переменные нужны.
+```
+
+```text notes
+git\s+add\s+(-f|--force) => git add -f добавляет файл в обход .gitignore — так секреты и попадают в репозиторий.
+git\s+add\s+[^\n]*\.env\b => .env добавлялся в индекс вручную. Даже если потом его убрали, проверьте, что он не попал ни в один коммит: git log --all -- .env
+```
+
+### Дополнить последний коммит
+
+В `~/notes` уже есть один коммит «Add readme». После него вы создали `CHANGELOG.md`, но забыли его закоммитить. Добавьте файл **в тот же последний коммит** (новых коммитов быть не должно) и поменяйте сообщение коммита на `Add readme and changelog`.
+
+```bash setup
+su - student -c 'git config --global user.name >/dev/null || git config --global user.name Student; git config --global user.email >/dev/null || git config --global user.email student@stand.local'
+rm -rf /home/student/notes
+su - student -c 'bash -s' <<'EOF'
+mkdir ~/notes && cd ~/notes && git init -q -b main
+echo "# Заметки" > README.md
+git add README.md && git commit -qm "Add readme"
+echo "## 1.0 — первая версия" > CHANGELOG.md
+EOF
+```
+
+```bash check
+r=/home/student/notes
+n=$(git -C $r rev-list --count HEAD 2>/dev/null)
+[ "$n" = 1 ] || fail "В истории $n коммитов, а должен остаться один — исправленный последний"
+git -C $r ls-tree --name-only HEAD | grep -qx CHANGELOG.md || fail "CHANGELOG.md не попал в коммит"
+msg=$(git -C $r log -1 --format=%s)
+[ "$msg" = "Add readme and changelog" ] || fail "Сообщение коммита — «$msg»"
+ok "$(git -C $r log --oneline)"
+```
+
+```text hint
+1. Добавить новый файл в индекс.
+2. Пересоздать последний коммит вместе с изменениями из индекса и с новым сообщением — у команды коммита для этого есть специальный ключ «исправить».
+```
+
+```bash solution
+cd ~/notes
+git add CHANGELOG.md
+git commit --amend -m "Add readme and changelog"
+```
+
+```text review
+Эталон: `git add CHANGELOG.md && git commit --amend -m "..."`.
+
+- `--amend` не «дописывает» коммит, а создаёт **новый** с другим хешем вместо старого.
+- Поэтому правило: amend — только для коммитов, которые ещё не отправлены (`git push`). Иначе у коллег останется старая версия, и понадобится `push --force`.
+- `git commit --amend --no-edit` — добавить изменения, не трогая сообщение.
+- Вариант `git reset --soft HEAD~1` + новый коммит тоже работает, но `--amend` проще и понятнее.
+```
+
+```text notes
+reset\s+--hard => git reset --hard удаляет незакоммиченные изменения без возможности восстановления. Для правки последнего коммита хватит git commit --amend.
+```
+
+### Найти коммит
+
+В репозитории `~/service` около десятка коммитов. В одном из них в `config.yml` поменяли порт с `8080` на `9090`. Найдите этот коммит и запишите его хеш (полный или сокращённый, не короче 7 символов) в `~/answer.txt`.
+
+```bash setup
+su - student -c 'git config --global user.name >/dev/null || git config --global user.name Student; git config --global user.email >/dev/null || git config --global user.email student@stand.local'
+rm -rf /home/student/service /home/student/answer.txt
+su - student -c 'bash -s' <<'EOF'
+mkdir ~/service && cd ~/service && git init -q -b main
+c() { git add -A && GIT_AUTHOR_NAME="$1" GIT_COMMITTER_NAME="$1" git commit -qm "$2"; }
+printf 'name: service\nport: 8080\nworkers: 2\n' > config.yml; echo "v1" > app.txt; c Анна "Initial commit"
+echo "v2" > app.txt; c Анна "Update app"
+printf 'name: service\nport: 8080\nworkers: 4\n' > config.yml; c Борис "More workers"
+echo "# Service" > README.md; c Анна "Add readme"
+printf 'name: service\nport: 9090\nworkers: 4\n' > config.yml; echo "v3" > app.txt; c Борис "Refactoring"
+git rev-parse HEAD > /tmp/lab-port-commit
+echo "v4" > app.txt; c Вера "Bump version"
+echo "docs" >> README.md; c Анна "Docs"
+printf 'name: service\nport: 9090\nworkers: 8\n' > config.yml; c Вера "Scale workers"
+echo "v5" > app.txt; c Борис "Release"
+EOF
+mv /tmp/lab-port-commit /var/lib/lab/port-commit
+```
+
+```bash check
+[ -f /home/student/answer.txt ] || fail "Нет ~/answer.txt"
+got=$(tr -d '[:space:]' < /home/student/answer.txt)
+want=$(cat /var/lib/lab/port-commit)
+[ ${#got} -ge 7 ] || fail "Хеш «$got» слишком короткий — нужно не меньше 7 символов"
+case "$want" in
+  "$got"*) ok "коммит $(git -C /home/student/service log -1 --format='%h %s (%an)' "$want")" ;;
+  *) fail "Это не тот коммит: $(git -C /home/student/service log -1 --format='%h %s' "$got" 2>/dev/null || echo "«$got» — такого коммита в репозитории нет")" ;;
+esac
+```
+
+```text hint
+Сообщения коммитов здесь не помогут — ищите по самим изменениям. У просмотра истории есть режим поиска коммитов, в которых количество вхождений строки изменилось (так называемая «кирка»), и режим показа изменений конкретного файла.
+```
+
+```bash solution
+cd ~/service
+git log -S "port: 9090" --format=%H -- config.yml | tail -1 > ~/answer.txt
+```
+
+```text review
+Эталон: `git log -S "port: 9090" --oneline -- config.yml`.
+
+- `-S строка` («pickaxe») находит коммиты, где число вхождений строки изменилось: появилась или исчезла. `-G регулярка` — где строка, подходящая под шаблон, была в изменённых строках.
+- `git log -p -- config.yml` — история одного файла с изменениями; `git log -L '/port/,+1:config.yml'` — история конкретных строк.
+- `git blame config.yml` покажет, какой коммит последним трогал каждую строку, — но здесь строку с портом не меняли позже, так что blame тоже бы привёл к ответу.
+- Мораль для своих коммитов: «Refactoring», в котором поменялся порт, — плохое сообщение. Пишите, **что** и **зачем** изменилось.
+```
+
 ## Тест
 
 ### Что Git сохраняет при каждом коммите?

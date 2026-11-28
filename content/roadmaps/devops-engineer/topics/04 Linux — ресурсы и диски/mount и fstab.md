@@ -107,6 +107,139 @@ UUID=b411dc99-f0a0-4c87-9e05-184977be8539 /mnt/data  ext4   defaults,nofail    0
 - [ ] Зайти в `/mnt/data` в одном терминале и попробовать `umount` в другом; найти виновника через `fuser` или `lsof`
 - [ ] Сделать bind mount каталога и посмотреть его в `findmnt`
 
+## Лаборатория
+
+Диски здесь — файлы-образы, подключённые как loop-устройства. Для каждого задачи сделана ссылка вида `/dev/lab-имя`.
+
+```bash setup
+export LVM_SUPPRESS_FD_WARNINGS=1
+DISKS=/var/lib/lab-disks
+# Убрать всё, что могли оставить прошлые задачи с дисками: монтирования, массивы, тома, loop-устройства
+lab_disks_reset() {
+  for m in $(findmnt -rn -o TARGET | grep -E '^/mnt/(data|app|busy|raid|xfs-lab|ramcache|lab-[a-z]+)$|^/srv/overlay/merged$' | sort -r); do umount -l "$m"; done
+  mdadm --stop --scan >/dev/null 2>&1
+  for vg in data labvg; do vgremove -qq -ff "$vg" >/dev/null 2>&1; done
+  for l in $(losetup -nO NAME,BACK-FILE 2>/dev/null | awk -v d="$DISKS" 'index($2, d) == 1 {print $1}'); do
+    pvremove -qq -ff "$l" >/dev/null 2>&1; wipefs -qa "$l" >/dev/null 2>&1; losetup -d "$l"
+  done
+  rm -f /dev/lab-*; rm -rf "$DISKS"; mkdir -p "$DISKS"
+  sed -i -E '\#[[:space:]]/mnt/(data|app|raid|xfs-lab|ramcache)[[:space:]]#d' /etc/fstab
+  true
+}
+# lab_disk имя размер → пустой «диск» /dev/lab-имя (ссылка на loop-устройство)
+lab_disk() {
+  truncate -s "$2" "$DISKS/$1.img"
+  ln -sf "$(losetup -f --show "$DISKS/$1.img")" "/dev/lab-$1"
+}
+lab_unit() { systemctl stop "$1" 2>/dev/null; systemctl reset-failed "$1" 2>/dev/null; true; }
+```
+
+### Подключить новый диск навсегда
+
+К серверу подключили новый пустой диск `/dev/lab-data` (100 МБ). Создайте на нём файловую систему **ext4**, смонтируйте в `/mnt/data`, положите туда файл `hello.txt` и пропишите диск в `/etc/fstab` **по UUID** так, чтобы при отсутствии диска сервер всё равно загрузился.
+
+```bash setup
+lab_disks_reset
+lab_disk data 100M
+rmdir /mnt/data 2>/dev/null; true
+```
+
+```bash check
+dev=$(readlink -f /dev/lab-data)
+[ "$(blkid -s TYPE -o value "$dev" 2>/dev/null)" = ext4 ] || fail "На /dev/lab-data нет файловой системы ext4"
+uuid=$(blkid -s UUID -o value "$dev")
+[ "$(findmnt -no SOURCE /mnt/data 2>/dev/null)" = "$dev" ] || fail "Диск не смонтирован в /mnt/data"
+[ -f /mnt/data/hello.txt ] || fail "На диске нет hello.txt"
+line=$(awk -v u="UUID=$uuid" '$1 == u || $1 == "UUID=\""substr(u,6)"\""' /etc/fstab)
+[ -n "$line" ] || fail "В /etc/fstab нет строки для этого диска по его UUID"
+echo "$line" | awk '{exit !($2 == "/mnt/data" && $3 == "ext4")}' || fail "Строка в fstab не та: нужно монтирование в /mnt/data с типом ext4 — $line"
+echo "$line" | awk '{print $4}' | tr ',' '\n' | grep -qx nofail || fail "Если диск пропадёт, загрузка остановится: в опциях нет нужного флага"
+tmp=$(mktemp); echo "$line" > $tmp
+findmnt --verify --tab-file $tmp >/dev/null 2>&1 || { rm -f $tmp; fail "findmnt --verify находит ошибки в строке fstab"; }
+rm -f $tmp
+ok "$line"
+```
+
+```text hint
+1. Создать файловую систему на устройстве и каталог для монтирования, смонтировать, создать файл (каталог принадлежит root).
+2. Узнать UUID файловой системы — утилита, которая показывает атрибуты блочных устройств, или lsblk с колонками.
+3. Дописать в таблицу монтирования строку из шести полей: что, куда, тип, опции, dump, pass. В опциях кроме «по умолчанию» — флаг «не обязательно».
+4. Проверить таблицу: размонтировать и смонтировать «всё из fstab», а также утилитой проверки findmnt.
+```
+
+```bash solution
+sudo mkfs.ext4 -q /dev/lab-data
+sudo mkdir -p /mnt/data
+sudo mount /dev/lab-data /mnt/data
+echo "hello" | sudo tee /mnt/data/hello.txt >/dev/null
+uuid=$(sudo blkid -s UUID -o value "$(readlink -f /dev/lab-data)")
+echo "UUID=$uuid /mnt/data ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab >/dev/null
+sudo umount /mnt/data
+sudo mount -a
+findmnt /mnt/data
+```
+
+```text review
+Эталон: `mkfs.ext4` → `mount` → строка `UUID=... /mnt/data ext4 defaults,nofail 0 2` → `umount` + `mount -a` для проверки.
+
+- **UUID**, а не `/dev/sdb`: имена устройств меняются при добавлении дисков и перезагрузке, UUID файловой системы — нет.
+- `nofail` — если диска нет, загрузка продолжится. Без него сломанная строка fstab отправляет сервер в emergency mode — а на облачной ВМ без консоли это часы простоя.
+- Перед перезагрузкой всегда `sudo mount -a` (смонтирует всё, что ещё не смонтировано, и покажет ошибки) и `findmnt --verify`.
+- Последние два поля: dump (0 — не бэкапить старой утилитой dump) и pass (порядок проверки fsck: 1 — корень, 2 — остальные, 0 — не проверять).
+```
+
+```text notes
+^[^\n]*/dev/(lab-data|loop[0-9]+)\s+/mnt/data[^\n]*>>\s*/etc/fstab|tee\s+-a\s+/etc/fstab[^\n]*/dev/loop => В fstab вписывалось имя устройства. Имена /dev/sdX и /dev/loopN меняются — пишите UUID.
+```
+
+### Размонтировать занятый раздел
+
+Раздел `/mnt/busy` нужно отключить для обслуживания, но `umount` отвечает «target is busy». Выясните, какой процесс держит раздел, завершите его (он не важен) и **размонтируйте** раздел.
+
+```bash setup
+lab_disks_reset
+lab_unit lab-busy
+lab_disk busy 50M
+mkfs.ext4 -q -F /dev/lab-busy
+mkdir -p /mnt/busy
+mount /dev/lab-busy /mnt/busy
+mkdir -p /mnt/busy/work && chown student:student /mnt/busy/work
+systemd-run -q --unit=lab-busy -p User=student -p WorkingDirectory=/mnt/busy/work bash -c 'while true; do date > now.txt; sleep 5; done'
+sleep 1
+```
+
+```bash check
+findmnt /mnt/busy >/dev/null && fail "/mnt/busy всё ещё смонтирован"
+grep -qs ' /mnt/busy ' /proc/mounts && fail "/mnt/busy всё ещё смонтирован"
+ok "/mnt/busy размонтирован"
+```
+
+```text hint
+1. Попробовать отмонтировать и прочитать ошибку.
+2. Есть утилиты, которые показывают процессы, использующие файловую систему (в том числе как текущий каталог): одна — с ключом «смонтированная ФС», другая — список открытых файлов по пути.
+3. Завершить найденный процесс и повторить отмонтирование.
+```
+
+```bash solution
+sudo umount /mnt/busy || true
+sudo fuser -vm /mnt/busy
+sudo fuser -km /mnt/busy
+sleep 1
+sudo umount /mnt/busy
+```
+
+```text review
+Эталон: `fuser -vm /mnt/busy` (или `lsof +f -- /mnt/busy`) → завершить процесс → `umount /mnt/busy`.
+
+- «Занятым» раздел делает любой открытый на нём файл **и** любой процесс, у которого там текущий каталог (часто — ваша же оболочка после `cd /mnt/busy`).
+- `fuser -km` убивает всех пользователей раздела разом — удобно, но опасно на разделах, где работают нужные службы. Сначала смотрите `-v`.
+- `umount -l` (lazy) отключает раздел из дерева сразу, а реально — когда освободится. Помогает в тупиковых случаях, но процессы продолжают писать «в никуда» — для обслуживания диска это не годится.
+```
+
+```text notes
+umount\s+(-l|--lazy) => Использовался ленивый umount -l: раздел исчез из дерева, но процесс продолжает с ним работать. Для обслуживания диска нужно найти и остановить процесс.
+```
+
 ## Тест
 
 ### Какая команда покажет диски и разделы вместе с файловыми системами и UUID?

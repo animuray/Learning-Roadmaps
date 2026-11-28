@@ -173,6 +173,177 @@ server {
 - [ ] Получить IP хоста db1 в задаче для web через `hostvars`
 - [ ] Специально оставить `{{` без кавычек в начале значения и разобрать ошибку
 
+## Лаборатория
+
+«Серверы» — контейнеры `lab-web1`, `lab-web2`, `lab-db1`; проект `~/ansible-lab` с `ansible.cfg` и `inventory.ini` (группы `web` и `db`) готов.
+
+```bash lib
+# «Серверы» для Ansible — контейнеры lab-web1, lab-web2, lab-db1 (Python, sudo, sshd); подключение — community.docker.docker
+lab_host_image() {
+  docker image inspect lab-ansible-host:2 >/dev/null 2>&1 && return
+  docker image inspect python:3.12-slim >/dev/null 2>&1 || docker pull -q python:3.12-slim >/dev/null
+  docker build -q -t lab-ansible-host:2 - >/dev/null <<'EOF'
+FROM python:3.12-slim
+RUN apt-get update -q && apt-get install -y -q --no-install-recommends sudo openssh-server \
+ && mkdir -p /run/sshd && rm -rf /var/lib/apt/lists/*
+CMD ["sleep", "infinity"]
+EOF
+}
+lab_hosts() { lab_host_image; for h in ${*:-lab-web1 lab-web2 lab-db1}; do docker rm -f $h >/dev/null 2>&1; docker run -d --name $h --hostname $h lab-ansible-host:2 >/dev/null; done; }
+# lab_inv каталог — ansible.cfg и inventory.ini: web = lab-web1, lab-web2; db = lab-db1
+lab_inv() {
+  mkdir -p "$1"
+  printf '[defaults]\ninventory = inventory.ini\ninterpreter_python = /usr/local/bin/python3\n' > "$1/ansible.cfg"
+  printf '[web]\nlab-web1\nlab-web2\n\n[db]\nlab-db1\n\n[all:vars]\nansible_connection=community.docker.docker\n' > "$1/inventory.ini"
+}
+lab_own() { chown -R student:student "$1"; }
+# lab_play каталог аргументы — ansible-playbook от имени ученика, вывод — в /tmp/lab-ans.log
+lab_play() { su - student -c "cd $1 && ANSIBLE_NOCOLOR=1 ansible-playbook $2" > /tmp/lab-ans.log 2>&1; }
+# сумма changed по всем хостам из итогов последнего прогона
+lab_changed() { grep -E '^lab-[a-z0-9]+ +:' /tmp/lab-ans.log | grep -oE 'changed=[0-9]+' | cut -d= -f2 | awk '{s += $1} END {print s + 0}'; }
+lab_anslog() { grep -E 'fatal|ERROR|FAILED|error' /tmp/lab-ans.log | head -2 | tr '\n' ' ' | cut -c1-300; }
+```
+
+```bash setup
+lab_hosts
+rm -rf /home/student/ansible-lab
+lab_inv /home/student/ansible-lab
+lab_own /home/student/ansible-lab
+```
+
+### Где задана переменная
+
+Переменная `app_port` должна принимать значения:
+
+- **8000** — для всех хостов (по умолчанию);
+- **8080** — для группы `web`;
+- **9090** — для хоста `lab-web2`.
+
+Задайте её в **`group_vars`** и **`host_vars`** проекта (не в плейбуке) и напишите плейбук `~/ansible-lab/port.yml` для всех хостов, который записывает значение в `/etc/app_port`.
+
+```bash check
+d=/home/student/ansible-lab
+[ -f $d/port.yml ] || fail "Нет ~/ansible-lab/port.yml"
+grep -q 'app_port:' $d/port.yml && fail "app_port задан в самом плейбуке — переменные нужно вынести в group_vars/host_vars"
+lab_play $d port.yml || fail "Плейбук падает: $(lab_anslog)"
+for p in lab-web1:8080 lab-web2:9090 lab-db1:8000; do
+  h=${p%%:*}; want=${p#*:}
+  got=$(docker exec $h cat /etc/app_port 2>/dev/null | tr -d '[:space:]')
+  [ "$got" = "$want" ] || fail "На $h в /etc/app_port «$got», а должно быть $want"
+done
+ok "lab-web1=8080, lab-web2=9090, lab-db1=8000"
+```
+
+```text hint
+1. Значение «для всех» — в файле группы all, «для web» — в файле группы web, «для хоста» — в файле с именем хоста. Каталоги — рядом с inventory.
+2. Плейбук для всех хостов записывает значение переменной в файл модулем копирования содержимого.
+3. Проверить, какое значение получит хост, можно ad-hoc модулем debug или ansible-inventory.
+```
+
+```bash solution
+cd ~/ansible-lab
+mkdir -p group_vars host_vars
+echo 'app_port: 8000' > group_vars/all.yml
+echo 'app_port: 8080' > group_vars/web.yml
+echo 'app_port: 9090' > host_vars/lab-web2.yml
+cat > port.yml <<'EOF'
+- name: Порт приложения
+  hosts: all
+  become: true
+  tasks:
+    - name: Записать порт
+      ansible.builtin.copy:
+        dest: /etc/app_port
+        content: "{{ app_port }}\n"
+        mode: "0644"
+EOF
+ansible all -m debug -a var=app_port
+ansible-playbook port.yml
+```
+
+```text review
+Эталон: `group_vars/all.yml` (8000) → `group_vars/web.yml` (8080) → `host_vars/lab-web2.yml` (9090).
+
+- Чем конкретнее, тем сильнее: хост > группа > all. Полный порядок приоритета — 22 уровня в документации; на практике хватает: `-e` > vars плея/задачи > host_vars > group_vars конкретной группы > group_vars/all > defaults роли.
+- Отладка «откуда значение»: `ansible -m debug -a var=app_port lab-web2`, `ansible-inventory --host lab-web2`.
+- Переменные окружений держат в inventory, а не в плейбуках: плейбук один, а `inventories/stage/group_vars` и `inventories/prod/group_vars` — свои.
+```
+
+### Шаблон upstream по группе
+
+Хост `lab-db1` в этой задаче играет роль балансировщика. Создайте шаблон `templates/upstream.conf.j2` и плейбук `~/ansible-lab/lb.yml` (для `lab-db1`), который рендерит его в **`/etc/upstream.conf`**:
+
+    upstream app {
+        server lab-web1:8080 max_conns=100;
+        server lab-web2:9090 max_conns=100;
+    }
+
+Строки `server` должны строиться **циклом по всем хостам группы `web`**, порт — из **их** переменной `app_port` (8080 для группы web и 9090 для lab-web2 — уже заданы в group_vars/host_vars), а `max_conns` — из переменной `max_conns`, которая **не задана**: используйте значение **по умолчанию 100**.
+
+```bash setup
+mkdir -p /home/student/ansible-lab/group_vars /home/student/ansible-lab/host_vars
+echo 'app_port: 8080' > /home/student/ansible-lab/group_vars/web.yml
+echo 'app_port: 9090' > /home/student/ansible-lab/host_vars/lab-web2.yml
+rm -f /home/student/ansible-lab/lb.yml /home/student/ansible-lab/templates/upstream.conf.j2
+lab_own /home/student/ansible-lab
+```
+
+```bash check
+d=/home/student/ansible-lab
+[ -f $d/templates/upstream.conf.j2 ] || fail "Нет шаблона templates/upstream.conf.j2"
+grep -qE '\{%-?\s*for ' $d/templates/upstream.conf.j2 || fail "В шаблоне нет цикла for"
+grep -qE 'lab-web[12]' $d/templates/upstream.conf.j2 && fail "Имена хостов вписаны в шаблон вручную — они должны браться из группы web"
+grep -qE 'default\(' $d/templates/upstream.conf.j2 || fail "max_conns в шаблоне без значения по умолчанию"
+lab_play $d lb.yml || fail "Плейбук падает: $(lab_anslog)"
+want=$(printf 'upstream app {\n    server lab-web1:8080 max_conns=100;\n    server lab-web2:9090 max_conns=100;\n}')
+got=$(docker exec lab-db1 cat /etc/upstream.conf 2>/dev/null | sed '/^[[:space:]]*$/d')
+[ "$got" = "$want" ] || fail "/etc/upstream.conf на lab-db1 не совпадает с ожидаемым. Сейчас: $(echo "$got" | tr '\n' '|')"
+lab_play $d "lb.yml -e max_conns=50" >/dev/null
+docker exec lab-db1 grep -q 'max_conns=50' /etc/upstream.conf || fail "Переменная max_conns не используется в шаблоне"
+lab_play $d lb.yml >/dev/null
+ok "upstream собран по группе web"
+```
+
+```text hint
+1. В шаблоне: цикл по списку хостов группы — список групп доступен через специальную переменную groups.
+2. Переменные другого хоста берутся из hostvars по его имени.
+3. Значение по умолчанию для незаданной переменной — фильтр default.
+4. Внимательно с пробелами: управляющие конструкции Jinja оставляют пустые строки — их можно убрать минусом внутри скобок.
+```
+
+```bash solution
+cd ~/ansible-lab
+mkdir -p templates
+cat > templates/upstream.conf.j2 <<'EOF'
+upstream app {
+{% for host in groups['web'] %}
+    server {{ host }}:{{ hostvars[host].app_port }} max_conns={{ max_conns | default(100) }};
+{% endfor %}
+}
+EOF
+cat > lb.yml <<'EOF'
+- name: Балансировщик
+  hosts: lab-db1
+  become: true
+  tasks:
+    - name: Конфиг upstream
+      ansible.builtin.template:
+        src: upstream.conf.j2
+        dest: /etc/upstream.conf
+        mode: "0644"
+EOF
+ansible-playbook lb.yml && docker exec lab-db1 cat /etc/upstream.conf
+```
+
+```text review
+Эталон — в «Решении»: `{% for host in groups['web'] %}`, `hostvars[host].app_port`, `max_conns | default(100)`.
+
+- `groups['web']` — список хостов группы, `hostvars[имя]` — переменные и факты любого хоста, `inventory_hostname` — имя текущего, `group_names` — его группы. Так собирают конфиги кластеров: upstream в nginx, список узлов Patroni, `/etc/hosts`.
+- Добавили сервер в inventory — он сам появится в балансировщике при следующем прогоне.
+- Факты других хостов (`hostvars[h].ansible_default_ipv4.address`) есть, только если с ними уже был сеанс в этом прогоне — иначе включают кэш фактов или первый плей `hosts: all` со сбором фактов.
+- В Ansible по умолчанию `trim_blocks` включён: перевод строки после `{% %}` убирается. Для точного контроля — `{%-` и `-%}`.
+```
+
 ## Тест
 
 ### Какой источник переменных имеет самый высокий приоритет?

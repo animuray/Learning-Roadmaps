@@ -173,6 +173,199 @@ curl -I -H "Host: myapp.example.com" http://127.0.0.1/
 - [ ] Остановить бэкенд и получить 502, найти причину в error.log
 - [ ] Подключить HTTPS: самоподписанный сертификат для теста или Let's Encrypt, если есть домен; настроить редирект с HTTP на HTTPS
 
+## Лаборатория
+
+nginx уже установлен и работает на порту 80. Сайты Ubuntu-способом: файл в `/etc/nginx/sites-available/` и ссылка на него в `/etc/nginx/sites-enabled/`. Проверять — `curl -H 'Host: <имя>' http://127.0.0.1/...`.
+
+```bash setup
+lab_site_reset() { rm -f /etc/nginx/sites-enabled/$1* /etc/nginx/sites-available/$1*; }
+```
+
+### Одностраничное приложение
+
+Фронтенд собран в `/srv/spa`: `index.html` и файлы в `assets/`. Опубликуйте его как сайт **`spa.local`**. Это SPA: адреса вроде `/dashboard` или `/users/42` существуют только внутри JavaScript-роутера, поэтому для любого пути, которому не соответствует файл, nginx должен отдавать `index.html` с кодом 200. Настоящие файлы (`/assets/app.js`) отдаются как есть.
+
+```bash setup
+lab_site_reset spa
+rm -rf /srv/spa && mkdir -p /srv/spa/assets
+echo '<!doctype html><title>SPA</title><div id="app">SPA root</div><script src="/assets/app.js"></script>' > /srv/spa/index.html
+echo 'console.log("app loaded")' > /srv/spa/assets/app.js
+nginx -t -q && systemctl reload nginx
+```
+
+```bash check
+nginx -t >/dev/null 2>&1 || fail "nginx -t находит ошибку в конфигурации"
+g() { curl -s -o /tmp/lab-body -w '%{http_code}' -H 'Host: spa.local' "http://127.0.0.1$1"; }
+[ "$(g /)" = 200 ] && grep -q 'SPA root' /tmp/lab-body || fail "spa.local/ не отдаёт index.html — сайт не настроен или не применён"
+[ "$(g /assets/app.js)" = 200 ] && grep -q 'app loaded' /tmp/lab-body || fail "/assets/app.js не отдаётся как файл"
+c=$(g /dashboard); [ "$c" = 200 ] && grep -q 'SPA root' /tmp/lab-body || fail "/dashboard отвечает кодом $c, а не страницей приложения"
+c=$(g /users/42); [ "$c" = 200 ] && grep -q 'SPA root' /tmp/lab-body || fail "/users/42 отвечает кодом $c, а не страницей приложения"
+rm -f /tmp/lab-body
+ok "spa.local: файлы — как есть, остальные пути — index.html"
+```
+
+```text hint
+1. Сайт: блок server на 80-м порту с именем spa.local и корнем — каталогом фронтенда.
+2. В корневом location — директива, которая пробует отдать запрошенный путь как файл, потом как каталог, а если ничего нет — внутренне переходит к index.html.
+3. Включить сайт ссылкой, проверить синтаксис и перечитать конфигурацию.
+```
+
+```bash solution
+sudo tee /etc/nginx/sites-available/spa >/dev/null <<'EOF'
+server {
+    listen 80;
+    server_name spa.local;
+    root /srv/spa;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
+EOF
+sudo ln -sf /etc/nginx/sites-available/spa /etc/nginx/sites-enabled/spa
+sudo nginx -t && sudo systemctl reload nginx
+curl -s -H 'Host: spa.local' http://127.0.0.1/dashboard
+```
+
+```text review
+Эталон: `root /srv/spa;` + `try_files $uri $uri/ /index.html;`.
+
+- `try_files` перебирает варианты слева направо; последний — внутреннее перенаправление (или код: `=404`). Для API так делать нельзя — несуществующий `/api/...` должен давать 404, а не HTML; поэтому `/api/` выносят в отдельный `location` с `proxy_pass`.
+- Кэширование: `location /assets/ { expires 1y; }` — у собранных файлов в имени хеш, а `index.html` кэшировать нельзя, иначе пользователи не увидят новую версию.
+- `root` vs `alias`: `root /srv/spa` + `/assets/app.js` → `/srv/spa/assets/app.js`; `alias` заменяет путь location целиком.
+```
+
+### 502 Bad Gateway
+
+Сайт **`api.local`** уже настроен в nginx как прокси на бэкенд, но отдаёт **502**. Бэкенд (служба `lab-nginx-api`) работает, менять его нельзя. Разберитесь по логам и почините так, чтобы `http://api.local/` отвечал `api ok`.
+
+```bash setup
+lab_site_reset api
+systemctl stop lab-nginx-api 2>/dev/null; systemctl reset-failed lab-nginx-api 2>/dev/null
+cat > /opt/lab-nginx-api.py <<'EOF'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"api ok\n")
+HTTPServer(("127.0.0.1", 8097), H).serve_forever()
+EOF
+systemd-run -q --unit=lab-nginx-api python3 /opt/lab-nginx-api.py
+cat > /etc/nginx/sites-available/api <<'EOF'
+server {
+    listen 80;
+    server_name api.local;
+
+    location / {
+        proxy_pass http://127.0.0.1:8096;
+        proxy_set_header Host $host;
+    }
+}
+EOF
+ln -sf /etc/nginx/sites-available/api /etc/nginx/sites-enabled/api
+nginx -t -q && systemctl reload nginx
+sleep 0.5
+systemctl show -p MainPID --value lab-nginx-api > /var/lib/lab/nginx-api-pid
+```
+
+```bash check
+[ "$(systemctl show -p MainPID --value lab-nginx-api)" = "$(cat /var/lib/lab/nginx-api-pid)" ] || fail "Бэкенд перезапускали или меняли — по условию его трогать нельзя"
+ss -ltnH 'src 127.0.0.1 and sport = :8097' | grep -q . || fail "Бэкенд больше не слушает свой порт"
+nginx -t >/dev/null 2>&1 || fail "nginx -t находит ошибку в конфигурации"
+r=$(curl -s --max-time 5 -H 'Host: api.local' http://127.0.0.1/)
+[ "$r" = "api ok" ] || fail "api.local отвечает: «$(echo "$r" | head -c 80)»"
+ok "api.local → api ok"
+```
+
+```text hint
+1. Причину 502 nginx пишет в свой журнал ошибок — найдите там, куда он пытался подключиться и что ответила система.
+2. Узнать, какой адрес и порт на самом деле слушает бэкенд, — список слушающих сокетов с процессами.
+3. Поправить адрес в конфигурации сайта, проверить синтаксис и перечитать конфигурацию.
+```
+
+```bash solution
+sudo tail -n 3 /var/log/nginx/error.log
+sudo ss -ltnp | grep python3
+sudo sed -i 's#proxy_pass http://127.0.0.1:8096;#proxy_pass http://127.0.0.1:8097;#' /etc/nginx/sites-available/api
+sudo nginx -t && sudo systemctl reload nginx
+curl -s -H 'Host: api.local' http://127.0.0.1/
+```
+
+```text review
+Эталон: `/var/log/nginx/error.log` → `connect() failed (111: Connection refused) while connecting to upstream, upstream: "http://127.0.0.1:8096/"` → `ss -ltnp` (бэкенд на 8097) → исправить `proxy_pass` → `nginx -t` → `reload`.
+
+- 502 — nginx не смог поговорить с бэкендом: тот не запущен, слушает другой порт/адрес (`127.0.0.1` vs `0.0.0.0`, IPv4 vs IPv6), упал посреди ответа. 504 — бэкенд не ответил за `proxy_read_timeout`.
+- `error.log` почти всегда называет причину прямо: `Connection refused`, `no live upstreams`, `Permission denied` (SELinux), `upstream prematurely closed connection`.
+- `curl -v` к самому бэкенду (`curl 127.0.0.1:8097`) отделяет проблему прокси от проблемы приложения.
+```
+
+### HTTPS и редирект
+
+Для сайта **`secure.local`** уже выпущен сертификат: `/etc/ssl/lab/secure.local.crt` и ключ `/etc/ssl/lab/secure.local.key`. Настройте:
+
+- `https://secure.local/` — отдаёт содержимое `/srv/secure` по TLS с этим сертификатом;
+- `http://secure.local/...` — постоянный редирект (**301**) на тот же адрес по `https://`.
+
+```bash setup
+lab_site_reset secure
+mkdir -p /etc/ssl/lab /srv/secure
+echo "secure site" > /srv/secure/index.html
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 -keyout /etc/ssl/lab/secure.local.key -out /etc/ssl/lab/secure.local.crt -subj "/CN=secure.local" -addext "subjectAltName=DNS:secure.local" 2>/dev/null
+chmod 600 /etc/ssl/lab/secure.local.key
+nginx -t -q && systemctl reload nginx
+```
+
+```bash check
+nginx -t >/dev/null 2>&1 || fail "nginx -t находит ошибку в конфигурации"
+r=$(curl -s --max-time 5 --cacert /etc/ssl/lab/secure.local.crt --resolve secure.local:443:127.0.0.1 https://secure.local/)
+[ "$r" = "secure site" ] || fail "https://secure.local/ не отдаёт сайт по TLS с выпущенным сертификатом (ответ: «$(echo "$r" | head -c 60)»)"
+read code loc < <(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -H 'Host: secure.local' http://127.0.0.1/docs?page=2)
+[ "$code" = 301 ] || fail "http://secure.local/ отвечает кодом $code, а не постоянным редиректом"
+[ "$loc" = "https://secure.local/docs?page=2" ] || fail "Редирект ведёт на «$loc» — путь и параметры запроса должны сохраняться"
+ok "HTTPS работает, http → $loc"
+```
+
+```text hint
+1. Два блока server для одного имени: один на 80-м порту, другой на 443-м с включённым SSL.
+2. В HTTPS-блоке — пути к сертификату и ключу и корень сайта.
+3. В HTTP-блоке — вернуть код постоянного перенаправления на адрес со схемой https, тем же именем хоста и исходным путём с параметрами (у nginx есть переменная, где путь хранится вместе со строкой запроса).
+```
+
+```bash solution
+sudo tee /etc/nginx/sites-available/secure >/dev/null <<'EOF'
+server {
+    listen 80;
+    server_name secure.local;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name secure.local;
+    ssl_certificate     /etc/ssl/lab/secure.local.crt;
+    ssl_certificate_key /etc/ssl/lab/secure.local.key;
+    root /srv/secure;
+    index index.html;
+}
+EOF
+sudo ln -sf /etc/nginx/sites-available/secure /etc/nginx/sites-enabled/secure
+sudo nginx -t && sudo systemctl reload nginx
+curl -sI -H 'Host: secure.local' http://127.0.0.1/ | head -3
+```
+
+```text review
+Эталон: блок `:80` с `return 301 https://$host$request_uri;` + блок `listen 443 ssl` с `ssl_certificate`/`ssl_certificate_key`.
+
+- `$request_uri` — путь вместе со строкой запроса; `$uri` потеряет `?page=2`.
+- 301 — постоянный (браузер запомнит), 302 — временный. Пока не уверены — 302, потом 301.
+- Дальше по уму: `listen 443 ssl http2;`, `ssl_protocols TLSv1.2 TLSv1.3;`, заголовок `Strict-Transport-Security` (HSTS) — но только когда HTTPS точно работает.
+- С Let's Encrypt `certbot --nginx -d example.com` делает обе части сам и ставит таймер продления.
+```
+
+```text notes
+rewrite\s+\^ => Редирект сделан через rewrite — работает, но return 301 проще и быстрее: не нужен разбор регулярного выражения.
+```
+
 ## Тест
 
 ### Что такое reverse proxy?

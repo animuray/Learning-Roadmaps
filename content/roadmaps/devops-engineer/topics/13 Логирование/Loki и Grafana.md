@@ -148,6 +148,191 @@ quantile_over_time(0.95, {app="api"} | json | unwrap duration_ms [5m]) by (route
 - [ ] Специально добавить метку с высокой кардинальностью (например, request_id) на тестовом стенде и посмотреть число потоков через logcli series
 - [ ] В Kubernetes поставить Loki и Alloy через Helm и найти логи пода по namespace и app
 
+## Лаборатория
+
+Приложение `labapp` пишет лог в `/var/log/labapp/app.log` (служба `lab-labapp`). Loki и Promtail запускаются в Docker (образы `grafana/loki:3.3.0` и `grafana/promtail:3.3.0` уже скачаны). Запросы к Loki — через HTTP API: `curl -s --get localhost:3100/loki/api/v1/query_range --data-urlencode 'query={job="labapp"}' | jq`.
+
+```bash lib
+# Логи: Loki (порт 3100) и Promtail — контейнеры в сети Docker «logging».
+# lab_loki — запустить Loki со стандартным конфигом образа (если ещё не работает)
+lab_loki() {
+  docker network inspect logging >/dev/null 2>&1 || docker network create logging >/dev/null
+  if [ "$(docker inspect -f '{{.State.Running}}' loki 2>/dev/null)" != true ]; then
+    docker rm -f loki >/dev/null 2>&1
+    docker run -d --name loki --network logging -p 3100:3100 grafana/loki:3.3.0 >/dev/null
+  fi
+  for i in $(seq 60); do curl -s localhost:3100/ready 2>/dev/null | grep -q ready && return 0; sleep 1; done
+}
+# lab_logq 'LogQL' — строки за последний час (JSON-ответ Loki)
+lab_logq() { curl -s --get localhost:3100/loki/api/v1/query_range --data-urlencode "query=$1" --data-urlencode "limit=${2:-1000}" --data-urlencode "start=$(( $(date +%s) - 3600 ))000000000"; }
+# lab_loglines 'LogQL' — число строк в ответе
+lab_loglines() { lab_logq "$1" | jq '[.data.result[]?.values[]?] | length'; }
+lab_drm() { docker rm -f "$@" >/dev/null 2>&1; true; }
+# образ есть локально или скачивается (если ученик почистил образы через prune)
+lab_img() { for i in "$@"; do docker image inspect "$i" >/dev/null 2>&1 || docker pull -q "$i" >/dev/null; done; }
+# lab_wait_http URL [строка] — дождаться ответа
+lab_wait_http() { for i in $(seq 60); do curl -s --max-time 1 "$1" 2>/dev/null | grep -q "${2:-.}" && return 0; sleep 0.25; done; return 1; }
+```
+
+```bash setup
+lab_img grafana/loki:3.3.0 grafana/promtail:3.3.0
+systemctl stop lab-labapp 2>/dev/null; systemctl reset-failed lab-labapp 2>/dev/null
+mkdir -p /var/log/labapp /opt/lab
+cat > /opt/lab/labapp.py <<'EOF'
+import random, time
+levels = ["INFO"] * 8 + ["WARN", "ERROR"]
+with open("/var/log/labapp/app.log", "a", buffering=1) as f:
+    while True:
+        lvl = random.choice(levels)
+        f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {lvl} order={random.randint(10000, 99999)} handled in {random.randint(5, 900)}ms\n")
+        time.sleep(1)
+EOF
+```
+
+### Собрать логи в Loki
+
+Запустите в Docker-сети **`logging`**:
+
+1. **`loki`** — Loki на порту **3100** (стандартного конфига образа достаточно);
+2. **`promtail`** — Promtail с вашим конфигом `~/logging/promtail.yml`, который читает **`/var/log/labapp/*.log`** стенда (подключите каталог в контейнер только на чтение) и отправляет строки в Loki с метками **`job="labapp"`** и **`host="stand"`**.
+
+Строки лога должны находиться в Loki запросом `{job="labapp", host="stand"}`.
+
+```bash setup
+docker rm -f promtail loki >/dev/null 2>&1
+docker network rm logging >/dev/null 2>&1
+rm -rf /home/student/logging && mkdir -p /home/student/logging && chown student:student /home/student/logging
+: > /var/log/labapp/app.log
+systemd-run -q --unit=lab-labapp python3 /opt/lab/labapp.py
+```
+
+```bash check
+[ "$(docker inspect -f '{{.State.Running}}' loki 2>/dev/null)" = true ] || fail "Контейнер loki не запущен"
+[ "$(docker inspect -f '{{.State.Running}}' promtail 2>/dev/null)" = true ] || fail "Контейнер promtail не запущен: $(docker logs promtail 2>&1 | tail -1 | cut -c1-150)"
+for c in loki promtail; do docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' $c | grep -qw logging || fail "$c не в сети logging"; done
+[ -f /home/student/logging/promtail.yml ] || fail "Нет ~/logging/promtail.yml"
+docker inspect -f '{{range .Mounts}}{{.Source}}:{{.RW}} {{end}}' promtail | grep -q '/var/log/labapp:false' || fail "Каталог /var/log/labapp не подключён в promtail только на чтение"
+for i in $(seq 30); do n=$(lab_loglines '{job="labapp", host="stand"}' 50); [ "${n:-0}" -gt 0 ] && break; sleep 1; done
+[ "${n:-0}" -gt 0 ] || fail "В Loki нет строк по запросу {job=\"labapp\", host=\"stand\"}. Последние сообщения promtail: $(docker logs promtail 2>&1 | grep -iE 'error|level=warn' | tail -1 | cut -c1-150)"
+ok "в Loki $n+ строк labapp; последняя: $(lab_logq '{job="labapp"}' 1 | jq -r '.data.result[0].values[0][1]')"
+```
+
+```text hint
+1. Создать сеть Docker и запустить Loki в ней с публикацией порта.
+2. Конфиг Promtail: свой HTTP-порт, файл позиций (что уже отправлено), адрес отправки в Loki (внутри сети — по имени контейнера) и задание сбора: статическая цель с метками; путь к файлам задаётся специальной меткой с двойным подчёркиванием.
+3. Запустить Promtail в той же сети с конфигом и каталогом логов, указав путь к конфигу ключом запуска.
+4. Проверить запрос к API Loki.
+```
+
+```bash solution
+cd ~/logging
+cat > promtail.yml <<'EOF'
+server:
+  http_listen_port: 9080
+positions:
+  filename: /tmp/positions.yaml
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+scrape_configs:
+  - job_name: labapp
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: labapp
+          host: stand
+          __path__: /var/log/labapp/*.log
+EOF
+docker network create logging
+docker run -d --name loki --network logging -p 3100:3100 grafana/loki:3.3.0
+docker run -d --name promtail --network logging \
+  -v ~/logging/promtail.yml:/etc/promtail/config.yml:ro -v /var/log/labapp:/var/log/labapp:ro \
+  grafana/promtail:3.3.0 -config.file=/etc/promtail/config.yml
+sleep 20
+curl -s --get localhost:3100/loki/api/v1/query_range --data-urlencode 'query={job="labapp"}' --data-urlencode limit=3 | jq -r '.data.result[].values[][1]'
+```
+
+```text review
+Эталон — в «Решении».
+
+- Loki индексирует **только метки**, а не текст строк: поэтому дешевле Elasticsearch по железу. Цена — поиск по тексту перебирает строки в выбранных метками потоках, и метки нужно выбирать с умом.
+- Метки — низкой кардинальности: `job`, `host`, `env`, `level`. Никогда — `order_id`, `user_id`, `trace_id` в метках: каждый вариант — отдельный поток, Loki захлебнётся. Такие поля ищут фильтрами по тексту.
+- Файл позиций хранит, до какого места каждый файл уже отправлен; в продакшене его кладут на том, иначе после пересоздания контейнера логи уйдут повторно.
+- Promtail переведён в режим поддержки; новые установки делают на Grafana Alloy (тот же функционал, другой синтаксис), Fluent Bit или Vector.
+```
+
+### Найти ошибку оплаты
+
+В логах `labapp` (уже в Loki, метка `job="labapp"`) среди тысяч строк есть **одна** строка о сбое оплаты: `ERROR payment failed order=<номер>`. Найдите её **запросом LogQL** и запишите:
+
+- сам запрос — в `~/logql.txt`;
+- номер заказа — в `~/failed-order.txt`.
+
+```bash setup
+# чистый Loki и никаких строк от прошлых попыток
+docker rm -f promtail loki >/dev/null 2>&1
+rm -f /var/log/labapp/history-*.log
+lab_loki
+cat > /home/student/promtail-labapp.yml <<'EOF'
+server:
+  http_listen_port: 9080
+positions:
+  filename: /tmp/positions.yaml
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+scrape_configs:
+  - job_name: labapp
+    static_configs:
+      - targets: [localhost]
+        labels: {job: labapp, host: stand, __path__: /var/log/labapp/*.log}
+EOF
+chown student:student /home/student/promtail-labapp.yml
+o=$((RANDOM % 90000 + 10000)); echo $o > /var/lib/lab/failed-order
+{ for i in $(seq 1 400); do echo "$(date -Is) INFO order=$((RANDOM % 90000 + 10000)) handled in $((RANDOM % 900))ms"; done
+  echo "$(date -Is) ERROR payment failed order=$o: card declined"
+  for i in $(seq 1 400); do echo "$(date -Is) WARN order=$((RANDOM % 90000 + 10000)) slow payment provider"; done; } > /var/log/labapp/history-$o.log
+docker run -d --name promtail --network logging -v /home/student/promtail-labapp.yml:/etc/promtail/config.yml:ro \
+  -v /var/log/labapp:/var/log/labapp:ro grafana/promtail:3.3.0 -config.file=/etc/promtail/config.yml >/dev/null
+for i in $(seq 40); do [ "$(lab_loglines "{job=\"labapp\"} |= \"order=$o\"" 5)" -ge 1 ] 2>/dev/null && break; sleep 1; done
+rm -f /home/student/logql.txt /home/student/failed-order.txt
+```
+
+```bash check
+want=$(cat /var/lib/lab/failed-order)
+[ -f /home/student/logql.txt ] || fail "Нет ~/logql.txt"
+q=$(cat /home/student/logql.txt)
+echo "$q" | grep -q 'job="labapp"' || fail "Запрос не выбирает поток по метке job=\"labapp\""
+echo "$q" | grep -qE '\|[=~]' || fail "В запросе нет фильтра по тексту строки"
+r=$(lab_logq "$q" 50)
+[ "$(echo "$r" | jq -r .status)" = success ] || fail "Loki не выполняет запрос: $(echo "$r" | head -c 150)"
+lines=$(echo "$r" | jq -r '.data.result[]?.values[]?[1]')
+[ "$(echo "$lines" | grep -c .)" = 1 ] || fail "Запрос возвращает $(echo "$lines" | grep -c .) строк — нужна одна строка о сбое оплаты"
+echo "$lines" | grep -q "payment failed order=$want" || fail "Запрос находит не ту строку"
+[ -f /home/student/failed-order.txt ] && [ "$(tr -d '[:space:]' < /home/student/failed-order.txt)" = "$want" ] || fail "В ~/failed-order.txt не номер заказа из этой строки"
+ok "заказ $want найден запросом: $q"
+```
+
+```text hint
+1. Запрос LogQL начинается с выбора потоков по меткам в фигурных скобках.
+2. Дальше — фильтры по тексту строки: «содержит» (|=) или регулярное выражение (|~); их можно ставить друг за другом.
+3. Проверить запрос через HTTP API Loki и выписать номер заказа.
+```
+
+```bash solution
+q='{job="labapp"} |= "ERROR" |= "payment failed"'
+echo "$q" > ~/logql.txt
+curl -s --get localhost:3100/loki/api/v1/query_range --data-urlencode "query=$q" | jq -r '.data.result[].values[][1]'
+curl -s --get localhost:3100/loki/api/v1/query_range --data-urlencode "query=$q" | jq -r '.data.result[].values[][1]' | grep -o 'order=[0-9]*' | cut -d= -f2 > ~/failed-order.txt
+```
+
+```text review
+Эталон: `{job="labapp"} |= "ERROR" |= "payment failed"`.
+
+- Сначала селектор меток (сужает поток), потом фильтры строк: `|=` содержит, `!=` не содержит, `|~` регулярное выражение. Чем раньше и уже фильтр, тем быстрее запрос.
+- Парсеры превращают строку в поля: `| logfmt`, `| json`, `| pattern "<ts> <level> order=<order> <_>"`, затем фильтр по полю `| order = "12345"`.
+- Метрики из логов: `sum by (level) (count_over_time({job="labapp"}[5m]))`, `rate({job="labapp"} |= "ERROR" [1m])` — на них строят графики и алерты в Grafana (Loki ruler).
+- В Grafana то же самое — раздел Explore с источником Loki и конструктором запросов.
+```
+
 ## Тест
 
 ### Что индексирует Loki?

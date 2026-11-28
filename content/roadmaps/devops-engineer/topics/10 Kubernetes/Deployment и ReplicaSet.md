@@ -127,6 +127,158 @@ kubectl autoscale deploy web --min=2 --max=10 --cpu-percent=70    # HPA
 - [ ] Посмотреть историю ревизий и откатиться на конкретную ревизию
 - [ ] Удалить ReplicaSet руками и посмотреть, что сделает Deployment
 
+## Лаборатория
+
+Кластер — k3s на стенде. Приложение в задачах — `hashicorp/http-echo`: отвечает на порту 5678 текстом из аргумента `-text`.
+
+```bash lib
+# Kubernetes на стенде — k3s (один узел). root работает с /etc/rancher/k3s/k3s.yaml, ученик — со своим ~/.kube/config
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# lab_kns имя — чистый namespace задачи (старый удаляется вместе со всем содержимым)
+lab_kns() {
+  kubectl delete ns "$1" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1
+  kubectl create ns "$1" >/dev/null
+}
+# убрать с узла метки и taint-ы, которые оставляют задачи про размещение подов
+lab_knode() {
+  kubectl taint nodes --all lab-dedicated- >/dev/null 2>&1
+  kubectl label nodes --all disktype- zone- >/dev/null 2>&1
+  true
+}
+# lab_kready ns селектор [секунд] — дождаться готовности подов
+lab_kready() { kubectl -n "$1" wait --for=condition=Ready pod -l "$2" --timeout="${3:-90}s" >/dev/null 2>&1; }
+# lab_kfiles каталог — каталог манифестов ученика (пустой)
+lab_kfiles() { rm -rf "$1"; mkdir -p "$1"; chown -R student:student "$1"; }
+lab_kj() { kubectl "$@" -o json 2>/dev/null; }
+lab_traefik() { kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'; }
+```
+
+```bash setup
+lab_knode
+```
+
+### Deployment и масштабирование
+
+В namespace **`lab-deploy`** создайте Deployment **`api`** (манифест — `~/k8s/api.yaml`):
+
+- образ `hashicorp/http-echo:1.0`, аргументы `-text=api v1`, порт 5678;
+- метка подов `app=api`;
+- **3 реплики**.
+
+Затем увеличьте число реплик до **5** — так, чтобы это было и в манифесте.
+
+```bash setup
+lab_kns lab-deploy
+mkdir -p /home/student/k8s && chown student:student /home/student/k8s
+rm -f /home/student/k8s/api.yaml
+```
+
+```bash check
+d=$(lab_kj -n lab-deploy get deploy api) || fail "Deployment api нет"
+[ "$(echo "$d" | jq -r '.spec.replicas')" = 5 ] || fail "Реплик в Deployment: $(echo "$d" | jq -r '.spec.replicas')"
+[ -f /home/student/k8s/api.yaml ] || fail "Нет ~/k8s/api.yaml"
+python3 -c 'import yaml,sys; d=[x for x in yaml.safe_load_all(open(sys.argv[1])) if x and x.get("kind")=="Deployment"]; sys.exit(0 if d and d[0]["spec"].get("replicas")==5 else 1)' /home/student/k8s/api.yaml 2>/dev/null || fail "В манифесте ~/k8s/api.yaml не 5 реплик — кластер и Git разошлись"
+[ "$(echo "$d" | jq -r '.spec.selector.matchLabels.app')" = api ] || fail "Селектор Deployment не app=api"
+kubectl -n lab-deploy rollout status deploy/api --timeout=90s >/dev/null 2>&1 || fail "Deployment api не раскатился"
+[ "$(lab_kj -n lab-deploy get deploy api | jq -r '.status.readyReplicas')" = 5 ] || fail "Готовых реплик не 5"
+ok "api: 5/5, ReplicaSet: $(kubectl -n lab-deploy get rs -l app=api --no-headers | awk '{print $1}' | head -1)"
+```
+
+```text hint
+1. Каркас Deployment даёт kubectl create deployment в режиме «показать на клиенте» с выводом YAML.
+2. В спецификации: число реплик, селектор по метке и шаблон пода с той же меткой и контейнером с аргументами.
+3. Изменить число реплик в файле и применить его снова — так кластер и манифест не разойдутся.
+```
+
+```bash solution
+mkdir -p ~/k8s
+cat > ~/k8s/api.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: lab-deploy
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: hashicorp/http-echo:1.0
+          args: ["-text=api v1"]
+          ports:
+            - containerPort: 5678
+EOF
+kubectl apply -f ~/k8s/api.yaml
+sed -i 's/replicas: 3/replicas: 5/' ~/k8s/api.yaml
+kubectl apply -f ~/k8s/api.yaml
+kubectl -n lab-deploy rollout status deploy/api
+```
+
+```text review
+Эталон: `replicas: 5` в манифесте + `kubectl apply -f`.
+
+- Deployment → ReplicaSet → поды. ReplicaSet держит заданное число подов, Deployment управляет ReplicaSet-ами при обновлениях (старый уменьшается, новый растёт).
+- `kubectl scale deploy/api --replicas=5` работает, но манифест в Git останется с 3 — при следующем `apply` (или в Argo CD) реплик снова станет 3. Источник правды — файл.
+- Исключение — HPA: если реплики считает автомасштабирование, `replicas` из манифеста убирают совсем.
+```
+
+```text notes
+kubectl\s+scale => Реплики менялись через kubectl scale — удобно, но манифест в Git тогда расходится с кластером. Меняйте файл и применяйте его.
+```
+
+### Обновление и откат
+
+Deployment **`api`** в **`lab-deploy`** работает на версии `api v1` (5 реплик). Выкатили новую версию с образом **`hashicorp/http-echo:9.9-broken`** — такого образа нет, обновление застряло. **Откатите** Deployment на предыдущую рабочую ревизию. Все 5 реплик должны отвечать `api v1`.
+
+```bash setup
+lab_kns lab-deploy
+kubectl -n lab-deploy create deployment api --image=hashicorp/http-echo:1.0 --replicas=5 --port=5678 -- /http-echo "-text=api v1" >/dev/null
+kubectl -n lab-deploy rollout status deploy/api --timeout=90s >/dev/null
+kubectl -n lab-deploy set image deploy/api http-echo=hashicorp/http-echo:9.9-broken >/dev/null
+kubectl -n lab-deploy annotate deploy/api kubernetes.io/change-cause="update to 9.9" --overwrite >/dev/null
+sleep 3
+```
+
+```bash check
+d=$(lab_kj -n lab-deploy get deploy api) || fail "Deployment api нет"
+img=$(echo "$d" | jq -r '.spec.template.spec.containers[0].image')
+[ "$img" = hashicorp/http-echo:1.0 ] || fail "Образ в Deployment — $img"
+kubectl -n lab-deploy rollout status deploy/api --timeout=60s >/dev/null 2>&1 || fail "Раскатка не завершилась"
+[ "$(echo "$d" | jq -r '.spec.replicas')" = 5 ] || fail "Реплик не 5"
+bad=$(kubectl -n lab-deploy get pods -l app=api --no-headers | grep -cv Running)
+[ "$bad" = 0 ] || fail "Не все поды Running: $(kubectl -n lab-deploy get pods -l app=api --no-headers | awk '{print $3}' | sort | uniq -c | tr -s ' ' | tr '\n' ';')"
+ok "api откачен на hashicorp/http-echo:1.0, ревизия $(echo "$d" | jq -r '.metadata.annotations["deployment.kubernetes.io/revision"]')"
+```
+
+```text hint
+1. Посмотреть статус раскатки и состояние подов: почему новые поды не стартуют?
+2. У подкоманды rollout есть история ревизий и команда «отменить» — по умолчанию к предыдущей ревизии.
+3. Дождаться окончания раскатки.
+```
+
+```bash solution
+kubectl -n lab-deploy get pods -l app=api
+kubectl -n lab-deploy rollout history deploy/api
+kubectl -n lab-deploy rollout undo deploy/api
+kubectl -n lab-deploy rollout status deploy/api
+```
+
+```text review
+Эталон: `kubectl rollout history` → `kubectl rollout undo deploy/api`.
+
+- Почему сервис не лёг: стратегия RollingUpdate с `maxUnavailable: 25%` удаляет старые поды, только когда новые стали Ready. Новые висят в `ImagePullBackOff`, а 4 из 5 старых продолжают работать.
+- `rollout undo --to-revision=N` — откат на конкретную ревизию. Сколько ревизий хранить — `revisionHistoryLimit` (10).
+- В GitOps откат делают `git revert` в репозитории манифестов — иначе Argo CD вернёт «сломанную» версию обратно.
+- Застрявшую раскатку видно по `kubectl rollout status` и событиям (`kubectl describe deploy`); `progressDeadlineSeconds` помечает её как неудачную через 10 минут.
+```
+
 ## Тест
 
 ### Как связаны Deployment, ReplicaSet и Pod?
