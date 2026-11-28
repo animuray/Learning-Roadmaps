@@ -10,7 +10,8 @@ WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN npm run build && npm prune --omit=dev
+# public/ может отсутствовать в репозитории (пустые каталоги git не хранит), а финальный образ его копирует.
+RUN mkdir -p public && npm run build && npm prune --omit=dev
 
 FROM node:22-alpine AS run
 WORKDIR /app
