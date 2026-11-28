@@ -8,6 +8,7 @@ import { practiceChecks, quizAttempts, topicProgress, userMaterials, userNotes }
 import { getRoadmap, getTopic } from "@/lib/content";
 import { computeStates, getRoadmapProgress, logActivity, markStarted } from "@/lib/progress";
 import { gradeQuestion, type QuestionResult } from "@/lib/quiz";
+import { scheduleMistakes } from "@/lib/review";
 import { getCurrentUser } from "@/lib/session";
 
 async function authedTopic(roadmapSlug: string, topicSlug: string) {
@@ -110,6 +111,12 @@ export async function submitQuiz(input: z.infer<typeof submitSchema>): Promise<Q
       },
     });
 
+  await scheduleMistakes(
+    user.id,
+    data.roadmap,
+    data.topic,
+    graded.filter((g) => !g.ok).map((g) => g.q.id),
+  );
   await logActivity(user.id, "quiz", { roadmap: data.roadmap, topic: data.topic, amount: Math.max(correct, 1) });
   if (passed && !wasPassed) {
     await logActivity(user.id, "pass", { roadmap: data.roadmap, topic: data.topic, amount: 3 });

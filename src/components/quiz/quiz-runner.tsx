@@ -4,33 +4,38 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState, useTransition } from "react";
 import clsx from "clsx";
-import { ArrowLeft, ArrowRight, Check, CircleCheck, CircleX, RotateCcw, Trophy, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, Check, CircleCheck, CircleX, Repeat, RotateCcw, Trophy, X } from "lucide-react";
 import { submitQuiz, type QuizSubmitResult } from "@/app/actions/learning";
+import { submitReview, type ReviewResult } from "@/app/actions/review";
 import type { PublicQuestion } from "@/lib/content";
+import type { QuestionResult } from "@/lib/quiz";
 
 type Answer = { selected?: number[]; text?: string };
 
-export function QuizRunner({
-  roadmap,
-  topic,
-  questions,
-  passScore,
-  next,
-  topicHref,
-  roadmapHref,
-}: {
-  roadmap: string;
-  topic: string;
-  questions: PublicQuestion[];
-  passScore: number;
-  next: { title: string; href: string } | null;
-  topicHref: string;
-  roadmapHref: string;
-}) {
+/** Тест темы или повторение ошибок: экран вопросов общий, отличаются отправка и итог. */
+export type QuizTarget =
+  | {
+      kind: "test";
+      roadmap: string;
+      topic: string;
+      passScore: number;
+      next: { title: string; href: string } | null;
+      topicHref: string;
+      roadmapHref: string;
+    }
+  | {
+      kind: "review";
+      /** Из какой темы вопрос — на повторении вопросы вперемешку из разных тем. */
+      topicTitles: Record<string, string>;
+    };
+
+type Result = ({ kind: "test" } & QuizSubmitResult) | ({ kind: "review" } & ReviewResult);
+
+export function QuizRunner({ target, questions }: { target: QuizTarget; questions: PublicQuestion[] }) {
   const router = useRouter();
   const [idx, setIdx] = useState(0);
   const [answers, setAnswers] = useState<Record<string, Answer>>({});
-  const [result, setResult] = useState<QuizSubmitResult | null>(null);
+  const [result, setResult] = useState<Result | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
@@ -54,12 +59,13 @@ export function QuizRunner({
     setError(null);
     startTransition(async () => {
       try {
-        const res = await submitQuiz({
-          roadmap,
-          topic,
-          answers: questions.map((qq) => ({ questionId: qq.id, ...answers[qq.id] })),
-        });
-        setResult(res);
+        const list = questions.map((qq) => ({ questionId: qq.id, ...answers[qq.id] }));
+        if (target.kind === "test") {
+          const res = await submitQuiz({ roadmap: target.roadmap, topic: target.topic, answers: list });
+          setResult({ kind: "test", ...res });
+        } else {
+          setResult({ kind: "review", ...(await submitReview({ answers: list })) });
+        }
         window.scrollTo({ top: 0, behavior: "smooth" });
       } catch (e) {
         setError(e instanceof Error ? e.message : "Не удалось отправить ответы");
@@ -68,7 +74,16 @@ export function QuizRunner({
   }
 
   if (result) {
-    return <Results result={result} questions={questions} answers={answers} passScore={passScore} next={next} topicHref={topicHref} roadmapHref={roadmapHref} onRetry={() => router.refresh()} />;
+    return (
+      <div className="mt-6">
+        {result.kind === "test" && target.kind === "test" ? (
+          <TestSummary result={result} target={target} onRetry={() => router.refresh()} />
+        ) : (
+          result.kind === "review" && <ReviewSummary result={result} onMore={() => router.refresh()} />
+        )}
+        <AnswersReview result={result} questions={questions} answers={answers} />
+      </div>
+    );
   }
 
   return (
@@ -90,6 +105,7 @@ export function QuizRunner({
       </div>
 
       <div className="mt-5 rounded-2xl border border-line bg-surface p-5 md:p-7">
+        {target.kind === "review" && <div className="mb-1 text-sm text-accent">{target.topicTitles[q.id]}</div>}
         <div className="text-xs font-medium uppercase tracking-wide text-muted">
           Вопрос {idx + 1} из {questions.length}
           {q.type === "multiple" && " · несколько правильных ответов"}
@@ -165,7 +181,7 @@ export function QuizRunner({
             disabled={pending}
             className="inline-flex items-center gap-1.5 rounded-xl bg-passed px-4 py-2 text-sm font-medium text-white hover:opacity-90 disabled:opacity-60"
           >
-            {pending ? "Проверяю…" : "Завершить тест"}
+            {pending ? "Проверяю…" : target.kind === "test" ? "Завершить тест" : "Проверить ответы"}
           </button>
         )}
       </div>
@@ -177,28 +193,17 @@ export function QuizRunner({
   );
 }
 
-function Results({
+function TestSummary({
   result,
-  questions,
-  answers,
-  passScore,
-  next,
-  topicHref,
-  roadmapHref,
+  target,
   onRetry,
 }: {
   result: QuizSubmitResult;
-  questions: PublicQuestion[];
-  answers: Record<string, Answer>;
-  passScore: number;
-  next: { title: string; href: string } | null;
-  topicHref: string;
-  roadmapHref: string;
+  target: Extract<QuizTarget, { kind: "test" }>;
   onRetry: () => void;
 }) {
-  const byId = new Map(result.results.map((r) => [r.questionId, r]));
+  const { passScore, next, topicHref, roadmapHref } = target;
   return (
-    <div className="mt-6">
       <div
         className={clsx(
           "rounded-2xl border-2 p-6 text-center",
@@ -235,10 +240,51 @@ function Results({
             К карте роадмапа
           </Link>
         </div>
+        {result.correct < result.total && (
+          <p className="mt-3 text-sm text-muted">Вопросы с ошибками попадут в «Повторение» — они вернутся завтра.</p>
+        )}
       </div>
+  );
+}
 
+function ReviewSummary({ result, onMore }: { result: ReviewResult; onMore: () => void }) {
+  const learned = result.results.filter((r) => r.correct && r.nextInDays === null).length;
+  return (
+    <div className="rounded-2xl border-2 border-line bg-surface p-6 text-center">
+      <Repeat className="mx-auto size-10 text-accent" />
+      <div className="mt-2 text-4xl font-bold">
+        {result.correct} из {result.total}
+      </div>
+      <p className="mt-3">
+        Верные ответы вернутся позже, с каждым разом всё реже. Ошибки — завтра.
+        {learned > 0 && ` Выучено и ушло из повторения: ${learned}.`}
+      </p>
+      <div className="mt-5 flex flex-wrap justify-center gap-3">
+        <button onClick={onMore} className="inline-flex items-center gap-1.5 rounded-xl bg-accent px-4 py-2 font-medium text-white hover:opacity-90">
+          <RotateCcw className="size-4" /> Есть ли ещё?
+        </button>
+        <Link href="/roadmaps" className="rounded-xl border border-line bg-surface px-4 py-2 hover:bg-surface-2">
+          К роадмапам
+        </Link>
+      </div>
+    </div>
+  );
+}
+
+function AnswersReview({
+  result,
+  questions,
+  answers,
+}: {
+  result: Result;
+  questions: PublicQuestion[];
+  answers: Record<string, Answer>;
+}) {
+  const byId = new Map<string, QuestionResult & { nextInDays?: number | null }>(result.results.map((r) => [r.questionId, r]));
+  return (
+    <>
       <h2 className="mt-8 text-lg font-semibold">Разбор</h2>
-      {!result.passed && (
+      {result.kind === "test" && !result.passed && (
         <p className="mt-1 text-sm text-muted">Правильные ответы и пояснения откроются, когда вы сдадите тест.</p>
       )}
       <ol className="mt-3 space-y-3">
@@ -290,12 +336,17 @@ function Results({
                   {r?.explanationHtml && (
                     <div className="prose-content mt-3 rounded-lg bg-surface-2 p-3 text-sm" dangerouslySetInnerHTML={{ __html: r.explanationHtml }} />
                   )}
+                  {r && r.nextInDays !== undefined && (
+                    <div className="mt-2 text-xs text-muted">
+                      {r.nextInDays === null ? "Выучен — больше не вернётся" : `Вернётся через ${r.nextInDays} дн.`}
+                    </div>
+                  )}
                 </div>
               </div>
             </li>
           );
         })}
       </ol>
-    </div>
+    </>
   );
 }

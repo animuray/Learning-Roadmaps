@@ -13,10 +13,13 @@ import {
   Lock,
   NotebookPen,
   Signal,
+  Terminal,
+  TerminalSquare,
 } from "lucide-react";
 import { db } from "@/db";
-import { practiceChecks, userMaterials, userNotes } from "@/db/schema";
+import { labSolves, practiceChecks, sqlSolves, userMaterials, userNotes } from "@/db/schema";
 import { getRoadmap, getTopic } from "@/lib/content";
+import { canUseLab, labConfig } from "@/lib/lab";
 import { blockingTopic } from "@/lib/progress";
 import { getRoadmapView } from "@/lib/roadmap-view";
 import { getCurrentUser } from "@/lib/session";
@@ -24,6 +27,8 @@ import { MarkDoneButton } from "@/components/topic/mark-done-button";
 import { MyMaterials } from "@/components/topic/my-materials";
 import { NoteEditor } from "@/components/topic/note-editor";
 import { PracticeChecklist } from "@/components/topic/practice-checklist";
+import { LabPanel } from "@/components/topic/lab-panel";
+import { SqlTrainer } from "@/components/topic/sql-trainer";
 import { ViewTracker } from "@/components/topic/view-tracker";
 
 export async function generateMetadata({ params }: PageProps<"/roadmaps/[roadmap]/[topic]">) {
@@ -79,7 +84,7 @@ export default async function TopicPage({ params }: PageProps<"/roadmaps/[roadma
     );
   }
 
-  const [checks, materials, note] = user
+  const [checks, materials, note, solves, labDone] = user
     ? await Promise.all([
         db
           .select({ key: practiceChecks.itemKey })
@@ -107,12 +112,45 @@ export default async function TopicPage({ params }: PageProps<"/roadmaps/[roadma
           .from(userNotes)
           .where(and(eq(userNotes.userId, user.id), eq(userNotes.roadmap, roadmap.slug), eq(userNotes.topic, topic.slug)))
           .then((r) => r[0] ?? null),
+        db
+          .select({ key: sqlSolves.taskKey })
+          .from(sqlSolves)
+          .where(
+            and(eq(sqlSolves.userId, user.id), eq(sqlSolves.roadmap, roadmap.slug), eq(sqlSolves.topic, topic.slug)),
+          ),
+        db
+          .select({ key: labSolves.taskKey })
+          .from(labSolves)
+          .where(
+            and(eq(labSolves.userId, user.id), eq(labSolves.roadmap, roadmap.slug), eq(labSolves.topic, topic.slug)),
+          ),
       ])
-    : [[], [], null];
+    : [[], [], null, [], []];
 
   const p = progress.get(topic.slug);
   const hasQuiz = topic.quiz.length > 0;
   const passed = state === "passed";
+  const hasTrainer = topic.tasks.length > 0;
+  const solvedKeys = solves.map((s) => s.key);
+  const trainerDone = hasTrainer && topic.tasks.every((t) => solvedKeys.includes(t.key));
+  const lab = topic.lab;
+  const labSolvedKeys = labDone.map((s) => s.key);
+  const labFinished = !!lab && lab.tasks.every((t) => labSolvedKeys.includes(t.key));
+  const labUnavailable = !lab
+    ? null
+    : !labConfig()
+      ? "Терминал на этом сервере не настроен: нужен учебный стенд и lab-runner (docs/practice-lab.md). Задачи можно прочитать и решить на своей машине."
+      : user && !canUseLab(user)
+        ? "Терминал учебного стенда доступен только пользователям из списка допущенных."
+        : null;
+  const steps = [
+    { href: "#konspekt", icon: <BookOpen className="size-4" />, label: "Конспект и материалы" },
+    { href: "#praktika", icon: <Hammer className="size-4" />, label: "Практика" },
+    ...(hasTrainer ? [{ href: "#trenazher", icon: <Terminal className="size-4" />, label: "Тренажёр", done: trainerDone }] : []),
+    ...(lab ? [{ href: "#laboratoriya", icon: <TerminalSquare className="size-4" />, label: "Лаборатория", done: labFinished }] : []),
+    { href: "#test", icon: <ClipboardCheck className="size-4" />, label: "Тест", done: passed },
+  ];
+  const stepCols = ["", "", "", "sm:grid-cols-3", "sm:grid-cols-4", "sm:grid-cols-5"][steps.length];
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-8">
@@ -165,10 +203,10 @@ export default async function TopicPage({ params }: PageProps<"/roadmaps/[roadma
                 ))}
               </div>
             )}
-            <ol className="mt-6 grid grid-cols-3 gap-2 text-sm">
-              <Step href="#konspekt" n={1} icon={<BookOpen className="size-4" />} label="Конспект и материалы" />
-              <Step href="#praktika" n={2} icon={<Hammer className="size-4" />} label="Практика" />
-              <Step href="#test" n={3} icon={<ClipboardCheck className="size-4" />} label="Тест" done={passed} />
+            <ol className={`mt-6 grid grid-cols-2 gap-2 text-sm ${stepCols}`}>
+              {steps.map((s, i) => (
+                <Step key={s.href} href={s.href} n={i + 1} icon={s.icon} label={s.label} done={s.done} />
+              ))}
             </ol>
           </header>
 
@@ -246,6 +284,58 @@ export default async function TopicPage({ params }: PageProps<"/roadmaps/[roadma
               </p>
             )}
           </section>
+
+          {hasTrainer && (
+            <section id="trenazher" className="mt-6 scroll-mt-20 rounded-2xl border border-line bg-surface p-5 md:p-6">
+              <h2 className="flex items-center gap-2 text-lg font-semibold">
+                <Terminal className="size-5" /> Тренажёр SQL
+              </h2>
+              <p className="mt-1 text-sm text-muted">
+                Напишите запрос и нажмите «Проверить»: он выполнится в изолированной базе, результат сравним с эталоном.
+                {solvedKeys.length > 0 && ` Решено задач: ${solvedKeys.length} из ${topic.tasks.length}.`}
+              </p>
+              <SqlTrainer
+                roadmap={roadmap.slug}
+                topic={topic.slug}
+                tasks={topic.tasks.map((t) => ({
+                  key: t.key,
+                  title: t.title,
+                  conditionHtml: t.conditionHtml,
+                  seed: t.seed,
+                  hint: t.hint,
+                  solution: t.solution,
+                }))}
+                solved={solvedKeys}
+                disabled={!user}
+              />
+            </section>
+          )}
+
+          {lab && (
+            <section id="laboratoriya" className="mt-6 scroll-mt-20 rounded-2xl border border-line bg-surface p-5 md:p-6">
+              <h2 className="flex items-center gap-2 text-lg font-semibold">
+                <TerminalSquare className="size-5" /> Лаборатория
+              </h2>
+              <p className="mt-1 text-sm text-muted">
+                Настоящий Linux в терминале ниже. Решайте как удобно: проверка смотрит на результат, а после решения
+                покажет замечания и разбор того, как это делают на практике.
+              </p>
+              <LabPanel
+                roadmap={roadmap.slug}
+                topic={topic.slug}
+                tasks={lab.tasks.map((t) => ({
+                  key: t.key,
+                  title: t.title,
+                  conditionHtml: t.conditionHtml,
+                  hint: t.hint,
+                  solution: t.solution,
+                }))}
+                solved={labSolvedKeys}
+                disabled={!user}
+                unavailable={labUnavailable}
+              />
+            </section>
+          )}
 
           <section className="mt-6 rounded-2xl border border-line bg-surface p-5 md:p-6">
             <h2 className="flex items-center gap-2 text-lg font-semibold">

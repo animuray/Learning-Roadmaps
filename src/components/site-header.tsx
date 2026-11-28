@@ -1,10 +1,14 @@
 import Link from "next/link";
 import { Route } from "lucide-react";
+import { getReviewSummary } from "@/lib/review";
 import { getCurrentUser } from "@/lib/session";
+import type { Theme } from "@/lib/theme";
+import { ThemeToggle } from "./theme-toggle";
 import { UserMenu } from "./user-menu";
 
-export async function SiteHeader() {
+export async function SiteHeader({ theme }: { theme: Theme }) {
   const user = await getCurrentUser();
+  const due = user ? (await getReviewSummary(user.id)).due : 0;
   return (
     <header className="sticky top-0 z-30 border-b border-line bg-surface/90 backdrop-blur">
       <div className="mx-auto flex h-14 max-w-6xl items-center gap-6 px-4">
@@ -18,8 +22,20 @@ export async function SiteHeader() {
           <Link href="/roadmaps" className="hover:text-fg">
             Роадмапы
           </Link>
+          <Link href="/leaderboard" className="hover:text-fg">
+            Лидеры
+          </Link>
+          {user && (
+            <Link href="/review" className="flex items-center gap-1.5 hover:text-fg">
+              Повторение
+              {due > 0 && (
+                <span className="rounded-full bg-accent px-1.5 text-xs font-semibold leading-5 text-white">{due}</span>
+              )}
+            </Link>
+          )}
         </nav>
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-2">
+          <ThemeToggle initial={theme} />
           {user ? (
             <UserMenu
               name={user.name ?? user.email ?? "Профиль"}

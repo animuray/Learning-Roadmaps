@@ -5,27 +5,36 @@ import { renderInline, renderMarkdown, type LinkResolver } from "./markdown";
 const QUIZ_HEADINGS = ["тест", "вопросы", "проверь себя", "quiz", "test"];
 const PRACTICE_HEADINGS = ["практика", "задания", "лабораторная", "practice"];
 const MATERIALS_HEADINGS = ["материалы", "ссылки", "источники", "materials", "links"];
+const TRAINER_HEADINGS = ["тренажёр", "тренажер", "тренажёр sql", "тренажер sql", "sql trainer", "trainer"];
+const LAB_HEADINGS = ["лаборатория", "лабораторная работа", "терминал", "lab"];
+
+/** Сравнение заголовков без ё и лишних знаков: «Тренажёр» === «тренажер». */
+function normHeading(s: string): string {
+  return s.toLowerCase().replace(/ё/g, "е").replace(/[:.!?]+$/, "").trim();
+}
 
 export type SplitNote = {
   body: string;
   quiz: string | null;
   practice: string | null;
   materials: string | null;
+  trainer: string | null;
+  lab: string | null;
 };
 
 /** Делит заметку по заголовкам второго уровня: служебные разделы уходят отдельно. */
 export function splitNote(content: string): SplitNote {
   const lines = content.split(/\r?\n/);
-  const result: SplitNote = { body: "", quiz: null, practice: null, materials: null };
+  const result: SplitNote = { body: "", quiz: null, practice: null, materials: null, trainer: null, lab: null };
   let current: keyof SplitNote = "body";
-  const buckets: Record<keyof SplitNote, string[]> = { body: [], quiz: [], practice: [], materials: [] };
+  const buckets: Record<keyof SplitNote, string[]> = { body: [], quiz: [], practice: [], materials: [], trainer: [], lab: [] };
   let inFence = false;
 
   for (const line of lines) {
     if (/^\s*(```|~~~)/.test(line)) inFence = !inFence;
     const h2 = !inFence && line.match(/^##\s+(.+?)\s*#*\s*$/);
     if (h2) {
-      const name = h2[1].toLowerCase().replace(/[:.!?]+$/, "").trim();
+      const name = normHeading(h2[1]);
       if (QUIZ_HEADINGS.includes(name)) {
         current = "quiz";
         continue;
@@ -38,6 +47,14 @@ export function splitNote(content: string): SplitNote {
         current = "materials";
         continue;
       }
+      if (TRAINER_HEADINGS.includes(name)) {
+        current = "trainer";
+        continue;
+      }
+      if (LAB_HEADINGS.includes(name)) {
+        current = "lab";
+        continue;
+      }
       current = "body";
     }
     buckets[current].push(line);
@@ -46,6 +63,8 @@ export function splitNote(content: string): SplitNote {
   if (buckets.quiz.length) result.quiz = buckets.quiz.join("\n");
   if (buckets.practice.length) result.practice = buckets.practice.join("\n");
   if (buckets.materials.length) result.materials = buckets.materials.join("\n");
+  if (buckets.trainer.length) result.trainer = buckets.trainer.join("\n");
+  if (buckets.lab.length) result.lab = buckets.lab.join("\n");
   return result;
 }
 

@@ -8,6 +8,34 @@
       "when": 1795779826704,
       "tag": "0000_init",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1795798201058,
+      "tag": "0001_tricky_serpent_society",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1795809765075,
+      "tag": "0002_lab_solve",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1795822004505,
+      "tag": "0003_certain_karnak",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1795822969515,
+      "tag": "0004_wet_scream",
+      "breakpoints": true
     }
   ]
 }

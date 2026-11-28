@@ -1,7 +1,16 @@
 import "server-only";
-import { and, count, desc, eq, gte, sql, sum } from "drizzle-orm";
+import { and, desc, eq, gte, sql, sum, type SQL } from "drizzle-orm";
 import { db } from "@/db";
-import { activities, practiceChecks, quizAttempts, topicProgress, userMaterials } from "@/db/schema";
+import {
+  activities,
+  labSolves,
+  practiceChecks,
+  quizAttempts,
+  sqlSolves,
+  topicProgress,
+  userMaterials,
+  users,
+} from "@/db/schema";
 import { startOfUtcDay } from "./progress";
 
 export function dayKey(d: Date): string {
@@ -45,31 +54,94 @@ export async function getStreaks(userId: string) {
   return { current, max, activeDays: days.length };
 }
 
-export async function getTotals(userId: string) {
-  const [[passed], [quiz], [practice], [materials]] = await Promise.all([
-    db
-      .select({ n: count() })
-      .from(topicProgress)
-      .where(and(eq(topicProgress.userId, userId), eq(topicProgress.status, "passed"))),
-    db
-      .select({
-        correct: sum(quizAttempts.correct).mapWith(Number),
-        attempts: count(),
-        passedTests: sql<number>`count(*) filter (where ${quizAttempts.passed})`.mapWith(Number),
-      })
-      .from(quizAttempts)
-      .where(eq(quizAttempts.userId, userId)),
-    db.select({ n: count() }).from(practiceChecks).where(eq(practiceChecks.userId, userId)),
-    db.select({ n: count() }).from(userMaterials).where(eq(userMaterials.userId, userId)),
-  ]);
+/**
+ * Метрики профиля: одна строка на пользователя. Практические задания — пункты чек-листа «Практика»,
+ * задачи SQL-тренажёра и лабораторий. Тест считается сданным один раз, сколько бы попыток ни было.
+ */
+// В подзапросах drizzle пишет столбцы без имени таблицы, и "id" достался бы таблице подзапроса.
+const outerUserId = sql.raw(`"user"."id"`);
+
+function userMetrics(where: SQL) {
+  return db
+    .select({
+      id: users.id,
+      name: users.name,
+      handle: users.handle,
+      image: users.image,
+      topicsPassed: sql<number>`(select count(*) from ${topicProgress} where ${topicProgress.userId} = ${outerUserId} and ${topicProgress.status} = 'passed')`.mapWith(Number),
+      testsPassed: sql<number>`(select count(distinct ${quizAttempts.roadmap} || '/' || ${quizAttempts.topic}) from ${quizAttempts} where ${quizAttempts.userId} = ${outerUserId} and ${quizAttempts.passed})`.mapWith(Number),
+      correctAnswers: sql<number>`(select coalesce(sum(${quizAttempts.correct}), 0) from ${quizAttempts} where ${quizAttempts.userId} = ${outerUserId})`.mapWith(Number),
+      practiceDone: sql<number>`((select count(*) from ${practiceChecks} where ${practiceChecks.userId} = ${outerUserId})
+        + (select count(*) from ${sqlSolves} where ${sqlSolves.userId} = ${outerUserId})
+        + (select count(*) from ${labSolves} where ${labSolves.userId} = ${outerUserId}))`.mapWith(Number),
+      materials: sql<number>`(select count(*) from ${userMaterials} where ${userMaterials.userId} = ${outerUserId})`.mapWith(Number),
+    })
+    .from(users)
+    .where(where);
+}
+
+export type UserTotals = {
+  topicsPassed: number;
+  testsPassed: number;
+  correctAnswers: number;
+  practiceDone: number;
+  materials: number;
+};
+
+export async function getTotals(userId: string): Promise<UserTotals> {
+  const [row] = await userMetrics(eq(users.id, userId));
   return {
-    topicsPassed: passed?.n ?? 0,
-    correctAnswers: quiz?.correct ?? 0,
-    quizAttempts: quiz?.attempts ?? 0,
-    testsPassed: quiz?.passedTests ?? 0,
-    practiceDone: practice?.n ?? 0,
-    materials: materials?.n ?? 0,
+    topicsPassed: row?.topicsPassed ?? 0,
+    testsPassed: row?.testsPassed ?? 0,
+    correctAnswers: row?.correctAnswers ?? 0,
+    practiceDone: row?.practiceDone ?? 0,
+    materials: row?.materials ?? 0,
   };
+}
+
+/** Очки за каждую метрику в рейтинге: за изученную тему больше, чем за сохранённую ссылку. */
+export const SCORE_WEIGHTS: Record<keyof UserTotals, number> = {
+  topicsPassed: 10,
+  testsPassed: 5,
+  practiceDone: 3,
+  correctAnswers: 1,
+  materials: 1,
+};
+
+/** «1 очко», «3 очка», «5 очков». */
+export function points(n: number): string {
+  const d = n % 10;
+  const dd = n % 100;
+  if (d === 1 && dd !== 11) return "очко";
+  if (d >= 2 && d <= 4 && (dd < 12 || dd > 14)) return "очка";
+  return "очков";
+}
+
+export function totalScore(t: UserTotals): number {
+  return (Object.keys(SCORE_WEIGHTS) as (keyof UserTotals)[]).reduce((s, k) => s + t[k] * SCORE_WEIGHTS[k], 0);
+}
+
+export type LeaderboardRow = UserTotals & {
+  id: string;
+  name: string | null;
+  handle: string | null;
+  image: string | null;
+  score: number;
+  place: number;
+};
+
+/** Рейтинг по сумме очков. Только публичные профили и только те, у кого есть хоть что-то. */
+export async function getLeaderboard(): Promise<LeaderboardRow[]> {
+  const rows = await userMetrics(eq(users.isPublic, true));
+  const scored = rows
+    .map((r) => ({ ...r, score: totalScore(r) }))
+    .sort((a, b) => b.score - a.score || b.topicsPassed - a.topicsPassed || (a.name ?? "").localeCompare(b.name ?? "", "ru"));
+  // Одинаковые очки — одно место: 1, 2, 2, 4.
+  let place = 0;
+  return scored.map((r, i) => {
+    if (i === 0 || scored[i - 1].score !== r.score) place = i + 1;
+    return { ...r, place };
+  });
 }
 
 export async function getRecentPasses(userId: string, limit = 8) {

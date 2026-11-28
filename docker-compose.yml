@@ -10,6 +10,8 @@ services:
       POSTGRES_DB: roadmaps
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Песочница SQL-тренажёра: роль и база создаются при первом старте.
+      - ./scripts/sql-practice-init.sql:/docker-entrypoint-initdb.d/01-sql-practice.sql:ro
     ports:
       - "127.0.0.1:5432:5432"
     healthcheck:
@@ -24,6 +26,7 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgres://roadmaps:${POSTGRES_PASSWORD:-roadmaps}@db:5432/roadmaps
+      SQL_PRACTICE_URL: postgres://sql_practice:sql_practice@db:5432/sql_practice
     ports:
       - "3000:3000"
     volumes:

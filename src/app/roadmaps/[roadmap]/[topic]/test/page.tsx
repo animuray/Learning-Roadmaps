@@ -34,13 +34,16 @@ export default async function TestPage({ params }: PageProps<"/roadmaps/[roadmap
       </p>
       <QuizRunner
         key={token}
-        roadmap={rmSlug}
-        topic={topicSlug}
         questions={questions}
-        passScore={topic.passScore}
-        next={next ? { title: next.title, href: `/roadmaps/${rmSlug}/${next.slug}` } : null}
-        topicHref={`/roadmaps/${rmSlug}/${topicSlug}`}
-        roadmapHref={`/roadmaps/${rmSlug}`}
+        target={{
+          kind: "test",
+          roadmap: rmSlug,
+          topic: topicSlug,
+          passScore: topic.passScore,
+          next: next ? { title: next.title, href: `/roadmaps/${rmSlug}/${next.slug}` } : null,
+          topicHref: `/roadmaps/${rmSlug}/${topicSlug}`,
+          roadmapHref: `/roadmaps/${rmSlug}`,
+        }}
       />
     </div>
   );

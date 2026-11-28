@@ -12,17 +12,20 @@ function shuffle<T>(arr: T[]): T[] {
 /** Случайная выборка вопросов для попытки: варианты перемешаны, правильные ответы вырезаны. */
 export function buildAttempt(topic: Topic): { token: string; questions: PublicQuestion[] } {
   const size = topic.quizSize || topic.quiz.length;
-  const questions = shuffle(topic.quiz)
-    .slice(0, size)
-    .map((q) => ({
-      id: q.id,
-      type: q.type,
-      titleHtml: q.titleHtml,
-      bodyHtml: q.bodyHtml,
-      options: shuffle(q.options).map((o) => ({ id: o.id, html: o.html })),
-    }));
+  const questions = shuffle(topic.quiz).slice(0, size).map(toPublicQuestion);
   // Токен нужен, чтобы после «Пройти ещё раз» компонент теста пересоздался с новой выборкой.
   return { token: crypto.randomUUID(), questions };
+}
+
+/** Вопрос для браузера: без правильных ответов, варианты перемешаны. */
+export function toPublicQuestion(q: Question): PublicQuestion {
+  return {
+    id: q.id,
+    type: q.type,
+    titleHtml: q.titleHtml,
+    bodyHtml: q.bodyHtml,
+    options: shuffle(q.options).map((o) => ({ id: o.id, html: o.html })),
+  };
 }
 
 export type SubmittedAnswer = { questionId: string; selected?: number[]; text?: string };

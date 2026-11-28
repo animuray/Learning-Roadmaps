@@ -5,6 +5,8 @@ import { slugify } from "../translit";
 import type { LinkResolver, TocItem } from "./markdown";
 import { renderMarkdown } from "./markdown";
 import { parseMaterials, parsePractice, parseQuiz, splitNote } from "./parse-topic";
+import { parseLab } from "./parse-lab";
+import { parseSqlTasks } from "./parse-sql-tasks";
 import type { Material, Roadmap, RoadmapMode, Section, Topic, TopicRef } from "./types";
 
 export * from "./types";
@@ -284,6 +286,8 @@ function loadTopic(roadmap: Roadmap, ref: TopicRef, warn: (m: string) => void): 
     materials: [],
     practiceIntroHtml: "",
     practice: [],
+    tasks: [],
+    lab: null,
     quiz: [],
     quizSize: 0,
     passScore: roadmap.passScore,
@@ -299,6 +303,8 @@ function loadTopic(roadmap: Roadmap, ref: TopicRef, warn: (m: string) => void): 
   const toc: TocItem[] = [];
   const quiz = parts.quiz ? parseQuiz(parts.quiz, resolver, warn) : [];
   const practice = parts.practice ? parsePractice(parts.practice, resolver) : { introHtml: "", items: [] };
+  const tasks = parts.trainer ? parseSqlTasks(parts.trainer, resolver, warn) : [];
+  const lab = parts.lab ? parseLab(parts.lab, resolver, warn) : null;
 
   const fmMaterials: Material[] = Array.isArray(data.materials)
     ? data.materials
@@ -331,6 +337,8 @@ function loadTopic(roadmap: Roadmap, ref: TopicRef, warn: (m: string) => void): 
     materials: [...fmMaterials, ...(parts.materials ? parseMaterials(parts.materials) : [])],
     practiceIntroHtml: practice.introHtml,
     practice: practice.items,
+    tasks,
+    lab,
     quiz,
     quizSize,
     passScore: num(data.passScore) ?? roadmap.passScore,

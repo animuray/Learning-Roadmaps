@@ -16,7 +16,12 @@ export type CurrentUser = {
 
 /** Текущий пользователь или null. Кешируется на время одного запроса. */
 export const getCurrentUser = cache(async (): Promise<CurrentUser | null> => {
-  const session = await auth();
+  // Старая кука, подписанная другим AUTH_SECRET, даёт JWTSessionError вместо null.
+  // Такую сессию считаем отсутствующей, а не роняем страницу.
+  const session = await auth().catch((error: unknown) => {
+    console.warn("[auth] не удалось прочитать сессию, пользователь не авторизован:", error);
+    return null;
+  });
   const id = session?.user?.id;
   if (!id) return null;
   const [user] = await db

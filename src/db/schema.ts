@@ -1,5 +1,6 @@
 import {
   boolean,
+  customType,
   index,
   integer,
   pgTable,
@@ -30,6 +31,18 @@ export const users = pgTable("user", {
   website: text("website"),
   isPublic: boolean("is_public").notNull().default(true),
   createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+});
+
+const bytea = customType<{ data: Buffer }>({ dataType: () => "bytea" });
+
+/** Загруженная аватарка. users.image тогда указывает на /api/avatar/<id>. */
+export const userAvatars = pgTable("user_avatar", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => users.id, { onDelete: "cascade" }),
+  mime: text("mime").notNull(),
+  data: bytea("data").notNull(),
+  updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
 });
 
 export const accounts = pgTable(
@@ -122,7 +135,7 @@ export const activities = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     type: text("type")
-      .$type<"read" | "quiz" | "pass" | "practice" | "material" | "note">()
+      .$type<"read" | "quiz" | "pass" | "practice" | "material" | "note" | "sql" | "lab" | "review">()
       .notNull(),
     roadmap: text("roadmap"),
     topic: text("topic"),
@@ -179,4 +192,58 @@ export const practiceChecks = pgTable(
     createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
   },
   (t) => [primaryKey({ columns: [t.userId, t.roadmap, t.topic, t.itemKey] })],
+);
+
+/** Решённые задачи SQL-тренажёра: одна строка — одна задача. */
+export const sqlSolves = pgTable(
+  "sql_solve",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    roadmap: text("roadmap").notNull(),
+    topic: text("topic").notNull(),
+    taskKey: text("task_key").notNull(),
+    createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.userId, t.roadmap, t.topic, t.taskKey] })],
+);
+
+/** Решённые задачи лабораторий (терминал на стенде): одна строка — одна задача. */
+export const labSolves = pgTable(
+  "lab_solve",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    roadmap: text("roadmap").notNull(),
+    topic: text("topic").notNull(),
+    taskKey: text("task_key").notNull(),
+    createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.userId, t.roadmap, t.topic, t.taskKey] })],
+);
+
+/**
+ * Интервальное повторение: вопросы тестов, на которые ученик ответил неверно.
+ * box — сколько раз подряд ответил верно на повторении; от него зависит следующий интервал.
+ */
+export const reviewItems = pgTable(
+  "review_item",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    roadmap: text("roadmap").notNull(),
+    topic: text("topic").notNull(),
+    questionId: text("question_id").notNull(),
+    box: integer("box").notNull().default(0),
+    dueAt: timestamp("due_at", { mode: "date" }).notNull(),
+    lapses: integer("lapses").notNull().default(1),
+    updatedAt: timestamp("updated_at", { mode: "date" }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.userId, t.roadmap, t.topic, t.questionId] }),
+    index("review_item_due_idx").on(t.userId, t.dueAt),
+  ],
 );

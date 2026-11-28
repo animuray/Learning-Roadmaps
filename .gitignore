@@ -45,3 +45,6 @@ next-env.d.ts
 content/.obsidian/workspace*.json
 content/.obsidian/cache
 content/.trash/
+
+# ключ lab-runner для входа на учебные стенды
+/.lab/

@@ -55,6 +55,71 @@ export type Question = {
 
 export type PracticeItem = { key: string; html: string };
 
+/**
+ * Проверка задачи SQL-тренажёра:
+ * - `rows` — сравнение строк результата с эталонным запросом;
+ * - `state` — после запроса ученика выполняется контрольный запрос: задача
+ *   засчитывается, если он вернул хотя бы одну строку (для INSERT/UPDATE/DELETE);
+ * - `regex` — регулярка по тексту результата.
+ */
+export type SqlCheck =
+  | { kind: "rows"; sql: string; ordered: boolean }
+  | { kind: "state"; sql: string }
+  | { kind: "regex"; pattern: string };
+
+/** Задача интерактивного SQL-тренажёра (раздел «## Тренажёр» в заметке темы). */
+export type SqlTask = {
+  /** Ключ в URL и в базе решений. Считается из заголовка задачи. */
+  key: string;
+  title: string;
+  conditionHtml: string;
+  /** SQL-данные задачи: схема и наполнение, выполняются перед запросом пользователя. */
+  seed: string;
+  check: SqlCheck;
+  hint: string | null;
+  solution: string | null;
+  /** Разбор эталона — показывается после решения. */
+  reviewHtml: string | null;
+  notes: SolutionNote[];
+};
+
+/** Задача тренажёра в том виде, в каком она уходит в браузер: без проверки, разбора и замечаний. */
+export type PublicSqlTask = Omit<SqlTask, "check" | "reviewHtml" | "notes">;
+
+/** Замечание к решению: если код ученика подходит под шаблон — показать объяснение. */
+export type SolutionNote = { pattern: string; message: string };
+
+/**
+ * Задача лаборатории (раздел «## Лаборатория»): ученик работает в терминале стенда,
+ * проверка — bash-скрипт от root, код возврата 0 — задача решена.
+ */
+export type LabTask = {
+  key: string;
+  title: string;
+  conditionHtml: string;
+  /** Подготовка стенда к задаче (root). Выполняется кнопкой «Начать задачу». */
+  setup: string;
+  /** Проверка (root): код возврата 0 — решено, вывод показывается ученику. */
+  check: string;
+  hint: string | null;
+  /** Эталонное решение — команды, выполняемые от имени student. */
+  solution: string | null;
+  reviewHtml: string | null;
+  notes: SolutionNote[];
+};
+
+export type PublicLabTask = Pick<LabTask, "key" | "title" | "conditionHtml" | "hint" | "solution">;
+
+export type Lab = {
+  /** Шаблон стенда: linux (по умолчанию). Определяет, где открывается терминал. */
+  stand: string;
+  /** Общие функции для подготовки и проверок — блок ```bash lib до первой задачи. */
+  lib: string;
+  /** Общая подготовка для всех задач темы — блок ```bash setup до первой задачи. */
+  setup: string;
+  tasks: LabTask[];
+};
+
 export type Topic = TopicRef & {
   roadmap: string;
   description: string;
@@ -67,6 +132,10 @@ export type Topic = TopicRef & {
   materials: Material[];
   practiceIntroHtml: string;
   practice: PracticeItem[];
+  /** Задачи интерактивного SQL-тренажёра (пусто, если раздела «Тренажёр» нет). */
+  tasks: SqlTask[];
+  /** Лаборатория с терминалом (null, если раздела «Лаборатория» нет). */
+  lab: Lab | null;
   quiz: Question[];
   /** Сколько вопросов показывать за попытку (случайная выборка из банка). */
   quizSize: number;

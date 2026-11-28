@@ -37,13 +37,16 @@ export async function getRoadmapProgress(
 /**
  * Состояние каждой темы. В последовательном режиме тема открыта, если пройдены
  * все предыдущие обязательные темы. Необязательные темы (#optional) открыты всегда и никого не блокируют.
+ * При DEV_LOGIN=true (только локальная разработка) последовательность не применяется —
+ * все темы открыты, чтобы проверять, как они написаны.
  */
 export function computeStates(roadmap: Roadmap, progress: Map<string, ProgressRow>): Map<string, TopicState> {
+  const devUnlockAll = process.env.DEV_LOGIN === "true";
   const states = new Map<string, TopicState>();
   let gateOpen = true;
   for (const t of roadmap.topics) {
     const p = progress.get(t.slug);
-    const unlocked = roadmap.mode === "free" || gateOpen || t.optional;
+    const unlocked = devUnlockAll || roadmap.mode === "free" || gateOpen || t.optional;
     let state: TopicState;
     if (p?.status === "passed") state = "passed";
     else if (!unlocked) state = "locked";

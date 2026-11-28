@@ -11,6 +11,7 @@ import {
   Hammer,
   Link2,
   Lock,
+  Medal,
   Send,
   Settings,
   Target,
@@ -21,7 +22,16 @@ import { users } from "@/db/schema";
 import { getRoadmap, getRoadmaps } from "@/lib/content";
 import { buildView } from "@/lib/roadmap-view";
 import { getCurrentUser } from "@/lib/session";
-import { getActivityByDay, getRecentPasses, getStreaks, getTotals, getUserMaterialsList } from "@/lib/stats";
+import {
+  getActivityByDay,
+  getLeaderboard,
+  getRecentPasses,
+  getStreaks,
+  getTotals,
+  getUserMaterialsList,
+  points,
+  totalScore,
+} from "@/lib/stats";
 import { Avatar } from "@/components/avatar";
 import { Heatmap } from "@/components/profile/heatmap";
 import { ProgressBar } from "@/components/progress-bar";
@@ -57,14 +67,17 @@ export default async function ProfilePage({ params }: PageProps<"/u/[handle]">) 
     );
   }
 
-  const [activity, streaks, totals, recent, materials, views] = await Promise.all([
+  const [activity, streaks, totals, recent, materials, views, leaderboard] = await Promise.all([
     getActivityByDay(user.id),
     getStreaks(user.id),
     getTotals(user.id),
     getRecentPasses(user.id),
     getUserMaterialsList(user.id, 10),
     Promise.all(getRoadmaps().map((r) => buildView(r, user.id))),
+    getLeaderboard(),
   ]);
+  const place = leaderboard.find((r) => r.id === user.id)?.place;
+  const score = totalScore(totals);
   const started = views.filter((v) => v.stats.passedAll > 0 || v.progress.size > 0);
   const name = user.name ?? user.handle ?? "Без имени";
 
@@ -82,6 +95,9 @@ export default async function ProfilePage({ params }: PageProps<"/u/[handle]">) 
               <BookCheck className="size-4 text-muted" /> <b>{totals.topicsPassed}</b> тем изучено
             </li>
             <li className="flex items-center gap-2">
+              <Target className="size-4 text-muted" /> <b>{totals.testsPassed}</b> тестов сдано
+            </li>
+            <li className="flex items-center gap-2">
               <CircleCheck className="size-4 text-muted" /> <b>{totals.correctAnswers}</b> верных ответов
             </li>
             <li className="flex items-center gap-2">
@@ -91,6 +107,21 @@ export default async function ProfilePage({ params }: PageProps<"/u/[handle]">) 
               <Link2 className="size-4 text-muted" /> <b>{totals.materials}</b> материалов сохранено
             </li>
           </ul>
+
+          <Link
+            href="/leaderboard"
+            className="mt-4 flex items-center gap-2 rounded-lg border border-line px-3 py-2 text-sm hover:bg-surface-2"
+          >
+            <Medal className="size-4 text-yellow-500" />
+            <span>
+              <b>{score}</b> {points(score)}
+              {place ? (
+                <span className="text-muted"> · {place}-е место</span>
+              ) : (
+                !user.isPublic && <span className="text-muted"> · профиль скрыт, вне рейтинга</span>
+              )}
+            </span>
+          </Link>
 
           <div className="mt-5 space-y-2 border-t border-line pt-5 text-sm text-muted">
             <div className="flex items-center gap-2">
@@ -130,11 +161,10 @@ export default async function ProfilePage({ params }: PageProps<"/u/[handle]">) 
             <div className="mt-4">
               <Heatmap data={activity} />
             </div>
-            <div className="mt-5 grid grid-cols-2 gap-4 border-t border-line pt-5 sm:grid-cols-4">
+            <div className="mt-5 grid grid-cols-3 gap-4 border-t border-line pt-5">
               <Stat icon={<Flame className="size-4 text-orange-500" />} value={streaks.current} label="дней без перерыва" />
               <Stat icon={<Trophy className="size-4 text-yellow-500" />} value={streaks.max} label="макс. серия дней" />
               <Stat icon={<CalendarDays className="size-4 text-accent" />} value={streaks.activeDays} label="дней с занятиями" />
-              <Stat icon={<Target className="size-4 text-passed" />} value={totals.testsPassed} label="тестов сдано" />
             </div>
           </section>
 

@@ -5,6 +5,8 @@ const nextConfig: NextConfig = {
   outputFileTracingIncludes: {
     "/**": ["./content/**/*"],
   },
+  // ssh2 (лаборатории) подгружает необязательные нативные модули — не собираем его в бандл.
+  serverExternalPackages: ["ssh2"],
   images: {
     remotePatterns: [{ protocol: "https", hostname: "lh3.googleusercontent.com" }],
   },
