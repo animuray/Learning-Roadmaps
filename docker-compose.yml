@@ -32,9 +32,25 @@ services:
     volumes:
       # Контент монтируется с хоста: после `git pull` сайт подхватит изменения за минуту, без пересборки.
       - ./content:/app/content:ro
+      # Ключ для входа на учебный стенд (npm run lab:key): сайт по нему выполняет setup и проверки задач.
+      - ./.lab:/app/.lab:ro
     depends_on:
       db:
         condition: service_healthy
+
+  # Терминал учебного стенда в браузере. Включается профилем: COMPOSE_PROFILES=lab в .env
+  # (нужны LAB_SECRET, LAB_SSH_HOST и ключ в .lab/, владелец — uid 1000).
+  lab-runner:
+    profiles: ["lab"]
+    build:
+      context: .
+      target: labrunner
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./.lab:/app/.lab:ro
 
 volumes:
   pgdata:

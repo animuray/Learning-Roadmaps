@@ -28,16 +28,20 @@ export function labConfig(): LabConfig | null {
 }
 
 /**
- * Кому можно открывать терминал: стенды — ресурсы домашнего сервера, а войти через
- * Google может кто угодно. При DEV_LOGIN (локальная разработка) — всем.
+ * Кому можно открывать терминал: стенды — ресурсы домашнего сервера, а зарегистрироваться
+ * может кто угодно. Пускаем по спискам LAB_ALLOWED_EMAILS (вход через Google) и
+ * LAB_ALLOWED_USERS (логины; «*» — все вошедшие). При DEV_LOGIN (локальная разработка) — всем.
  */
 export function canUseLab(user: CurrentUser): boolean {
   if (process.env.DEV_LOGIN === "true") return true;
-  const allowed = (process.env.LAB_ALLOWED_EMAILS || "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-  return !!user.email && allowed.includes(user.email.toLowerCase());
+  const list = (v: string | undefined) =>
+    (v || "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+  const users = list(process.env.LAB_ALLOWED_USERS);
+  if (users.includes("*") || (!!user.handle && users.includes(user.handle.toLowerCase()))) return true;
+  return !!user.email && list(process.env.LAB_ALLOWED_EMAILS).includes(user.email.toLowerCase());
 }
 
 /** Стенд пользователя. Пока у всех один и тот же. */

@@ -21,7 +21,7 @@ async function loadLab(input: z.infer<typeof topicSchema>) {
   if (!user) throw new Error("Нужно войти, чтобы работать в терминале");
   const config = labConfig();
   if (!config) throw new Error("Лаборатория на этом сервере не настроена");
-  if (!canUseLab(user)) throw new Error("Терминал доступен только пользователям из списка LAB_ALLOWED_EMAILS");
+  if (!canUseLab(user)) throw new Error("Терминал доступен только пользователям из списков LAB_ALLOWED_USERS и LAB_ALLOWED_EMAILS");
 
   const roadmap = getRoadmap(input.roadmap);
   const topic = roadmap ? getTopic(input.roadmap, input.topic) : null;
