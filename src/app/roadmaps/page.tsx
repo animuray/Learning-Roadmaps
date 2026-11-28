@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { getRoadmaps } from "@/lib/content";
+import { getEnrollments } from "@/lib/enrollment";
 import { buildView } from "@/lib/roadmap-view";
 import { getCurrentUser } from "@/lib/session";
 import { RoadmapCard } from "@/components/roadmap-card";
@@ -9,10 +10,11 @@ export const metadata: Metadata = { title: "Роадмапы" };
 export default async function RoadmapsPage() {
   const user = await getCurrentUser();
   const views = await Promise.all(getRoadmaps().map((r) => buildView(r, user?.id)));
+  const status = new Map((user ? await getEnrollments(user.id) : []).map((e) => [e.roadmap, e.status]));
   return (
     <div className="mx-auto max-w-6xl px-4 py-10">
       <h1 className="text-3xl font-bold">Роадмапы</h1>
-      <p className="mt-2 text-muted">Выберите направление и проходите темы по порядку.</p>
+      <p className="mt-2 text-muted">Выберите направление, начните обучение — и роадмап появится в «Моём обучении».</p>
       <div className="mt-6 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
         {views.map((v) => (
           <RoadmapCard
@@ -20,6 +22,7 @@ export default async function RoadmapsPage() {
             roadmap={v.roadmap}
             stats={user ? v.stats : null}
             next={user && v.next ? { title: v.next.title, href: `/roadmaps/${v.roadmap.slug}/${v.next.slug}` } : null}
+            status={status.get(v.roadmap.slug) ?? null}
           />
         ))}
       </div>

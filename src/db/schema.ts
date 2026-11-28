@@ -89,6 +89,25 @@ export const verificationTokens = pgTable(
 /* Обучение                                                            */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Роадмапы, которые пользователь взял в обучение (как курс на Stepik). Темы открываются только
+ * после записи. archived — убран из «Прохожу сейчас», прогресс сохраняется.
+ */
+export const enrollments = pgTable(
+  "enrollment",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    roadmap: text("roadmap").notNull(),
+    status: text("status").$type<"active" | "archived">().notNull().default("active"),
+    enrolledAt: timestamp("enrolled_at", { mode: "date" }).notNull().defaultNow(),
+    /** Когда последний раз открывал роадмап или его тему — по нему выбираем «Продолжить». */
+    lastOpenedAt: timestamp("last_opened_at", { mode: "date" }).notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.userId, t.roadmap] })],
+);
+
 /** Состояние темы у пользователя. Тема адресуется парой roadmap + topic (slug из контента). */
 export const topicProgress = pgTable(
   "topic_progress",

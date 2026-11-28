@@ -1,16 +1,16 @@
 import Link from "next/link";
-import { BookOpen, ClipboardCheck, Flame, Hammer, Link2, Unlock } from "lucide-react";
+import { redirect } from "next/navigation";
+import { BookOpen, ClipboardCheck, Hammer, Link2, Unlock } from "lucide-react";
 import { getRoadmaps } from "@/lib/content";
 import { buildView } from "@/lib/roadmap-view";
 import { getCurrentUser } from "@/lib/session";
-import { getStreaks } from "@/lib/stats";
 import { RoadmapCard } from "@/components/roadmap-card";
 
 export default async function HomePage() {
-  const user = await getCurrentUser();
+  // Вошедшим главная не нужна — сразу их обучение (как «Моё обучение» на Stepik).
+  if (await getCurrentUser()) redirect("/learning");
   const roadmaps = getRoadmaps();
-  const views = await Promise.all(roadmaps.map((r) => buildView(r, user?.id)));
-  const streak = user ? await getStreaks(user.id) : null;
+  const views = await Promise.all(roadmaps.map((r) => buildView(r, null)));
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-10">
@@ -24,25 +24,12 @@ export default async function HomePage() {
           теме. Прогресс, серии дней и активность видны в профиле.
         </p>
         <div className="mt-6 flex flex-wrap items-center gap-3">
-          {roadmaps[0] && (
-            <Link
-              href={views[0]?.next ? `/roadmaps/${roadmaps[0].slug}/${views[0].next.slug}` : `/roadmaps/${roadmaps[0].slug}`}
-              className="rounded-xl bg-accent px-5 py-2.5 font-medium text-white hover:opacity-90"
-            >
-              {user ? "Продолжить обучение" : "Начать обучение"}
-            </Link>
-          )}
-          {!user && (
-            <Link href="/login" className="rounded-xl border border-line px-5 py-2.5 font-medium hover:bg-surface-2">
-              Войти через Google
-            </Link>
-          )}
-          {streak && (
-            <span className="inline-flex items-center gap-1.5 rounded-xl bg-node-soft px-3 py-2 text-sm">
-              <Flame className="size-4 text-orange-500" />
-              {streak.current > 0 ? `${streak.current} дн. подряд` : "Позанимайтесь сегодня, чтобы начать серию"}
-            </span>
-          )}
+          <Link href="/register" className="rounded-xl bg-accent px-5 py-2.5 font-medium text-white hover:opacity-90">
+            Зарегистрироваться
+          </Link>
+          <Link href="/login" className="rounded-xl border border-line px-5 py-2.5 font-medium hover:bg-surface-2">
+            Войти
+          </Link>
         </div>
       </section>
 
@@ -53,8 +40,7 @@ export default async function HomePage() {
             <RoadmapCard
               key={v.roadmap.slug}
               roadmap={v.roadmap}
-              stats={user ? v.stats : null}
-              next={user && v.next ? { title: v.next.title, href: `/roadmaps/${v.roadmap.slug}/${v.next.slug}` } : null}
+              stats={null}
             />
           ))}
           {views.length === 0 && (

@@ -7,10 +7,13 @@ export function RoadmapCard({
   roadmap,
   stats,
   next,
+  status = null,
 }: {
   roadmap: Roadmap;
   stats: { total: number; passed: number; percent: number } | null;
   next?: { title: string; href: string } | null;
+  /** Запись пользователя на роадмап: active — проходит, archived — в архиве, null — не начинал. */
+  status?: "active" | "archived" | null;
 }) {
   return (
     <div className="flex flex-col rounded-2xl border border-line bg-surface p-5">
@@ -24,7 +27,12 @@ export function RoadmapCard({
         </span>
         <span>{roadmap.topics.length} тем</span>
       </div>
-      {stats && (
+      {status && (
+        <span className="mt-3 w-fit rounded-full bg-accent-soft px-2.5 py-0.5 text-xs font-medium text-accent">
+          {status === "active" ? "Прохожу" : "В архиве"}
+        </span>
+      )}
+      {stats && status && (
         <div className="mt-4">
           <div className="mb-1 flex justify-between text-xs text-muted">
             <span>
@@ -36,7 +44,7 @@ export function RoadmapCard({
         </div>
       )}
       <div className="mt-auto pt-4">
-        {next ? (
+        {next && status === "active" ? (
           <Link
             href={next.href}
             className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-white hover:opacity-90"
@@ -48,7 +56,7 @@ export function RoadmapCard({
             href={`/roadmaps/${roadmap.slug}`}
             className="inline-flex items-center gap-1.5 text-sm font-medium text-accent hover:underline"
           >
-            Открыть роадмап <ArrowRight className="size-4" />
+            {status === "active" ? "Открыть роадмап" : "Подробнее"} <ArrowRight className="size-4" />
           </Link>
         )}
       </div>

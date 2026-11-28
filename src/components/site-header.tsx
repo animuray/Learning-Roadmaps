@@ -18,9 +18,14 @@ export async function SiteHeader({ theme }: { theme: Theme }) {
           </span>
           <span className="hidden sm:inline">Learning Roadmaps</span>
         </Link>
-        <nav className="flex items-center gap-4 text-sm text-muted">
+        <nav className="flex min-w-0 items-center gap-4 overflow-x-auto whitespace-nowrap text-sm text-muted">
+          {user && (
+            <Link href="/learning" className="hover:text-fg">
+              Моё обучение
+            </Link>
+          )}
           <Link href="/roadmaps" className="hover:text-fg">
-            Роадмапы
+            Каталог
           </Link>
           <Link href="/leaderboard" className="hover:text-fg">
             Лидеры

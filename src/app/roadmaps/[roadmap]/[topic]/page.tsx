@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import { and, desc, eq } from "drizzle-orm";
 import {
   ArrowLeft,
@@ -19,6 +19,7 @@ import {
 import { db } from "@/db";
 import { labSolves, practiceChecks, sqlSolves, userMaterials, userNotes } from "@/db/schema";
 import { getRoadmap, getTopic } from "@/lib/content";
+import { getEnrollment, touchEnrollment } from "@/lib/enrollment";
 import { canUseLab, labConfig } from "@/lib/lab";
 import { blockingTopic } from "@/lib/progress";
 import { getRoadmapView } from "@/lib/roadmap-view";
@@ -43,6 +44,12 @@ export default async function TopicPage({ params }: PageProps<"/roadmaps/[roadma
   const view = await getRoadmapView(rmSlug, user?.id);
   const topic = getTopic(rmSlug, topicSlug);
   if (!view || !topic) notFound();
+  // Темы открываются после «Начать обучение» на странице роадмапа (как курс на Stepik).
+  if (user) {
+    const enrollment = await getEnrollment(user.id, rmSlug);
+    if (enrollment?.status !== "active") redirect(`/roadmaps/${rmSlug}`);
+    await touchEnrollment(user.id, rmSlug);
+  }
   const { roadmap, states, progress } = view;
   const state = states.get(topic.slug)!;
   const section = roadmap.sections.find((s) => s.id === topic.sectionId);

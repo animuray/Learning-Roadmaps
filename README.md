@@ -10,7 +10,7 @@
 - **Профиль** как на Stepik: тепловая карта активности за год, текущая и максимальная серия дней, статистика, прогресс по роадмапам, свой аватар.
 - **Лидеры**: рейтинг по сумме метрик — темы, тесты, практика, ответы, материалы.
 - **Светлая и тёмная тема**.
-- **Вход через Google**.
+- **Регистрация и вход** по логину и паролю (с аватаркой) или через Google.
 - **Контент в Markdown** — папка `content/` открывается в Obsidian как хранилище. Формат описан в [content/README.md](content/README.md).
 
 Стек: Next.js 16 (App Router), TypeScript, Tailwind CSS 4, PostgreSQL + Drizzle ORM, Auth.js (next-auth v5).
@@ -43,7 +43,14 @@ npm run lab:check       # прогнать все задачи лаборато�
 
 Нужные переменные — в `.env.example` (раздел «Лаборатория»). Стенд на любой Linux-машине или в контейнере Proxmox готовит `scripts/lab-stand/provision.sh`; план с отдельным стендом на ученика — в [docs/practice-lab.md](docs/practice-lab.md).
 
-## Вход через Google
+## Вход
+
+Без настроек работает регистрация по логину и паролю (`/register`): логин — это адрес профиля `/u/логин`, пароль хранится как хеш scrypt, на один логин — не больше 10 неудачных попыток за 15 минут. На сервере задайте `AUTH_URL` — адрес, по которому открывают сайт (например, `http://192.168.1.130:3000` или `https://ваш-домен`), иначе после входа Auth.js перенаправит на `localhost`.
+
+### Вход через Google
+
+Google принимает адрес возврата только на `localhost` или на публичном домене с HTTPS.
+
 
 1. Откройте [Google Cloud Console](https://console.cloud.google.com/) → создайте проект.
 2. **APIs & Services → OAuth consent screen**: тип External, заполните название и почту. Пока приложение в режиме Testing, войти смогут только добавленные тестовые пользователи — добавьте себя или опубликуйте приложение.
@@ -73,6 +80,8 @@ docker compose up -d --build
 Обновление контента: `git pull` — папка `content/` смонтирована в контейнер, изменения появятся в течение минуты (`CONTENT_CACHE_TTL`). Обновление кода: `git pull && docker compose up -d --build`.
 
 Бэкап базы: `docker compose exec db pg_dump -U roadmaps roadmaps > backup.sql`.
+
+Терминал лабораторий: подготовьте стенд (`scripts/lab-stand/provision.sh` на отдельной ВМ с Ubuntu 24.04), положите ключ в `.lab/id_ed25519` (владелец — uid 1000, это пользователь `node` в контейнерах) и добавьте в `.env` `LAB_SECRET`, `LAB_SSH_HOST`, `LAB_WS_URL`, `LAB_ALLOWED_USERS` и `COMPOSE_PROFILES=lab` — тогда `docker compose up -d` запустит и lab-runner на порту 3001.
 
 ## Деплой на Vercel (бесплатно)
 

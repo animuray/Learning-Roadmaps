@@ -1,7 +1,9 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowRight, Check, Lock } from "lucide-react";
+import { ArrowRight, Check, GraduationCap, Lock } from "lucide-react";
+import { startLearning } from "@/app/actions/enrollment";
 import { getRoadmap } from "@/lib/content";
+import { getEnrollment, touchEnrollment } from "@/lib/enrollment";
 import { getRoadmapView } from "@/lib/roadmap-view";
 import { getCurrentUser } from "@/lib/session";
 import { ProgressBar } from "@/components/progress-bar";
@@ -19,6 +21,9 @@ export default async function RoadmapPage({ params }: PageProps<"/roadmaps/[road
   const view = await getRoadmapView(slug, user?.id);
   if (!view) notFound();
   const { roadmap, states, stats, next } = view;
+  const enrollment = user ? await getEnrollment(user.id, roadmap.slug) : null;
+  const enrolled = enrollment?.status === "active";
+  if (enrolled && user) await touchEnrollment(user.id, roadmap.slug);
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-10">
@@ -41,7 +46,20 @@ export default async function RoadmapPage({ params }: PageProps<"/roadmaps/[road
             </span>
           )}
         </div>
-        {user ? (
+        {user && !enrolled ? (
+          <div className="mt-5 flex flex-wrap items-center gap-4">
+            <form action={startLearning.bind(null, roadmap.slug)}>
+              <button className="inline-flex items-center gap-2 rounded-xl bg-accent px-5 py-2.5 font-medium text-white hover:opacity-90">
+                <GraduationCap className="size-5" /> {enrollment ? "Вернуть в обучение" : "Начать обучение"}
+              </button>
+            </form>
+            <span className="text-sm text-muted">
+              {enrollment
+                ? `Роадмап в архиве, прогресс сохранён: ${stats.passed} из ${stats.total} тем.`
+                : "Роадмап появится в «Моём обучении», темы откроются по порядку."}
+            </span>
+          </div>
+        ) : user ? (
           <div className="mt-5 max-w-xl">
             <div className="mb-1.5 flex justify-between text-sm">
               <span>
@@ -62,9 +80,9 @@ export default async function RoadmapPage({ params }: PageProps<"/roadmaps/[road
         ) : (
           <div className="mt-5 rounded-xl bg-accent-soft p-4 text-sm">
             <Link href={`/login?callbackUrl=/roadmaps/${roadmap.slug}`} className="font-medium text-accent hover:underline">
-              Войдите через Google
+              Войдите или зарегистрируйтесь
             </Link>{" "}
-            — чтобы сохранять прогресс, сдавать тесты и открывать темы.
+            — чтобы начать обучение: сохранять прогресс, сдавать тесты и открывать темы.
           </div>
         )}
         <div className="mt-6 flex flex-wrap gap-4 text-xs text-muted">

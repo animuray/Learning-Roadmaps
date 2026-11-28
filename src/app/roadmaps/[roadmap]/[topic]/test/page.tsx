@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 import { getTopic } from "@/lib/content";
+import { getEnrollment } from "@/lib/enrollment";
 import { buildAttempt } from "@/lib/quiz";
 import { getRoadmapView } from "@/lib/roadmap-view";
 import { requireUser } from "@/lib/session";
@@ -17,6 +18,7 @@ export default async function TestPage({ params }: PageProps<"/roadmaps/[roadmap
   const view = await getRoadmapView(rmSlug, user.id);
   const topic = getTopic(rmSlug, topicSlug);
   if (!view || !topic) notFound();
+  if ((await getEnrollment(user.id, rmSlug))?.status !== "active") redirect(`/roadmaps/${rmSlug}`);
   const state = view.states.get(topic.slug);
   if (state === "locked" || topic.quiz.length === 0) redirect(`/roadmaps/${rmSlug}/${topicSlug}`);
 
